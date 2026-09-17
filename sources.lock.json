@@ -1,0 +1,17 @@
+{
+  "git": {
+    "ComfyUI": {"url": "https://github.com/Comfy-Org/ComfyUI.git", "revision": "b1693ecba9f5b65f8c80ab36b195ab963ec92413"},
+    "openvdn": {"url": "https://github.com/OpenVDN/vdn-minimax-h3.git", "revision": "1dc52dd018e7d278741e01e9a376de7f71139d37"},
+    "diffusers": {"url": "https://github.com/huggingface/diffusers.git", "revision": "3a2f35d4efa4c059c8bfb3bc0d6c906264895c81"}
+  },
+  "models": {
+    "vdn": {
+      "repo": "OpenVDN/vdn-minimax-h3", "revision": "ec875b5bde3832ff72511b079c70ea18b277c339",
+      "patterns": ["h3-base/**", "stage-dmd-step-250/**", "LICENSE*", "README.md"]
+    },
+    "conditioner": {
+      "repo": "MiniMaxAI/MiniMax-H3", "revision": "42ed227ee7df40d41602854ae760620d6eb651fe",
+      "patterns": ["processor/**", "text_encoder/**", "LICENSE*", "README.md"]
+    }
+  }
+}

@@ -1,0 +1,13 @@
+.deps/
+.venv/
+.venv-ui/
+.venv-vdn/
+.runtime/
+models/
+output/
+input/
+work/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env

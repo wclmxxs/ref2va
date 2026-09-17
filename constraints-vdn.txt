@@ -1,0 +1,3 @@
+torch==2.13.0
+torchvision==0.28.0
+# Other direct dependencies are pinned by the official pyproject.toml.
