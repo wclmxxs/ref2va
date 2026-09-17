@@ -43,6 +43,16 @@ def test_legacy_and_even_pixel_geometry():
     assert api.normalize_request(body)[0]["reference_image_urls"] == ["https://example.com/a.png"]
 
 
+def test_sampler_geometry_rejects_landscape_latents_for_portrait_request():
+    plan = make_plan(duration=10, ratio="9:16", resolution=768)
+    for shape in [(1, 24, 15, 48, 84), (1, 24, 15, 86, 46), (2, 24, 15, 86, 48), (86, 48)]:
+        with pytest.raises(RuntimeError, match="Sampler geometry mismatch"):
+            plan.validate_latent_shape(shape)
+    assert plan.validate_latent_shape((1, 24, 15, 86, 48)) == {
+        "validated": True, "latent_shape": [1, 24, 15, 86, 48],
+        "generation_width": 768, "generation_height": 1376}
+
+
 @pytest.mark.parametrize("changes", [{"duration": 0}, {"duration": float("nan")}, {"duration": True},
                                      {"duration": None}, {"ratio": "0:16"}, {"ratio": "1:8"},
                                      {"resolution": 721}, {"resolution": 2160}, {"resolution": "720p"},

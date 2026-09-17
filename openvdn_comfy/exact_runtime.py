@@ -127,12 +127,19 @@ class ExactRuntime:
         forward = rewrite(ulysses._ulysses_transformer_forward, replacements)
         if active:
             self.generate = rewrite(render.generate_latents, [
+                # rewrite() snapshots globals, but the resident worker updates
+                # the canvas before every request. Bind those two values at call
+                # time, before layout, noise allocation and final unpatchify.
+                ("    num_frames = align_num_frames(num_frames, 17, 5)",
+                 "    LATENT_H, LATENT_W = _ref2va_render.LATENT_H, _ref2va_render.LATENT_W\n"
+                 "    num_frames = align_num_frames(num_frames, 17, 5)"),
                 ("step_started = time.perf_counter()", "step_started = _ref2va_step_start(device)"),
                 ("            torch.cuda.synchronize(device)\n            step_seconds.append(time.perf_counter() - step_started)",
                  "            step_seconds.append(_ref2va_step_end(step_started))"),
                 ("    # Unpatchify (the AfterDenoise step's reshape) and unpack the channel-major audio rows.",
                  "    _ref2va_finish_steps(step_seconds)\n\n    # Unpatchify (the AfterDenoise step's reshape) and unpack the channel-major audio rows.")],
-                {"_ref2va_step_start": step_start, "_ref2va_step_end": step_end,
+                {"_ref2va_render": render,
+                 "_ref2va_step_start": step_start, "_ref2va_step_end": step_end,
                  "_ref2va_finish_steps": finish_steps})
         # Install only after all four source contracts have passed.
         for attn in ulysses.iter_hybrids(transformer):

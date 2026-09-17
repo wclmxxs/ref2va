@@ -35,6 +35,16 @@ class RenderPlan:
     def metadata(self):
         return {**asdict(self), "duration": self.output_frames / self.fps}
 
+    def validate_latent_shape(self, shape):
+        """Check actual sampler output; output resizing must not hide a wrong canvas."""
+        expected = (self.generation_height // 16, self.generation_width // 16)
+        if len(shape) != 5 or shape[0] != 1 or tuple(shape[-2:]) != expected:
+            raise RuntimeError(f"Sampler geometry mismatch: latent shape {tuple(shape)}, "
+                               f"expected batch 1 and spatial H×W {expected}. "
+                               "Refusing to stretch an incorrect generation canvas.")
+        return {"validated": True, "latent_shape": list(shape),
+                "generation_width": shape[-1] * 16, "generation_height": shape[-2] * 16}
+
 
 def make_plan(num_frames=345, duration=None, ratio=None, resolution=None):
     if duration is None:

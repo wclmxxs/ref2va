@@ -1,4 +1,5 @@
 import ast
+import inspect
 from pathlib import Path
 import types
 
@@ -52,6 +53,61 @@ def test_all_pinned_source_contracts_and_changed_source_rejection():
         # A second application must fail rather than silently changing ownership.
         with pytest.raises(RuntimeError, match='source changed'):
             rewrite(changed, [(PROJECTION_OLD, PROJECTION_NEW)])
+
+
+@pytest.mark.parametrize('active', [True, False])
+@pytest.mark.parametrize('reference', [True, False])
+def test_sampler_tracks_request_geometry_after_runtime_construction(active, reference):
+    """Exercise native noise/layout/unpatchify across resident shape switches.
+
+    No model or CUDA is needed: an empty schedule keeps the sampled noise, so
+    the native and optimized samplers must return identical shaped tensors.
+    """
+    ulysses, render = sources()
+    model = DummyTransformer(ulysses)
+    model.config = types.SimpleNamespace(patch_size=(1, 2, 2), in_channels=2)
+    class Scheduler:
+        def __init__(self, **kwargs):
+            self.timesteps = []
+        def set_timesteps(self, *args, **kwargs):
+            pass
+        def scale_noise(self, condition, timestep, noise):
+            return condition + noise * timestep
+    def layout(tags, frames, height, width, audio_frames, patch, audio_channels, *args, **kwargs):
+        text = tags.numel()
+        audio = audio_frames * audio_channels
+        condition_rows = kwargs.get('condition_rows', 0)
+        video = frames * (height // patch[1]) * (width // patch[2]) + condition_rows
+        length = text + audio + video
+        return (torch.zeros(length, 3), torch.zeros(length, dtype=torch.long),
+                torch.arange(text + audio, length), torch.arange(text, text + audio),
+                torch.arange(text), condition_rows, None)
+    def ref_layout(tags, references, conditions, audios, frames, height, width, audio_frames, patch, audio_channels, *args):
+        count = sum(c.shape[-3] * (c.shape[-2]//2) * (c.shape[-1]//2) for c in conditions)
+        return layout(tags, frames, height, width, audio_frames, patch, audio_channels, condition_rows=count)
+    def patchify(value, patch):
+        b, c, t, h, w = value.shape
+        return value.reshape(b, c, t, h//2, 2, w//2, 2).permute(0, 2, 3, 5, 1, 4, 6).reshape(-1, c*4)
+    namespace = inspect.unwrap(render.generate_latents).__globals__
+    namespace.update(LATENT_H=48, LATENT_W=84, AUDIO_CHANNELS=2, AUDIO_TAG=1, VIDEO_TAG=2,
+        align_num_frames=lambda n, *args: n, video_latent_num_frames=lambda *args: 1,
+        audio_latent_num_frames=lambda *args: 1, is_reference_request=lambda anchors: bool(anchors),
+        SimpleNamespace=types.SimpleNamespace, KEYFRAME_NOISE_AUG=.999,
+        MiniMaxH3Scheduler=Scheduler, MiniMaxH3PrepareLayoutStep=types.SimpleNamespace(build_packed_sequence=layout),
+        MiniMaxH3Ref2VAPrepareLayoutStep=types.SimpleNamespace(build_ref2va_packed_sequence=ref_layout),
+        iter_hybrids=lambda model: iter(()), patchify_video_latents=patchify)
+    render.LATENT_H, render.LATENT_W = 48, 84
+    state = ExactRuntime(model, ulysses, render, active=active)
+    for height, width in ((86, 48), (48, 86), (48, 48), (80, 46), (86, 48)):
+        # This is how the resident worker selects each request's canvas.
+        render.LATENT_H, render.LATENT_W = height, width
+        namespace.update(LATENT_H=height, LATENT_W=width)
+        args = (model, torch.zeros(2, 4), torch.zeros(2, dtype=torch.long), 243, 0, 42, 'cpu')
+        conditions = (('ref',), [torch.ones(1, 2, 1, 4, 6)]) if reference else None
+        expected = render.generate_latents(*args, conditions=conditions)
+        actual = state.generate(*args, conditions=conditions)
+        assert actual[0].shape == (1, 2, 1, height, width)
+        assert all(torch.equal(a, b) for a, b in zip(actual, expected))
 
 
 def test_constants_reuse_views_but_invalidate_mutations_and_requests():

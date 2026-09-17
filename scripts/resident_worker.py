@@ -114,6 +114,7 @@ def main():
                         "world_size": 8, "video_vae_world_size": 8 if parallel_vae else 1,
                         "metrics_schema_version": 5, "compile_cache": compile_options,
                         "exact_runtime_enabled": enabled("REF2VA_EXACT_RUNTIME"),
+                        "sampler_geometry": "request_bound_v1",
                         "async_output_enabled": enabled("REF2VA_ASYNC_OUTPUT"),
                         "updated_at": time.time(), **extra})
 
@@ -197,6 +198,7 @@ def main():
             latents, audio = exact_runtime.generate(
                 model.transformer, embeds, tags, plan.sampling_frames, 8, current.seed, device,
                 video_shift=12., audio_shift=3., runtime=runtime, step_seconds=steps, conditions=conditions)
+            actual_geometry = plan.validate_latent_shape(latents.shape)
             # Include the sampler's final unpatchify/copies in the stage wall time.
             torch.cuda.synchronize(device)
             exact_report = exact_runtime.report()
@@ -278,7 +280,7 @@ def main():
                       "exact_runtime": {"enabled": exact_runtime.active, "by_rank": exact_records},
                       "parallel_profile": parallel_profile, "cache_dit": cache_report,
                       "new_geometry": new_shape, "flex_backend": flex_latch_state(),
-                      "render_plan": plan.metadata()}
+                      "render_plan": plan.metadata(), "actual_geometry": actual_geometry}
             if not denoise_only:
                 atomic_json(request["output"] + ".inference.json", record)
             if not warmup or denoise_only:
