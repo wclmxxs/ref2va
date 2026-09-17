@@ -68,7 +68,7 @@ def resident(tmp_path, monkeypatch):
     return tmp_path
 
 
-def test_schema_six_not_ready_until_entire_warmup_set_verified(resident):
+def test_schema_six_readiness_accepts_completed_basic_checks_without_hot_sweep(resident):
     state = backend.read_json(resident / 'state.json')
     state.update(metrics_schema_version=6, status='busy', phase='verifying_warm_cache')
     atomic_json(resident / 'state.json', state)
@@ -80,6 +80,14 @@ def test_schema_six_not_ready_until_entire_warmup_set_verified(resident):
     state.update(status='ready', phase='idle')
     atomic_json(resident / 'state.json', state)
     assert backend.health()['ready']
+    # New default: basic checks completed, no hot-cache sweep was requested.
+    state['startup_warmup'] = {'complete': True, 'verification_requested': False,
+                              'all_runtime_graphs_reused': None}
+    atomic_json(resident / 'state.json', state)
+    assert backend.health()['ready']
+    state['startup_warmup']['complete'] = False
+    atomic_json(resident / 'state.json', state)
+    assert not backend.health()['ready']
 
 
 def test_mailbox_reuses_one_worker_and_propagates_errors(resident):

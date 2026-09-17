@@ -105,7 +105,9 @@ bash deploy.sh render \
 | `REF2VA_PROFILE` | 0 | 各 rank 分段计时 |
 | `REF2VA_VAE_PARALLEL` | 1 | 八卡视频 VAE 片段并行及预分配 tile 拼接；启动时逐片段对照未优化原版，校验通过才开放服务；0 恢复原版单卡 |
 | `REF2VA_COMPILE_SHAPES` | 32 | 编译图轮换前保留的成功几何配置数，8–64；达到容量后才重置 Dynamo，保留磁盘缓存和 mask LRU |
-| `REF2VA_WARMUP_RECENT` | 27 | 启动时额外回放最近成功请求，0 关闭历史回放；最大为编译形状容量减 5，给启动及常见时长预留空间 |
+| `REF2VA_WARMUP_RECENT` | 0 | 默认不回放历史；可手动增加，最大为编译形状容量减 1 再减额外时长数 |
+| `REF2VA_WARMUP_DURATIONS` | 空 | 默认不额外预热时长；可设 `5,8,10,15`，最多四个 4–15 秒的值 |
+| `REF2VA_WARMUP_VERIFY` | 0 | 默认不复跑预热集验证热命中；1 开启该诊断检查，会增加启动时间 |
 | `REF2VA_TOKEN_BUCKET` | 1024 | Flex 路径的非生成视频 token 容量步长；0 关闭，或 256/512/1024/2048；只在 token 层补齐，不修改参考图或视频尺寸 |
 | `REF2VA_WARMUP_DURATION` | 10 | 启动预热时长 |
 | `REF2VA_WARMUP_RATIO` | 9:16 | 启动预热画幅 |
@@ -160,9 +162,11 @@ cd /root/ref2va && git pull --ff-only && bash deploy.sh start
 
 启动先用实际 FA4 校验补齐位置不会泄漏到有效输出，再完成一次完整 8 NFE、视频/音频 VAE、输出编码和原有数值校验。补齐检查覆盖不同有效长度和完整/局部窗口，失败则不开放服务，记录在 `.runtime/backend/token-bucket-parity.json`。它是注意力组件检查，不是全模型质量证明。
 
-随后预热启动画幅/分辨率的 5/8/10/15 秒，以及 `.runtime/backend/warmup-history.json` 最近最多 27 个成功请求（默认容量 32）。同时从相同源码/模型版本的最近 200 个成功 `.runtime/jobs/*/result.json` 补齐旧版短历史。保留这些 `.pt` 和 jobs 目录，升级后才能覆盖之前的模板。历史回放直接加载本地条件缓存，不下载图片、不重新编码、不导出重复视频，全部执行 8 NFE、关闭 DBCache。
+默认仅完成上述一次基础预热和正确性检查就开放服务，不预热全部时长、不回放历史 case、不再复跑整个集合。模型保持 GPU 常驻；token 分桶、进程内图缓存、磁盘编译缓存和条件缓存继续保留。新档位在第一次实际请求时编译，允许该次较慢，后续同档请求复用；运行时命中率和耗时仍逐次返回。
 
-预热结束再完整复跑所选请求，实际检查所有 rank 的新增图和 Dynamo 编译时间。只有复跑全部 `runtime_graph_reused=true` 才开放服务；失败会写报告并停止启动。健康接口持续保留 `startup_warmup` 汇总，详细逐请求结果在 `.runtime/backend/warmup-report.json`。这验证所选缓存请求的热态，不保证未覆盖的新尺寸/输入已经热身，也不等于已经复测原 13 个模板的质量及 RDT 0.25 耗时。
+额外预热可显式开启：`REF2VA_WARMUP_DURATIONS=5,8,10,15` 预热指定时长，`REF2VA_WARMUP_RECENT=27` 回放最近成功请求。历史从本地 `.runtime/backend/warmup-history.json` 和相同源码/模型版本最近 200 个成功 jobs 补齐，直接复用 `.pt`，不重新下载或编码，不输出重复视频。二者默认均关闭。
+
+`REF2VA_WARMUP_VERIFY=1` 可额外复跑所选集合，要求所有 rank 无新图编译才完成启动；默认关闭。健康接口 `startup_warmup.complete` 表示配置要求的启动检查完成；未执行热态复跑时 `verification_requested=false, verified_requests=0, all_runtime_graphs_reused=null`，不会把未检测伪装成全部命中。报告仍写入 `.runtime/backend/warmup-report.json`。
 
 Flex 默认把 `[文本/视觉条件 | 参考图 latent | 音频 | 视频]` 的非视频前缀补到 1024 token 的倍数，最多增加 1023 行。补齐放在音频与生成视频之间，真实 position_ids、参考图几何、文本行、噪声生成顺序均保留。窗口 BlockMask 使用容量形状，score modifier 用设备上的有效长度排除补齐 key（含 full blocks）；同档不同有效长度不改变 Python 标量 guard。线性注意力的文本状态只读取真实文本行，保留真实长度的归一化尺度；DBCache 的误差分组也排除补齐行。RDT 开关/阈值保持原请求值。
 
@@ -189,7 +193,7 @@ python3 scripts/benchmark_compile_cache.py --server http://43.218.119.131:8188 \
   --requests-dir /path/to/original-cases --output-dir work/cache-benchmark
 ```
 
-默认顺序跑两遍，第一遍就要求热命中，输出逐 case 的视频链接、原始响应、`timings.csv` 和 `summary.json`。任何一次新编译则验收失败；`--allow-first-compile` 可用于新输入的冷/热对照，此时只将第二遍纳入命中验收。报告保持编译/去噪/VAE/端到端耗时分开。
+默认顺序跑两遍，允许第一遍首次编译，要求第二遍热命中，输出逐 case 的视频链接、原始响应、`timings.csv` 和 `summary.json`。`--no-allow-first-compile` 可用于严格检查启动后两遍都已热身。报告保持编译/去噪/VAE/端到端耗时分开。
 
 ## 输出优化与阶段耗时
 

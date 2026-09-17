@@ -331,8 +331,8 @@ def main():
     run(warm_request, warmup=True)
     replay_box = [history.requests(compile_options["warmup_recent"], RUNTIME / "jobs") if runtime.is_main else None]
     dist.broadcast_object_list(replay_box, src=0)
-    # Reserve up to five slots: startup plus four common durations, even if the
-    # deployment overrides the startup duration with a different value.
+    # Additional durations/history are opt-in. Defaults run only the base
+    # warmup; new buckets compile lazily on their first actual request.
     common = [{**warm_request, "settings": asdict(replace(settings, duration=duration))}
               for duration in compile_options["warmup_durations"] if duration != settings.duration]
     replays = common + replay_box[0]
@@ -348,10 +348,11 @@ def main():
                                    "exact_runtime": result["upstream"]["exact_runtime"],
                                    "compilation": result["upstream"]["compilation"]})
             print(f"Startup shape warmup {index + 1}/{len(replays)} complete", flush=True)
-    # A separate complete sweep detects eviction/recompilation across the whole
-    # working set. Startup/history runs always execute all 8 NFE without DBCache.
+    # Optional diagnostic sweep; never delay default startup to prove all shapes
+    # are hot. Runtime compiler counters still report misses on actual requests.
     verification = []
-    for index, replay in enumerate([warm_request, *replays]):
+    verify_requests = [warm_request, *replays] if compile_options["warmup_verify"] else []
+    for index, replay in enumerate(verify_requests):
         state("loading", "verifying_warm_cache", warmup_index=index + 1, warmup_count=1 + len(replays))
         checked = {**replay, "settings": {**replay["settings"], "cache_dit": False, "profile": False}}
         result = run(checked, warmup=False, denoise_only=True, startup=True)
@@ -362,8 +363,11 @@ def main():
                                  "compilation": compilation, "timings": result["upstream"]["timings"]})
     if runtime.is_main:
         hits = sum(item["compilation"]["runtime_graph_reused"] for item in verification)
-        startup_report.update(verified_requests=len(verification), hot_requests=hits,
-                              all_runtime_graphs_reused=hits == len(verification))
+        startup_report.update(base_warmup_complete=True, extra_warmup_requests=len(replays),
+                              verification_requested=compile_options["warmup_verify"],
+                              verified_requests=len(verification), hot_requests=hits,
+                              all_runtime_graphs_reused=(hits == len(verification)) if verification else None,
+                              complete=not verification or hits == len(verification))
         atomic_json(BACKEND / "warmup-report.json", {"instance": instance, "requests": replay_metrics,
                                                     "verification": verification, "summary": startup_report})
         if hits != len(verification):

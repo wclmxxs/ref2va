@@ -97,8 +97,14 @@ def test_cache_options_validate_before_launch(monkeypatch):
     monkeypatch.delenv("REF2VA_COMPILE_SHAPES", raising=False)
     monkeypatch.delenv("REF2VA_WARMUP_RECENT", raising=False)
     monkeypatch.delenv("REF2VA_TOKEN_BUCKET", raising=False)
-    assert cache_settings() == {"max_shapes": 32, "recompile_limit": 256, "warmup_recent": 27,
-                                "token_bucket": 1024, "warmup_durations": [5, 8, 10, 15]}
+    monkeypatch.delenv("REF2VA_WARMUP_DURATIONS", raising=False)
+    monkeypatch.delenv("REF2VA_WARMUP_VERIFY", raising=False)
+    assert cache_settings() == {"max_shapes": 32, "recompile_limit": 256, "warmup_recent": 0,
+                                "token_bucket": 1024, "warmup_durations": [], "warmup_verify": False}
+    monkeypatch.setenv("REF2VA_WARMUP_DURATIONS", "5, 8,10,15,5")
+    monkeypatch.setenv("REF2VA_WARMUP_VERIFY", "1")
+    assert cache_settings()['warmup_durations'] == [5, 8, 10, 15]
+    assert cache_settings()['warmup_verify']
     monkeypatch.setenv("REF2VA_COMPILE_SHAPES", "8")
     monkeypatch.setenv("REF2VA_WARMUP_RECENT", "3")
     assert cache_settings()["warmup_recent"] == 3
@@ -122,7 +128,7 @@ def test_migration_backfills_existing_short_history_for_all_thirteen_cases(tmp_p
         (folder / "result.json").write_text(json.dumps(record))
         if index >= 5:
             history.remember(str(index), record)
-    requests = history.requests(cache_settings()["warmup_recent"], jobs)
+    requests = history.requests(27, jobs)
     assert len(requests) == 13
     assert {r["prompt_file"] for r in requests} == {str(tmp_path / f"{i}.pt") for i in range(13)}
 
@@ -131,4 +137,14 @@ def test_migration_backfills_existing_short_history_for_all_thirteen_cases(tmp_p
 def test_invalid_token_bucket_rejected(monkeypatch, value):
     monkeypatch.setenv("REF2VA_TOKEN_BUCKET", value)
     with pytest.raises(ValueError, match="REF2VA_TOKEN_BUCKET"):
+        cache_settings()
+
+
+@pytest.mark.parametrize('name,value', [('REF2VA_WARMUP_DURATIONS', '5,nan'),
+    ('REF2VA_WARMUP_DURATIONS', '3'), ('REF2VA_WARMUP_DURATIONS', '16'),
+    ('REF2VA_WARMUP_DURATIONS', '5,,10'), ('REF2VA_WARMUP_DURATIONS', '5,6,7,8,9'),
+    ('REF2VA_WARMUP_VERIFY', '2')])
+def test_invalid_optional_startup_work_rejected(monkeypatch, name, value):
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match=name):
         cache_settings()

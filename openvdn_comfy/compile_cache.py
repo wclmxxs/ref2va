@@ -1,5 +1,6 @@
 """Compiler counters and mask build timing; no changes to attention semantics."""
 from collections import OrderedDict
+import math
 import os
 import time
 
@@ -18,12 +19,20 @@ def cache_settings():
     stride = integer("REF2VA_TOKEN_BUCKET", 1024, 0, 2048)
     if stride not in (0, 256, 512, 1024, 2048):
         raise ValueError("REF2VA_TOKEN_BUCKET must be 0, 256, 512, 1024 or 2048")
+    raw_durations = os.environ.get("REF2VA_WARMUP_DURATIONS", "").strip()
+    try:
+        durations = list(dict.fromkeys(float(value.strip()) for value in raw_durations.split(','))) if raw_durations else []
+    except ValueError:
+        raise ValueError("REF2VA_WARMUP_DURATIONS must be empty or comma-separated seconds in [4, 15]") from None
+    if len(durations) > 4 or any(not math.isfinite(value) or not 4 <= value <= 15 for value in durations):
+        raise ValueError("REF2VA_WARMUP_DURATIONS accepts at most four durations in [4, 15]")
     return {"max_shapes": capacity,
             # Each helper can specialize several times per geometry. Retain the
             # upstream hard-failure policy instead of silently falling back.
             "recompile_limit": capacity * 8,
-            "warmup_recent": integer("REF2VA_WARMUP_RECENT", capacity - 5, 0, capacity - 5),
-            "token_bucket": stride, "warmup_durations": [5, 8, 10, 15]}
+            "warmup_recent": integer("REF2VA_WARMUP_RECENT", 0, 0, capacity - 1 - len(durations)),
+            "warmup_verify": bool(integer("REF2VA_WARMUP_VERIFY", 0, 0, 1)),
+            "token_bucket": stride, "warmup_durations": durations}
 
 
 class ObservedMasks(OrderedDict):

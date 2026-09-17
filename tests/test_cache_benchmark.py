@@ -34,7 +34,7 @@ def test_thirteen_original_requests_are_unchanged_and_disk_hits_are_not_hot_hits
                             'disk_graph_cache_hits': 8, 'geometry_id': 'bucket',
                             'token_bucket': {'prefix_capacity': 2048, 'padding_tokens': 512}}}}}
     client = Client()
-    report = benchmark(client, files, tmp_path / 'output')
+    report = benchmark(client, files, tmp_path / 'output', allow_first_compile=False)
     assert len(client.calls) == 26
     original = [json.loads(path.read_text()) for path in files]
     assert client.calls[:13] == client.calls[13:] == original
@@ -42,6 +42,10 @@ def test_thirteen_original_requests_are_unchanged_and_disk_hits_are_not_hot_hits
     assert not report['all_graphs_reused']
     assert report['misses'][0]['case'] == 'case-03'
     assert (tmp_path / 'output/timings.csv').is_file()
+    client.calls = []
+    lazy = benchmark(client, files, tmp_path / 'lazy-output')
+    assert lazy['all_graphs_reused'] and lazy['checked_runs'] == lazy['graph_hits'] == 13
+    assert client.calls[:13] == client.calls[13:] == original
 
 
 def test_old_server_rejected_before_submitting_jobs(tmp_path):

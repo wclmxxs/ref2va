@@ -1,4 +1,4 @@
-"""Check every original request after startup, then measure a second hot pass.
+"""Allow first-use compilation, then check a second hot pass of every original request.
 
 python3 scripts/benchmark_compile_cache.py --server http://HOST:8188 \
     --requests-dir /path/to/original-cases --output-dir work/cache-benchmark
@@ -48,7 +48,7 @@ def summarize_job(name, pass_index, job, server):
             'video_url': server.rstrip('/') + job['video_url']}
 
 
-def benchmark(client, files, output, passes=2, allow_first_compile=False):
+def benchmark(client, files, output, passes=2, allow_first_compile=True):
     health = client.http('/openvdn/health')
     if not health.get('ready') or health.get('metrics_schema_version', 0) < 6:
         raise RuntimeError('Deploy schema 6 and wait until startup warmup finishes')
@@ -88,7 +88,8 @@ def main():
     parser.add_argument('--requests-dir', type=Path, required=True)
     parser.add_argument('--output-dir', type=Path, required=True)
     parser.add_argument('--passes', type=int, default=2)
-    parser.add_argument('--allow-first-compile', action='store_true')
+    parser.add_argument('--allow-first-compile', action=argparse.BooleanOptionalAction, default=True,
+                        help='Allow cold first requests (default); --no-allow-first-compile checks both passes')
     args = parser.parse_args()
     files = sorted(args.requests_dir.glob('*/request.json'))
     if not files or args.passes < 2:

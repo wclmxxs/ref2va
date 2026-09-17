@@ -57,8 +57,11 @@ def same_process(record):
 def health():
     state = read_json(BACKEND / "state.json", {})
     owner = read_json(BACKEND / "owner.json", {})
+    warmup = state.get("startup_warmup", {})
+    # New deployments require the configured startup checks, not a full hot-cache
+    # sweep. Keep compatibility with schema-6 workers predating lazy warmup.
     verified = (state.get("metrics_schema_version", 0) < 6 or
-                state.get("startup_warmup", {}).get("all_runtime_graphs_reused") is True)
+                warmup.get("complete", warmup.get("all_runtime_graphs_reused")) is True)
     ready = (same_process(owner) and state.get("instance") == owner.get("instance")
              and state.get("status") in ("ready", "busy") and verified)
     return {**state, "ready": bool(ready)}
