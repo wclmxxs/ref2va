@@ -68,6 +68,20 @@ def resident(tmp_path, monkeypatch):
     return tmp_path
 
 
+def test_schema_six_not_ready_until_entire_warmup_set_verified(resident):
+    state = backend.read_json(resident / 'state.json')
+    state.update(metrics_schema_version=6, status='busy', phase='verifying_warm_cache')
+    atomic_json(resident / 'state.json', state)
+    assert not backend.health()['ready']
+    state['startup_warmup'] = {'all_runtime_graphs_reused': False}
+    atomic_json(resident / 'state.json', state)
+    assert not backend.health()['ready']
+    state['startup_warmup']['all_runtime_graphs_reused'] = True
+    state.update(status='ready', phase='idle')
+    atomic_json(resident / 'state.json', state)
+    assert backend.health()['ready']
+
+
 def test_mailbox_reuses_one_worker_and_propagates_errors(resident):
     def worker():
         handled = set()

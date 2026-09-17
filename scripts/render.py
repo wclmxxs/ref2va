@@ -21,7 +21,8 @@ def main():
     parser.add_argument("--ratio", help="Output width:height, e.g. 9:16")
     parser.add_argument("--resolution", type=int, help="Output short edge in pixels")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--reference-short-edge", type=int, default=768)
+    parser.add_argument("--reference-short-edge", type=int, default=768,
+                        help="Reference image short edge, 128–2048 in multiples of 32; independent of output resolution")
     parser.add_argument("--fp8", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--inference-kernels", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--softmax-backend", choices=["flex", "decomposed", "ref"], default="flex")

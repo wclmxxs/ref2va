@@ -78,7 +78,7 @@ class DBCache:
             self.clear()
             self.active_request = False
 
-    def configure_groups(self, x, video_indices, audio_indices, video_start, video_end):
+    def configure_groups(self, x, video_indices, audio_indices, video_start, video_end, valid_prefix=None):
         import torch
         if self.groups is not None:
             return
@@ -86,6 +86,10 @@ class DBCache:
         # Done once per enabled request, before block execution. These row indices
         # refer to local sequence owners, not the attention head/branch layout.
         kinds = torch.zeros(end - start, dtype=torch.long, device=x.device)
+        if valid_prefix is not None:
+            lo, hi = max(start, valid_prefix) - start, min(end, video_start) - start
+            if hi > lo:
+                kinds[lo:hi] = -1  # Padding must not change the RDT decision.
         for value, indices in ((1, video_indices), (3, audio_indices)):
             local = indices[(indices >= start) & (indices < end)] - start
             kinds[local] = value

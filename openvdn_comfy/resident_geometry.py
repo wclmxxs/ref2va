@@ -12,7 +12,7 @@ class GeometryCache:
         self.pending = None
         self.last = {}
 
-    def prepare(self, runtime, plan, embeds, tags, conditions):
+    def prepare(self, runtime, plan, embeds, tags, conditions, bucket=None):
         # Official configure() guards one geometry per process. Between completed
         # requests all collectives have finished; the next forward recomputes every
         # split/offset/head assignment. Keep the communicators and rank layout.
@@ -21,6 +21,13 @@ class GeometryCache:
                      tuple(embeds.shape), tuple(tags.tolist()),
                      tuple(conditions[0]) if conditions else (),
                      tuple(tuple(value.shape) for value in conditions[1]) if conditions else ())
+        if bucket is not None and bucket.stride:
+            # The compiled attention/pointwise helpers see the capacity, not the
+            # actual prefix length. Text state remains eager over the real text.
+            signature = ("prefix_gap_v1", getattr(runtime, "softmax_ranks", 6),
+                         plan.generation_width, plan.generation_height, plan.sampling_frames,
+                         bucket.capacity, bucket.video_tokens, str(embeds.dtype),
+                         bool(conditions))
         fingerprint = hashlib.sha256(json.dumps(signature).encode()).hexdigest()
         new_shape = fingerprint not in self.shapes
         reset = new_shape and len(self.shapes) >= self.max_shapes

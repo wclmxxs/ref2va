@@ -15,11 +15,15 @@ def cache_settings():
             raise ValueError(f"{name} must be in [{low}, {high}]")
         return value
     capacity = integer("REF2VA_COMPILE_SHAPES", 32, 8, 64)
+    stride = integer("REF2VA_TOKEN_BUCKET", 1024, 0, 2048)
+    if stride not in (0, 256, 512, 1024, 2048):
+        raise ValueError("REF2VA_TOKEN_BUCKET must be 0, 256, 512, 1024 or 2048")
     return {"max_shapes": capacity,
             # Each helper can specialize several times per geometry. Retain the
             # upstream hard-failure policy instead of silently falling back.
             "recompile_limit": capacity * 8,
-            "warmup_recent": integer("REF2VA_WARMUP_RECENT", min(8, capacity - 1), 0, capacity - 1)}
+            "warmup_recent": integer("REF2VA_WARMUP_RECENT", capacity - 5, 0, capacity - 5),
+            "token_bucket": stride, "warmup_durations": [5, 8, 10, 15]}
 
 
 class ObservedMasks(OrderedDict):
@@ -68,16 +72,31 @@ class CompilerMonitor:
                 "fxgraph_cache_hits": int(counters["inductor"]["fxgraph_cache_hit"]),
                 "fxgraph_cache_misses": int(counters["inductor"]["fxgraph_cache_miss"]),
                 "mask_hits": self.masks.hits, "mask_misses": self.masks.misses,
-                "mask_build_seconds": self.mask_build_seconds}
+                "mask_build_seconds": self.mask_build_seconds,
+                "guard_failure_counts": {code: len(values) for code, values in self.utils.guard_failures.items()}}
 
     def since(self, before):
-        return {key: max(0, value - before[key]) for key, value in self.snapshot().items()}
+        after = self.snapshot()
+        result = {key: max(0, value - before[key]) for key, value in after.items()
+                  if key != "guard_failure_counts"}
+        failures = []
+        for code, values in self.utils.guard_failures.items():
+            for reason in values[before["guard_failure_counts"].get(code, 0):]:
+                failures.append({"function": code.co_name, "reason": str(reason)[:1200]})
+        result["guard_failures"] = len(failures)
+        result["recompile_reasons"] = failures[-8:]
+        return result
 
 
 def summarize_compilation(records):
     # Ranks compile concurrently; summing their times would overstate latency.
+    compiled = any(r["unique_graphs"] for r in records)
+    seconds = max(r["dynamo_compile_seconds"] for r in records)
     return {"by_rank": records, "times_overlap_denoise": True,
-            "dynamo_compile_seconds": max(r["dynamo_compile_seconds"] for r in records),
+            "dynamo_compile_seconds": seconds,
             "mask_build_seconds": max(r["mask_build_seconds"] for r in records),
-            "compiled_new_graph": any(r["unique_graphs"] for r in records),
+            "compiled_new_graph": compiled,
+            "runtime_graph_reused": not compiled and seconds == 0,
+            "disk_graph_cache_hits": sum(r["fxgraph_cache_hits"] for r in records),
+            "disk_graph_cache_misses": sum(r["fxgraph_cache_misses"] for r in records),
             "scope": "denoise; Dynamo timing includes tracing/cache loading and may overlap mask construction"}

@@ -41,6 +41,7 @@ curl -sS http://43.218.119.131:8188/openvdn/jobs \
     "duration": 10,
     "ratio": "9:16",
     "resolution": 720,
+    "reference_short_edge": 768,
     "reference_image_urls": ["https://example.com/person.png"],
     "seed": 42
   }'
@@ -55,7 +56,11 @@ curl -sS http://43.218.119.131:8188/openvdn/jobs \
 | `reference_image_urls` | 必填，1–9 个 HTTP(S) 公网图片 URL，最多 20 MiB/张；不接收内网、文件或带凭据的 URL |
 | `reference_image_url` | 单张图片的简写；与复数参数二选一 |
 | `seed` | 默认 42 |
-| `reference_short_edge` | 编码参考图的短边，默认 768、32 的倍数；越大越耗时，独立于输出 `resolution` |
+| `reference_short_edge` | 编码参考图的短边，默认 768，范围 128–2048、32 的倍数；独立于输出 `resolution` |
+
+参考图按该短边等比例放大或缩小，两边四舍五入到 32 的倍数，不裁剪或拉伸到视频比例。例如 `resolution=768, reference_short_edge=512` 是视频短边 768、参考图短边 512。降低参考图短边会减少细节和编码 token，不属于无损优化，不会自动降低。Qwen 图像处理器还会生成自己的视觉网格。
+
+结果 `metrics.upstream.conditioning` 返回参考图实际 `original_size`、`normalized_size`（均为宽、高）、VAE `latent_shape`、`prompt_tokens`、`text_tokens`、`vision_tokens`；新条件缓存另有 `qwen_grid_thw`。旧缓存从 latent 恢复归一化尺寸，原文件已不存在时原尺寸为 null，不重新编码或伪造尺寸。
 
 例如 `duration=10, ratio=9:16, resolution=720` 输出 **720×1280、240 帧、10 秒**。模型内部在 736×1280、243 帧上生成，再缩放到输出尺寸并裁到目标时长，音频同步裁剪。内部宽高对齐 32、帧数对齐 `17n+5`。内部画布面积不超过 1920×1088；支持参数范围不代表所有高分辨率、长时长、多参考组合都能装入显存。
 
@@ -100,7 +105,8 @@ bash deploy.sh render \
 | `REF2VA_PROFILE` | 0 | 各 rank 分段计时 |
 | `REF2VA_VAE_PARALLEL` | 1 | 八卡视频 VAE 片段并行及预分配 tile 拼接；启动时逐片段对照未优化原版，校验通过才开放服务；0 恢复原版单卡 |
 | `REF2VA_COMPILE_SHAPES` | 32 | 编译图轮换前保留的成功几何配置数，8–64；达到容量后才重置 Dynamo，保留磁盘缓存和 mask LRU |
-| `REF2VA_WARMUP_RECENT` | 8 | 启动时额外预热最近成功形状，0 关闭，最大为编译形状容量减 1；增加启动时间以减少首次业务请求耗时 |
+| `REF2VA_WARMUP_RECENT` | 27 | 启动时额外回放最近成功请求，0 关闭历史回放；最大为编译形状容量减 5，给启动及常见时长预留空间 |
+| `REF2VA_TOKEN_BUCKET` | 1024 | Flex 路径的非生成视频 token 容量步长；0 关闭，或 256/512/1024/2048；只在 token 层补齐，不修改参考图或视频尺寸 |
 | `REF2VA_WARMUP_DURATION` | 10 | 启动预热时长 |
 | `REF2VA_WARMUP_RATIO` | 9:16 | 启动预热画幅 |
 | `REF2VA_WARMUP_RESOLUTION` | 768 | 启动预热短边 |
@@ -146,24 +152,44 @@ cd /root/ref2va && git pull --ff-only && bash deploy.sh start
 在版本 61245b4 上，同一 10 秒原模板热态处理 29.74 秒，其中采样 13.78 秒、视频 VAE 12.99 秒。提示词新增一句后首次处理 49.83 秒，再次处理 30.14 秒；前两步的额外开销与静态编译/掩码构建相关，尚未单独计量编译时间。下一步应分别比较八卡 VAE 和编译复用，避免把条件缓存命中或首次编译差异算成解码加速。
 
 
-## 编译缓存及启动预热（schema 3）
+## 编译缓存及启动预热（schema 6）
 
 保留 `.runtime/inductor/`、`.runtime/triton/`，显式开启 PyTorch FX graph/AOTAutograd 磁盘缓存；这些环境变量可由部署覆盖。缓存目录应随部署保留，PyTorch 自己按源码、硬件和编译配置判定能否复用，不在 H200/B200 之间强行复用二进制。
 
 原先每 8 种几何配置就重置全部编译记录，现默认允许 32 种成功配置，并给每个静态 helper 预留多版本编译预算。超过容量才轮换 Dynamo 图，mask 的原有 64 项 LRU 不随之清空。保留超出编译预算直接报错的行为，避免 Flex 静默进入高显存 eager 路径。`geometry_seen` 仅表示进程执行过该输入布局，实际新图编译与磁盘缓存命中另由 PyTorch 计数返回，不能混为一谈。
 
-启动先完成一次完整 8 NFE、视频/音频 VAE、输出编码和数值校验，再用 `.runtime/backend/warmup-history.json` 中最近 8 个成功配置预热完整 8 NFE。历史预热直接加载已有条件 `.pt`，不重新下载图片或编码，也不导出重复视频。首次升级会从相同源码/模型版本的 `.runtime/jobs/*/result.json` 成功记录迁移；缺失缓存、失败记录和不匹配配置会跳过。固定启动参考图的条件缓存也按内容/源码版本复用。所有预热完成后才开放服务，记录在 `.runtime/backend/warmup-report.json`。
+启动先用实际 FA4 校验补齐位置不会泄漏到有效输出，再完成一次完整 8 NFE、视频/音频 VAE、输出编码和原有数值校验。补齐检查覆盖不同有效长度和完整/局部窗口，失败则不开放服务，记录在 `.runtime/backend/token-bucket-parity.json`。它是注意力组件检查，不是全模型质量证明。
 
-本版不做 4096 token padding，也不把 FLASH Flex 改为动态形状：当前 OpenVDN 的有效 conditioning 和 mask 布局不能直接套用 SGLang 的分桶规则。新布局仍可能首次编译；优化的是已有布局的复用、重启预热和可观测性。
+随后预热启动画幅/分辨率的 5/8/10/15 秒，以及 `.runtime/backend/warmup-history.json` 最近最多 27 个成功请求（默认容量 32）。同时从相同源码/模型版本的最近 200 个成功 `.runtime/jobs/*/result.json` 补齐旧版短历史。保留这些 `.pt` 和 jobs 目录，升级后才能覆盖之前的模板。历史回放直接加载本地条件缓存，不下载图片、不重新编码、不导出重复视频，全部执行 8 NFE、关闭 DBCache。
+
+预热结束再完整复跑所选请求，实际检查所有 rank 的新增图和 Dynamo 编译时间。只有复跑全部 `runtime_graph_reused=true` 才开放服务；失败会写报告并停止启动。健康接口持续保留 `startup_warmup` 汇总，详细逐请求结果在 `.runtime/backend/warmup-report.json`。这验证所选缓存请求的热态，不保证未覆盖的新尺寸/输入已经热身，也不等于已经复测原 13 个模板的质量及 RDT 0.25 耗时。
+
+Flex 默认把 `[文本/视觉条件 | 参考图 latent | 音频 | 视频]` 的非视频前缀补到 1024 token 的倍数，最多增加 1023 行。补齐放在音频与生成视频之间，真实 position_ids、参考图几何、文本行、噪声生成顺序均保留。窗口 BlockMask 使用容量形状，score modifier 用设备上的有效长度排除补齐 key（含 full blocks）；同档不同有效长度不改变 Python 标量 guard。线性注意力的文本状态只读取真实文本行，保留真实长度的归一化尺度；DBCache 的误差分组也排除补齐行。RDT 开关/阈值保持原请求值。
+
+只对 Flex 路径分桶；decomposed/ref 自动使用原始布局。保持 FA4 静态编译，不直接改 `dynamic=True`。可用 `REF2VA_TOKEN_BUCKET=0 bash deploy.sh start` 关闭分桶，历史预热和耗时统计仍可使用。补齐可能改变 GEMM/归约的浮点顺序，并增加少量计算，不承诺逐位相等或固定加速比，需 H200 对比实际输出和热态延迟。
 
 `metrics.upstream.compilation` 返回：
 
 - `geometry_id` / `geometry_seen` / `successful_geometries`：布局指纹、此前是否成功运行和当前保留数。
 - `reset` / `reset_reason` / `generation`：是否因容量轮换及轮换次数。
 - `compiled_new_graph`：本次去噪是否有 Dynamo 新图；不是所有底层 JIT 的通用命中标记。
+- `runtime_graph_reused`：所有 rank 均无新图且 Dynamo 编译时间增量为零；与磁盘缓存命中分开。`disk_graph_cache_hits/misses` 是各 rank 的计数总和，不是耗时。
+- `token_bucket`：真实/补齐后的序列长度、前缀容量、补齐占比、条件（含视觉）/参考 latent/音频/视频 token 数；`geometry_seen` 在分桶模式下表示容量布局相同。
 - `by_rank`：各卡的 `unique_graphs`、`fxgraph_cache_hits/misses`、`mask_hits/misses`、`dynamo_compile_seconds`、`mask_build_seconds`。
+- `by_rank[].guard_failures/recompile_reasons`：guard 失败计数及本次最近 8 条原因，帮助定位新图由哪些形状/stride/标量变化触发。
 
 `metrics.timings.dynamo_compile_seconds` 和 `mask_build_seconds` 取各卡最大值，不累加并发的八卡时间。前者来自 PyTorch `entire_frame_compile`，包含 tracing/图缓存加载等编译框架工作，不单指 CUDA kernel 编译；后者在 mask 缓存未命中时 GPU 同步计时。两者都嵌套在 `denoise_seconds` 内，彼此也可能重叠，不可加到去噪或总耗时上。
+
+`denoise_wall_seconds` 明确标记去噪阶段墙钟时间（兼容原 `denoise_seconds`）；`hot_denoise_seconds` 仅在本次没有编译时返回实测值，否则为 null，不用减去编译时间的推算值冒充热态实测。
+
+部署后的原模板验收（输入为已有 `case-name/request.json`，不改提示词、图或 RDT 设置）：
+
+```bash
+python3 scripts/benchmark_compile_cache.py --server http://43.218.119.131:8188 \
+  --requests-dir /path/to/original-cases --output-dir work/cache-benchmark
+```
+
+默认顺序跑两遍，第一遍就要求热命中，输出逐 case 的视频链接、原始响应、`timings.csv` 和 `summary.json`。任何一次新编译则验收失败；`--allow-first-compile` 可用于新输入的冷/热对照，此时只将第二遍纳入命中验收。报告保持编译/去噪/VAE/端到端耗时分开。
 
 ## 输出优化与阶段耗时
 

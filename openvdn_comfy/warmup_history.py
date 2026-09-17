@@ -43,18 +43,22 @@ class WarmupHistory:
         if not limit:
             return []
         candidates = list(self.entries.values())
-        if not candidates and jobs_directory is not None:
+        if jobs_directory is not None:
             # Migration from schema 2: reuse completed requests from this
             # checkout. Bound metadata reads; ignore failed/incomplete jobs.
             paths = sorted(Path(jobs_directory).glob("*/result.json"),
                            key=lambda p: p.stat().st_mtime, reverse=True)[:200]
+            migrated = []
             for path in reversed(paths):
                 try:
                     record = json.loads(path.read_text())
                     if record.get("status") == "complete" and record.get("sources") == self.sources:
-                        candidates.append(record)
+                        migrated.append(record)
                 except (OSError, ValueError, TypeError):
                     continue
+            # Fill missing older shapes even when an existing history only kept
+            # eight entries. History entries remain the most recent candidates.
+            candidates = migrated + candidates
         selected, seen = [], set()
         for candidate in reversed(candidates):
             if len(selected) >= limit:

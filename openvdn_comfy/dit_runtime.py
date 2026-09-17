@@ -90,8 +90,10 @@ class DiTRuntime:
         cfg = self.cache.config
         if cfg.enabled and cfg.threshold > 0 and cfg.max_cached_steps > 0:
             layout = self.hybrids[0].layout
+            buckets = getattr(self.hybrids[0], "_ref2va_buckets", None)
             self.cache.configure_groups(packed, video_indices, audio_indices,
-                                        layout.video_start, layout.video_end)
+                                        layout.video_start, layout.video_end,
+                                        buckets.current.prefix_tokens if buckets and buckets.active else None)
 
         def call(block, value, block_args):
             if not self.runtime.profile_enabled:

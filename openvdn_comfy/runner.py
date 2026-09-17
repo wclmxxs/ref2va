@@ -185,7 +185,7 @@ def generate(*, prompt="", refs=(), settings=None, output=None, prompt_file=None
             upstream_record = json.loads(Path(str(output) + ".inference.json").read_text())
             if upstream_record["parallel"]["world_size"] != 8:
                 raise RuntimeError("Upstream result did not use 8 GPUs")
-            result = {**request, "status": "complete", "metrics_schema_version": 5, "log_directory": str(job),
+            result = {**request, "status": "complete", "metrics_schema_version": 6, "log_directory": str(job),
                       "conditioning_cache_hit": metrics["conditioning_cache_hit"], "prompt_file": str(cache),
                       "queue_seconds": queue_seconds, "encode_seconds": metrics["encode_seconds"],
                       "inference_process_seconds": metrics["inference_process_seconds"], "resident": True,

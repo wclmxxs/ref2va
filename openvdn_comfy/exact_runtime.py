@@ -106,17 +106,28 @@ def project_video_rows(attn, out, linear_local, runtime, layout, x):
 
 
 class ExactRuntime:
-    def __init__(self, transformer, ulysses, render, *, active=True, block_runtime=None):
+    def __init__(self, transformer, ulysses, render, *, active=True, block_runtime=None, token_buckets=None):
         self.active = active
         self.generate = render.generate_latents
         self.values = {}
         self.in_request = False
-        if not active and block_runtime is None:
+        if not active and block_runtime is None and token_buckets is None:
             return
         forwards = {}
+        if token_buckets is not None:
+            from .token_buckets import attention_replacements, bucket_window_attention
+            token_buckets.native_window_attention = ulysses._window_softmax_branch
         for name in ("_ulysses_attention_forward", "_branch_parallel_attention_forward"):
-            forwards[name] = (rewrite(getattr(ulysses, name), [(PROJECTION_OLD, PROJECTION_NEW)],
-                                      {"_ref2va_project": project_video_rows}) if active else getattr(ulysses, name))
+            edits = [(PROJECTION_OLD, PROJECTION_NEW)] if active else []
+            extra = {"_ref2va_project": project_video_rows}
+            if token_buckets is not None:
+                edits += attention_replacements()
+                if name == "_ulysses_attention_forward":
+                    # Only the Flex branch gains a full-cover case with padding.
+                    edits.append(("        linear_active = True\n    else:",
+                                  "        linear_active = not full_cover\n    else:"))
+                extra["_window_softmax_branch"] = bucket_window_attention
+            forwards[name] = rewrite(getattr(ulysses, name), edits, extra) if edits else getattr(ulysses, name)
         replacements = [
             ('rotary_emb = self.rope(position_ids)',
              'rotary_emb = self._ref2va_exact.constant("rope", position_ids, lambda: self.rope(position_ids))'),
@@ -125,20 +136,27 @@ class ExactRuntime:
             from .dit_runtime import transformer_replacements
             replacements += transformer_replacements()
         forward = rewrite(ulysses._ulysses_transformer_forward, replacements)
-        if active:
-            self.generate = rewrite(render.generate_latents, [
+        sampler_edits = [
                 # rewrite() snapshots globals, but the resident worker updates
                 # the canvas before every request. Bind those two values at call
                 # time, before layout, noise allocation and final unpatchify.
                 ("    num_frames = align_num_frames(num_frames, 17, 5)",
                  "    LATENT_H, LATENT_W = _ref2va_render.LATENT_H, _ref2va_render.LATENT_W\n"
-                 "    num_frames = align_num_frames(num_frames, 17, 5)"),
+                 "    num_frames = align_num_frames(num_frames, 17, 5)")]
+        if active:
+            sampler_edits += [
                 ("step_started = time.perf_counter()", "step_started = _ref2va_step_start(device)"),
                 ("            torch.cuda.synchronize(device)\n            step_seconds.append(time.perf_counter() - step_started)",
                  "            step_seconds.append(_ref2va_step_end(step_started))"),
                 ("    # Unpatchify (the AfterDenoise step's reshape) and unpack the channel-major audio rows.",
-                 "    _ref2va_finish_steps(step_seconds)\n\n    # Unpatchify (the AfterDenoise step's reshape) and unpack the channel-major audio rows.")],
-                {"_ref2va_render": render,
+                 "    _ref2va_finish_steps(step_seconds)\n\n    # Unpatchify (the AfterDenoise step's reshape) and unpack the channel-major audio rows.")]
+        if token_buckets is not None:
+            sampler_edits.append((
+                "    position_ids, token_tags, video_indices, audio_indices, text_indices, num_condition_rows, _ = layout",
+                "    layout = _ref2va_buckets.pack_layout(layout)\n"
+                "    position_ids, token_tags, video_indices, audio_indices, text_indices, num_condition_rows, _ = layout"))
+        self.generate = rewrite(render.generate_latents, sampler_edits,
+                {"_ref2va_render": render, "_ref2va_buckets": token_buckets,
                  "_ref2va_step_start": step_start, "_ref2va_step_end": step_end,
                  "_ref2va_finish_steps": finish_steps})
         # Install only after all four source contracts have passed.
@@ -147,6 +165,7 @@ class ExactRuntime:
             if name not in forwards:
                 raise RuntimeError(f"Unexpected attention owner: {name}")
             attn._ref2va_exact = self
+            attn._ref2va_buckets = token_buckets
             attn.forward = types.MethodType(forwards[name], attn)
         transformer._ref2va_exact = self
         transformer.forward = types.MethodType(forward, transformer)

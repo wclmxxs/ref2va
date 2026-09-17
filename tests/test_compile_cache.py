@@ -54,6 +54,13 @@ def test_real_dynamo_metrics_separate_first_compile_from_repeated_shape():
     summary = summarize_compilation([cold, hot])
     assert summary["dynamo_compile_seconds"] == cold["dynamo_compile_seconds"]
     assert summary["compiled_new_graph"]
+    assert not summary["runtime_graph_reused"]
+    assert summarize_compilation([hot])["runtime_graph_reused"]
+    before = monitor.snapshot()
+    compiled(torch.randn(15))
+    changed = monitor.since(before)
+    assert changed['unique_graphs'] > 0 and changed['guard_failures'] > 0
+    assert any('size mismatch' in entry['reason'] for entry in changed['recompile_reasons'])
     torch._dynamo.reset()
 
 
@@ -89,10 +96,39 @@ def test_warmup_replays_only_compatible_successful_local_caches(tmp_path):
 def test_cache_options_validate_before_launch(monkeypatch):
     monkeypatch.delenv("REF2VA_COMPILE_SHAPES", raising=False)
     monkeypatch.delenv("REF2VA_WARMUP_RECENT", raising=False)
-    assert cache_settings() == {"max_shapes": 32, "recompile_limit": 256, "warmup_recent": 8}
+    monkeypatch.delenv("REF2VA_TOKEN_BUCKET", raising=False)
+    assert cache_settings() == {"max_shapes": 32, "recompile_limit": 256, "warmup_recent": 27,
+                                "token_bucket": 1024, "warmup_durations": [5, 8, 10, 15]}
     monkeypatch.setenv("REF2VA_COMPILE_SHAPES", "8")
-    monkeypatch.setenv("REF2VA_WARMUP_RECENT", "7")
-    assert cache_settings()["warmup_recent"] == 7
-    monkeypatch.setenv("REF2VA_WARMUP_RECENT", "8")
+    monkeypatch.setenv("REF2VA_WARMUP_RECENT", "3")
+    assert cache_settings()["warmup_recent"] == 3
+    monkeypatch.setenv("REF2VA_WARMUP_RECENT", "4")
     with pytest.raises(ValueError, match="REF2VA_WARMUP_RECENT"):
+        cache_settings()
+
+
+def test_migration_backfills_existing_short_history_for_all_thirteen_cases(tmp_path):
+    settings = asdict(Settings(duration=10, ratio="9:16", resolution=768))
+    sources, profile = {"model": "pinned"}, {"fp8": True}
+    history = WarmupHistory(tmp_path / "history.json", sources, profile)
+    jobs = tmp_path / "jobs"
+    for index in range(13):
+        cached = tmp_path / f"{index}.pt"
+        cached.touch()
+        record = {"status": "complete", "sources": sources,
+                  "settings": settings, "prompt_file": str(cached)}
+        folder = jobs / str(index)
+        folder.mkdir(parents=True)
+        (folder / "result.json").write_text(json.dumps(record))
+        if index >= 5:
+            history.remember(str(index), record)
+    requests = history.requests(cache_settings()["warmup_recent"], jobs)
+    assert len(requests) == 13
+    assert {r["prompt_file"] for r in requests} == {str(tmp_path / f"{i}.pt") for i in range(13)}
+
+
+@pytest.mark.parametrize("value", ["-1", "2", "1023", "4096", "bad"])
+def test_invalid_token_bucket_rejected(monkeypatch, value):
+    monkeypatch.setenv("REF2VA_TOKEN_BUCKET", value)
+    with pytest.raises(ValueError, match="REF2VA_TOKEN_BUCKET"):
         cache_settings()
