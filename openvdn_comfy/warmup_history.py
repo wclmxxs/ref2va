@@ -64,7 +64,9 @@ class WarmupHistory:
             settings = asdict(Settings(**candidate["settings"]).validate())
             # Seed/output settings do not alter the compiled geometry.
             settings["seed"] = 42
-            identity = (candidate["prompt_file"],
+            settings["cache_dit"] = False
+            settings["profile"] = False
+            identity = (candidate["prompt_file"], settings["softmax_ranks"],
                         json.dumps(Settings(**settings).render_plan().metadata(), sort_keys=True))
             if identity in seen:
                 continue

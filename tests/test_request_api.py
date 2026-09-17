@@ -133,6 +133,13 @@ def test_rest_submission_status_validation_and_restart(monkeypatch, tmp_path):
             response = await client.post("/openvdn/jobs", json=request_body(duration=1))
             assert response.status == 400
             assert (await client.post("/openvdn/jobs", json=request_body(fp8=False))).status == 400
+            assert (await client.post("/openvdn/jobs", json=request_body(cache_dit_threshold=-1))).status == 400
+            response = await client.post("/openvdn/jobs", json=request_body(
+                profile=True, softmax_ranks=4, cache_dit=True, cache_dit_threshold=.04))
+            assert response.status == 202
+            inputs = server.prompt_queue.pending[-1][2]["1"]["inputs"]
+            assert inputs["cache_dit"] is True and inputs["cache_dit_threshold"] == .04
+            assert inputs["softmax_ranks"] == 4 and inputs["profile"] is True
             assert (await client.get("/openvdn/jobs/not-a-uuid")).status == 400
             assert (await client.get("/openvdn/jobs/" + str(uuid.uuid4()))).status == 404
             accepted = await (await client.post("/openvdn/jobs", json=request_body())).json()

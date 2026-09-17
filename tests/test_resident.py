@@ -47,6 +47,16 @@ def test_actual_upstream_ulysses_changes_geometry_without_reloading(monkeypatch)
         assert sum(runtime.softmax_head_splits) == sum(runtime.linear_head_splits) == 56
         cache.commit()
     assert resets == [True]
+    fingerprints = []
+    for layout in (6, 4, 0, 6):
+        runtime.softmax_ranks = layout
+        cache.prepare(runtime, plan, torch.zeros(202, 3), torch.ones(202, dtype=torch.long), None)
+        runtime.configure(202, 56)
+        assert sum(runtime.splits) == 202
+        assert runtime.heads_per_rank == (56 // 8 if layout == 0 else runtime.branch_heads)
+        fingerprints.append(cache.last["geometry_id"])
+        cache.commit()
+    assert len(set(fingerprints)) == 3 and fingerprints[0] == fingerprints[-1]
 
 
 @pytest.fixture

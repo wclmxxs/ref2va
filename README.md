@@ -2,7 +2,7 @@
 
 一条视频使用全部 8 张 H200。ComfyUI 负责输入、队列和视频预览；常驻八卡进程调用固定版本的 [OpenVDN](https://github.com/OpenVDN/vdn-minimax-h3)，默认 FP8、6 个 softmax rank + 2 个 linear rank、8 NFE。
 
-图片参考模式是官方 **Ref2VA-like**：FL2VA 权重接收参考图，不是 MiniMax 的独立 Ref2VA transformer。暂不接入 LightX2V、Sol、跨步 DiT 缓存或整块 DiT 编译；`inference_kernels` 控制官方融合/局部编译内核组合。
+图片参考模式是官方 **Ref2VA-like**：FL2VA 权重接收参考图，不是 MiniMax 的独立 Ref2VA transformer。支持默认关闭的 DBCache 跨步缓存；暂不接入 LightX2V、Sol 或整块 DiT 编译；`inference_kernels` 控制官方融合/局部编译内核组合。
 
 ## 一条命令启动
 
@@ -106,7 +106,7 @@ bash deploy.sh render \
 | `REF2VA_X264_THREADS` | 8 | H.264 编码线程数，1–64 |
 | `REF2VA_REFERENCE_SHORT_EDGE` | 768 | 启动预热参考图短边 |
 
-要比较精度/内核/并行配置，修改相应环境变量再执行 `bash deploy.sh start`。API 省略这些字段时自动使用当前配置；显式传入 `fp8`、`inference_kernels`、`softmax_backend`、`softmax_ranks`、`profile` 必须与 `/openvdn/health` 一致，避免请求临时重载模型。旧 `warmup_steps` 字段保留兼容，常驻服务统一在启动执行 8 NFE，请求中不再额外预热。
+精度/内核配置需修改环境变量并重启；显式传入 `fp8`、`inference_kernels`、`softmax_backend` 必须与 `/openvdn/health` 一致。`softmax_ranks` 和 `profile` 已改为按请求切换，不重载模型；省略时使用服务启动默认值。旧 `warmup_steps` 字段保留兼容，常驻服务统一在启动执行 8 NFE，请求中不再额外预热。
 
 固定 video/audio shift=12/3、8 NFE，不提供无对应权重的步数切换。`reference_short_edge=2048` 会显著增加参考 token 和显存。
 
@@ -171,7 +171,7 @@ cd /root/ref2va && git pull --ff-only && bash deploy.sh start
 
 ## 单次请求内的 DiT 去重与同步优化（schema 4）
 
-默认 `REF2VA_EXACT_RUNTIME=1`。本版完整运行 8 次 DiT，保留所有注意力和线性分支、FP8 设置、权重及采样器，不启用 Sol 或跨步残差缓存：
+默认 `REF2VA_EXACT_RUNTIME=1`。默认关闭 DBCache 时完整运行 8 次 DiT，保留所有注意力和线性分支、FP8 设置、权重及采样器，不启用 Sol 或跨步残差缓存：
 
 - 同一次请求的 `RoPE(position_ids)`、`token_refiner(context_embedder(prompt_embeds))` 只计算一次，其余 7 次复用。输入存储、形状、stride、版本、dtype、设备与 autocast 变化会失效；请求结束或异常立即释放。不同请求不共享这些结果。
 - 每层线性输出投影的 GPU 布尔索引/`any()`/`sum().item()` 改为 CPU 已知区间切片，保留原 GEMM 的输入形状、连续布局和精度。
@@ -179,7 +179,7 @@ cd /root/ref2va && git pull --ff-only && bash deploy.sh start
 
 适配层只接受固定 OpenVDN 函数的完整源码 hash，保持 `.deps` 工作区不变；源码或注意力方法不匹配直接拒绝启动。启动及历史预热时，在相同输入上对比缓存常量与重算结果、每个 attention 模块第一次输出投影与原始布尔索引路径，要求有限且逐元素一致。各卡先完成去噪并交换校验状态，再统一报错，避免某一卡在 collective 前退出。记录位于 `.runtime/backend/exact-runtime-parity.json`、`warmup-report.json` 以及每次结果的 `upstream.exact_runtime.by_rank`。这是组件和预热案例校验，不是所有提示词的端到端质量证明；本地 CPU 通过也不代表 H200 已测性能。
 
-两个开关都只在启动配置：需要回退本轮优化时执行 `REF2VA_EXACT_RUNTIME=0 REF2VA_ASYNC_OUTPUT=0 bash deploy.sh start`，其余模型、并行 VAE 和编译缓存配置不变。`/openvdn/health` 返回开关及 `metrics_schema_version: 4`。
+两个开关都只在启动配置：需要回退本轮优化时执行 `REF2VA_EXACT_RUNTIME=0 REF2VA_ASYNC_OUTPUT=0 bash deploy.sh start`，其余模型、并行 VAE 和编译缓存配置不变。`/openvdn/health` 返回开关及 `metrics_schema_version: 5`。
 
 `GET /openvdn/jobs/{id}` 成功结果的 `metrics.timings` 返回秒数：
 
@@ -204,3 +204,75 @@ cd /root/ref2va && git pull --ff-only && bash deploy.sh start
 | `processing_wall_seconds` / `api_wall_seconds` | 含下载的处理耗时 / 另含 ComfyUI 排队的总耗时 |
 
 去噪总计、VAE 等阶段仍在边界同步；每步、异步像素处理和视频 D2H 改为 CUDA event。event 时间可包含等待和主机未及时提交造成的间隙，不能当作纯 kernel 耗时之和；音频 D2H 仍采用原同步计时。像素准备、传输与 H.264 编码有重叠，**不要把全部组件时间直接相加**；总耗时使用 `*_wall_seconds`。`upstream.output_encoding` 记录实际设备、编码预设和重叠标记，`upstream.new_geometry` 标记首次形状，`conditioning_cache_hit` 标记条件缓存。首次形状与重复形状应分别比较，不能将首次编译耗时误算为模型重载。旧 `decode_and_encode_seconds` 保留（含末尾八卡 barrier）。计时不包含客户端下载生成视频的网络耗时。
+
+## 按请求分析多卡耗时与 DBCache（schema 5）
+
+更新仍只需一条命令，无新增依赖：
+
+```bash
+cd /root/ref2va && git pull --ff-only && bash deploy.sh start
+```
+
+### 多卡布局与分析
+
+`softmax_ranks` 现在可逐请求指定：6 为 6+2，5 为 5+3，4 为 4+4，0 为普通八卡 Ulysses。只在串行队列的请求边界切换分工，保留权重与 communicator。不同布局单独记录编译几何；首次切换可能编译，随后复用。服务默认仍为 6+2，比较脚本不会替用户永久更改默认值。改变并行分工不引入缓存近似，但浮点运算顺序可能不同，不能承诺逐像素一致。
+
+`profile: true` 按请求开启 CUDA event 分析，默认关闭。返回 `metrics.upstream.parallel_profile`：
+
+- `by_rank`：每卡角色、head 数、各段 `total_ms`、`ms_per_nfe`、调用次数。
+- 分段包含输入准备、所有 DiT blocks、attention、FFN、末尾 gather、输出 head；分支路径进一步包含 QKV、gate、打包、分发等待、softmax/linear 计算、回传及输出投影。
+- `branches` / `max_ms_per_nfe` 用于找慢卡和分支不均衡。计时测到的是计算流上的时间跨度，包含可见等待和提交间隙，并不是独立 NCCL kernel 的纯耗时。
+- `branch_dispatch` 包含 `branch_pack` 和 `branch_relevant_wait`，`output_dispatch` 包含 `output_a2a` 和 `output_unpack`，`blocks` 包含 attention/FFN；这些层级有重叠，不能相加，也不能累加八卡计时作为请求耗时。分析会有额外开销，正式测速使用 `profile: false`。
+
+### Cache-DiT / DBCache 参数
+
+这是按 [Cache-DiT DBCache 算法](https://github.com/vipshop/cache-dit/tree/main/src/cache_dit/caching/cache_blocks) 独立实现的 OpenVDN 八卡适配层 `openvdn_dbcache_adapter_v1`，不是直接安装其 Python 包或 ComfyUI 原生 H3 插件，不启用 TaylorSeer。先完整计算前 Fn 层，比较前缀残差与上次完整计算时的前缀残差；足够相似时复用中间层残差，再完整计算最后 Bn 层。保留原模型的混合 attention、参考图条件、音频、8 次采样调用和后处理。缓存命中会改变去噪轨迹，效果需逐案例对照。
+
+所有参数都可通过 REST / ComfyUI / CLI 按请求设置，不用重启：
+
+| 参数 | 默认 | 含义 |
+| --- | --- | --- |
+| `cache_dit` | false | 开关；关闭时无残差缓存拷贝或额外决策 collective |
+| `cache_dit_threshold` | 0.08 | 复用变化阈值，0–1；越小越保守，0 完全不复用；1 仍需通过变化量检查 |
+| `cache_dit_fn_blocks` | 8 | 每步完整计算前 Fn 层，1–49 |
+| `cache_dit_bn_blocks` | 8 | 每步完整计算后 Bn 层，0–49；Fn+Bn 必须小于 50 |
+| `cache_dit_warmup_steps` | 3 | 前几次 DiT 调用完整计算，1–8；不是额外增加采样步数 |
+| `cache_dit_max_consecutive` | 1 | 最多连续复用几步，1–7 |
+| `cache_dit_max_cached_steps` | 2 | 本次请求总复用步数上限，0–7；0 不复用 |
+| `cache_dit_last_steps` | 1 | 最后几步强制完整计算，0–7；与 warmup 之和不超过 8 |
+
+默认参数是 8 步模型的保守测试起点，尚未在 H200 上验证收益/效果，不是已验证的质量预设。不同于直接把所有 token 混合求均值，适配层分别统计 text、reference、目标 video、audio 的相对 L1 变化，取最大值判断；防止长视频 token 掩盖音频或参考条件的变化。每张卡先计算局部分子/分母，再全局 SUM，兼容不等长序列分片。所有卡得到相同判断后才能跳过中间层的 collective；任一卡缓存缺失、残差非有限或不兼容都会全体回到完整计算。每次请求结束或失败立即清空缓存；启动及历史预热强制关闭 DBCache，完整预热全部 8 步并执行原有数值检查。
+
+向原请求加入如下字段即可开启：
+
+```json
+{
+  "softmax_ranks": 6,
+  "profile": false,
+  "cache_dit": true,
+  "cache_dit_threshold": 0.08,
+  "cache_dit_fn_blocks": 8,
+  "cache_dit_bn_blocks": 8,
+  "cache_dit_warmup_steps": 3,
+  "cache_dit_max_consecutive": 1,
+  "cache_dit_max_cached_steps": 2,
+  "cache_dit_last_steps": 1
+}
+```
+
+返回 `metrics.upstream.cache_dit`：实际参数、`cache_hits`、`cached_steps`（1-based）、`full_steps`、执行/跳过的 block 数、每步原因、各模态误差代理值及 `all_rank_agreement`。`approximate: true` 表示这次实际发生了复用；开启但零命中时不会声称加速。L1 阈值是判断代理量，不是输出画质误差界。
+
+### 自动对比脚本
+
+保存一份正常的 POST 请求为 `case.json`，可在本地或服务器执行：
+
+```bash
+python3 scripts/benchmark_optimizations.py \
+  --server http://43.218.119.131:8188 --request-file case.json \
+  --output-dir work/optimization-benchmark \
+  --layouts 6 5 4 --thresholds 0.04 0.08 0.12 --repeat 3
+```
+
+依次比较 6+2、5+3、4+4 的无缓存热态速度，每种 1 次预热、3 次测速、1 次独立 profile；再在实测最快且热态没有新图编译的布局上比较三个缓存阈值，每种 1 次预热、3 次测速。整轮默认生成 27 条视频，串行使用同一服务；不重启、不结束其他应用。所有参数保持原请求，除布局/分析开关/缓存开关和阈值外不修改提示词、参考图、seed、尺寸或时长。启动实例变化或任务失败立即停止，不静默重试生成。已有结果目录拒绝覆盖。
+
+输出 `results.json`、`summary.json`、`report.md` 和每次请求/完整响应，包括视频链接、缓存命中数、编译情况、每卡分析。报告的耗时只统计独立热态样本中位数，不混入预热或 profile；须另外观看缓存与无缓存视频比较动作、身份和音画同步。未完成 H200 实测前，不承诺某种布局或缓存阈值一定更快。

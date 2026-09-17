@@ -45,6 +45,14 @@ class Settings:
     duration: float | None = None
     ratio: str | None = None
     resolution: int | None = None
+    cache_dit: bool = False
+    cache_dit_threshold: float = 0.08
+    cache_dit_fn_blocks: int = 8
+    cache_dit_bn_blocks: int = 8
+    cache_dit_warmup_steps: int = 3
+    cache_dit_max_consecutive: int = 1
+    cache_dit_max_cached_steps: int = 2
+    cache_dit_last_steps: int = 1
 
     def validate(self):
         for name, low, high in (("num_frames", 107, 345), ("seed", 0, 2**63 - 1),
@@ -62,6 +70,8 @@ class Settings:
                 raise ValueError(f"{name} must be boolean")
         if self.softmax_backend not in ("flex", "decomposed", "ref"):
             raise ValueError("Unsupported softmax_backend")
+        from .cache_dit import CacheConfig
+        CacheConfig.from_settings(self).validate()
         self.render_plan()
         return self
 

@@ -1,6 +1,6 @@
 """Request-local constant reuse and scheduling changes for the pinned OpenVDN.
 
-No denoising activations are reused across steps. The only cached tensors are
+This component does not reuse denoising activations across steps. Its cached tensors are
 RoPE(position_ids) and token_refiner(context_embedder(prompt_embeds)). Attention,
 FP8, model weights, schedulers and the eight denoiser calls remain upstream's.
 """
@@ -106,29 +106,34 @@ def project_video_rows(attn, out, linear_local, runtime, layout, x):
 
 
 class ExactRuntime:
-    def __init__(self, transformer, ulysses, render, *, active=True):
+    def __init__(self, transformer, ulysses, render, *, active=True, block_runtime=None):
         self.active = active
         self.generate = render.generate_latents
         self.values = {}
         self.in_request = False
-        if not active:
+        if not active and block_runtime is None:
             return
         forwards = {}
         for name in ("_ulysses_attention_forward", "_branch_parallel_attention_forward"):
-            forwards[name] = rewrite(getattr(ulysses, name), [(PROJECTION_OLD, PROJECTION_NEW)],
-                                     {"_ref2va_project": project_video_rows})
-        forward = rewrite(ulysses._ulysses_transformer_forward, [
+            forwards[name] = (rewrite(getattr(ulysses, name), [(PROJECTION_OLD, PROJECTION_NEW)],
+                                      {"_ref2va_project": project_video_rows}) if active else getattr(ulysses, name))
+        replacements = [
             ('rotary_emb = self.rope(position_ids)',
              'rotary_emb = self._ref2va_exact.constant("rope", position_ids, lambda: self.rope(position_ids))'),
-            (TEXT_OLD, TEXT_NEW)])
-        self.generate = rewrite(render.generate_latents, [
-            ("step_started = time.perf_counter()", "step_started = _ref2va_step_start(device)"),
-            ("            torch.cuda.synchronize(device)\n            step_seconds.append(time.perf_counter() - step_started)",
-             "            step_seconds.append(_ref2va_step_end(step_started))"),
-            ("    # Unpatchify (the AfterDenoise step's reshape) and unpack the channel-major audio rows.",
-             "    _ref2va_finish_steps(step_seconds)\n\n    # Unpatchify (the AfterDenoise step's reshape) and unpack the channel-major audio rows.")],
-            {"_ref2va_step_start": step_start, "_ref2va_step_end": step_end,
-             "_ref2va_finish_steps": finish_steps})
+            (TEXT_OLD, TEXT_NEW)] if active else []
+        if block_runtime is not None:
+            from .dit_runtime import transformer_replacements
+            replacements += transformer_replacements()
+        forward = rewrite(ulysses._ulysses_transformer_forward, replacements)
+        if active:
+            self.generate = rewrite(render.generate_latents, [
+                ("step_started = time.perf_counter()", "step_started = _ref2va_step_start(device)"),
+                ("            torch.cuda.synchronize(device)\n            step_seconds.append(time.perf_counter() - step_started)",
+                 "            step_seconds.append(_ref2va_step_end(step_started))"),
+                ("    # Unpatchify (the AfterDenoise step's reshape) and unpack the channel-major audio rows.",
+                 "    _ref2va_finish_steps(step_seconds)\n\n    # Unpatchify (the AfterDenoise step's reshape) and unpack the channel-major audio rows.")],
+                {"_ref2va_step_start": step_start, "_ref2va_step_end": step_end,
+                 "_ref2va_finish_steps": finish_steps})
         # Install only after all four source contracts have passed.
         for attn in ulysses.iter_hybrids(transformer):
             name = attn.forward.__func__.__name__
@@ -138,6 +143,8 @@ class ExactRuntime:
             attn.forward = types.MethodType(forwards[name], attn)
         transformer._ref2va_exact = self
         transformer.forward = types.MethodType(forward, transformer)
+        if block_runtime is not None:
+            block_runtime.install_attention(forwards)
 
     @contextmanager
     def request(self, *, verify=False):

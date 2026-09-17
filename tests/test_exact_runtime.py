@@ -204,3 +204,66 @@ def test_cuda_deferred_step_events():
         steps.append(step_end(started))
     finish_steps(steps)
     assert len(steps) == 8 and all(isinstance(t, float) and t >= 0 for t in steps)
+
+
+@pytest.mark.parametrize('exact_enabled', [True, False])
+def test_pinned_forward_with_dit_controller_cache_off_matches_native(exact_enabled):
+    import time
+    from openvdn_comfy.config import Settings
+    from openvdn_comfy.dit_runtime import DiTRuntime
+    ulysses, render = sources()
+    torch.manual_seed(91)
+    model = DummyTransformer(ulysses)
+    native = model.forward
+
+    class Block(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.ff = torch.nn.Linear(8,8)
+        def forward(self,x,temb,indices,rotary):
+            return x + self.ff(x) * .001 + temb.mean(0)[None,None] * .001
+    model.transformer_blocks = torch.nn.ModuleList([Block() for _ in range(50)])
+    rt = model._ulysses_runtime
+    rt.world_size, rt.softmax_ranks, rt.profile_enabled = 8,6,False
+    rt.sequence_to_heads = rt.heads_to_sequence = lambda x:x
+    rt.profile_events = {}
+    rt.reset_profile = lambda:rt.profile_events.clear()
+    rt.profile_start = lambda: time.perf_counter() if rt.profile_enabled else None
+    def end(name,start):
+        if start is not None:
+            rt.profile_events.setdefault(name,[]).append((start,time.perf_counter()))
+    rt.profile_end = end
+    controller = DiTRuntime(model,rt,[model.attn])
+    exact = ExactRuntime(model,ulysses,render,active=exact_enabled,block_runtime=controller)
+    kwargs = dict(hidden_states=torch.randn(1,10,2),audio_hidden_states=torch.randn(1,7,3),
+        encoder_hidden_states=torch.randn(1,3,4),timestep=torch.tensor([.9,.5]),
+        timestep_indices=torch.arange(20)%2,token_tags=torch.arange(20)%3,
+        position_ids=torch.arange(60).reshape(20,3),video_indices=torch.arange(3,13),
+        audio_indices=torch.arange(13,20),text_indices=torch.arange(3),return_dict=False)
+    with torch.no_grad():
+        expected = native(**kwargs)
+        # Profile toggles and branch switches must not change the pinned block
+        # loop math; compare all video/audio outputs for every NFE.
+        for layout,profile in ((6,False),(4,True),(0,True),(6,False)):
+            settings = Settings(softmax_ranks=layout,profile=profile)
+            with controller.request(settings),exact.request():
+                for _ in range(8):
+                    actual = model(**kwargs)
+                    assert all(torch.equal(a,b) for a,b in zip(actual,expected))
+                assert controller.cache.report()['executed_blocks'] == 400
+                assert controller.cache.report()['cache_hits'] == 0
+                if profile:
+                    assert len(rt.profile_events['ffn']) == 400
+                    assert len(rt.profile_events['blocks']) == 400
+                    assert len(rt.profile_events['input_prepare']) == 8
+                    assert len(rt.profile_events['final_gather']) == 8
+                    assert len(rt.profile_events['output_head']) == 8
+                else:
+                    assert not rt.profile_events
+            assert not rt.profile_enabled and not rt.profile_events
+            assert controller.cache.previous is None
+        with controller.request(Settings(cache_dit=True,profile=True),warmup=True),exact.request():
+            assert not controller.cache.config.enabled and not rt.profile_enabled
+            for _ in range(8):
+                model(**kwargs)
+            assert controller.cache.report()['executed_blocks'] == 400

@@ -11,7 +11,8 @@ import psutil
 from .config import RUNTIME, Settings, atomic_json
 
 BACKEND = RUNTIME / "backend"
-PROFILE_FIELDS = ("fp8", "inference_kernels", "softmax_backend", "softmax_ranks", "profile")
+PROFILE_FIELDS = ("fp8", "inference_kernels", "softmax_backend")
+REQUEST_DEFAULT_FIELDS = ("softmax_ranks", "profile")
 
 
 def parallel_vae_enabled():

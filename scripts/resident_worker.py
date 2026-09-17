@@ -11,11 +11,13 @@ import traceback
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from openvdn_comfy.backend import BACKEND, PROFILE_FIELDS, read_json
+from openvdn_comfy.backend import BACKEND, PROFILE_FIELDS, REQUEST_DEFAULT_FIELDS, read_json
 from openvdn_comfy.config import MODELS, RUNTIME, UPSTREAM, Settings, atomic_json, source_lock
 from openvdn_comfy.compile_cache import CompilerMonitor, cache_settings, summarize_compilation
 from openvdn_comfy.fast_output import decode_and_save, measured
 from openvdn_comfy.exact_runtime import ExactRuntime, enabled
+from openvdn_comfy.dit_runtime import DiTRuntime, summarize_profiles, summarize_cache
+from openvdn_comfy.cache_dit import FIELDS as CACHE_FIELDS
 from openvdn_comfy.parallel_vae import decode_parallel
 from openvdn_comfy.resident_geometry import GeometryCache
 from openvdn_comfy.runner import conditioning_key
@@ -105,8 +107,12 @@ def main():
     def state(status, phase, **extra):
         if runtime.is_main:
             atomic_json(BACKEND / "state.json", {"instance": instance, "status": status, "phase": phase,
-                        "profile": profile, "world_size": 8, "video_vae_world_size": 8 if parallel_vae else 1,
-                        "metrics_schema_version": 4, "compile_cache": compile_options,
+                        "profile": {**profile, **{name: getattr(settings, name) for name in REQUEST_DEFAULT_FIELDS}},
+                        "request_options": {"softmax_ranks": list(range(8)), "profile": True,
+                                            "cache_dit": {name: getattr(settings, name) for name in CACHE_FIELDS}},
+                        "active_softmax_ranks": runtime.softmax_ranks,
+                        "world_size": 8, "video_vae_world_size": 8 if parallel_vae else 1,
+                        "metrics_schema_version": 5, "compile_cache": compile_options,
                         "exact_runtime_enabled": enabled("REF2VA_EXACT_RUNTIME"),
                         "async_output_enabled": enabled("REF2VA_ASYNC_OUTPUT"),
                         "updated_at": time.time(), **extra})
@@ -116,7 +122,9 @@ def main():
     if not model.is_hybrid:
         raise RuntimeError("Expected OpenVDN hybrid checkpoint")
     install_ulysses(model.transformer, runtime, softmax_ranks=settings.softmax_ranks)
-    exact_runtime = ExactRuntime(model.transformer, ulysses, render, active=enabled("REF2VA_EXACT_RUNTIME"))
+    dit_runtime = DiTRuntime(model.transformer, runtime, ulysses.iter_hybrids(model.transformer))
+    exact_runtime = ExactRuntime(model.transformer, ulysses, render, active=enabled("REF2VA_EXACT_RUNTIME"),
+                                 block_runtime=dit_runtime)
     runtime.barrier()
     if parallel_vae:
         state("loading", "loading_parallel_video_vaes")
@@ -177,26 +185,30 @@ def main():
         encode_seconds = time.monotonic() - encode_start
         prepare_start = time.monotonic()
         embeds, tags, conditions = render.load_prompt(str(cache), str(device))
+        dit_runtime.select_layout(current.softmax_ranks)
         new_shape = geometries.prepare(runtime, plan, embeds, tags, conditions)
         state("loading" if warmup else "busy", "warming_up" if warmup else "denoising", token=request.get("token"))
         torch.cuda.synchronize(device)
         condition_load_seconds = time.monotonic() - prepare_start
-        runtime.reset_profile()
         steps = []
         compile_before = compiler.snapshot()
         denoise_start = time.monotonic()
-        with exact_runtime.request(verify=warmup):
+        with dit_runtime.request(current, warmup=warmup), exact_runtime.request(verify=warmup):
             latents, audio = exact_runtime.generate(
                 model.transformer, embeds, tags, plan.sampling_frames, 8, current.seed, device,
                 video_shift=12., audio_shift=3., runtime=runtime, step_seconds=steps, conditions=conditions)
             # Include the sampler's final unpatchify/copies in the stage wall time.
             torch.cuda.synchronize(device)
             exact_report = exact_runtime.report()
-        denoise_seconds = time.monotonic() - denoise_start
+            denoise_seconds = time.monotonic() - denoise_start
+            dit_report = dit_runtime.report(denoise_seconds)
         compile_records = [None] * runtime.world_size
         dist.all_gather_object(compile_records, {"rank": runtime.rank, **compiler.since(compile_before),
-                                               "exact_runtime": exact_report})
+                                               "exact_runtime": exact_report, "dit_runtime": dit_report})
         exact_records = [{"rank": item["rank"], **item.pop("exact_runtime")} for item in compile_records]
+        dit_records = [item.pop("dit_runtime") for item in compile_records]
+        parallel_profile = summarize_profiles([item["profile"] for item in dit_records])
+        cache_report = summarize_cache([item["cache_dit"] for item in dit_records])
         if runtime.is_main and warmup:
             atomic_json(BACKEND / "exact-runtime-parity.json", {"instance": instance, "by_rank": exact_records})
         if any(item["parity"]["checked"] and item["parity"]["exact"] is not True for item in exact_records):
@@ -204,8 +216,7 @@ def main():
         compilation = {**summarize_compilation(compile_records), **geometries.last}
         geometries.commit()
         compilation.update(geometries.last)
-        profiles = [None] * 8
-        dist.all_gather_object(profiles, {name: ms / 8 for name, ms in runtime.profile_milliseconds().items()})
+        profiles = [item["profile"]["ms_per_nfe"] for item in dit_records]
         decode_start = time.monotonic()
         decoded_video = None
         video_decode_seconds = None
@@ -265,6 +276,7 @@ def main():
                       "resident": True, "output_encoding": encoding, "video_vae_decode": video_decode_details,
                       "compilation": compilation,
                       "exact_runtime": {"enabled": exact_runtime.active, "by_rank": exact_records},
+                      "parallel_profile": parallel_profile, "cache_dit": cache_report,
                       "new_geometry": new_shape, "flex_backend": flex_latch_state(),
                       "render_plan": plan.metadata()}
             if not denoise_only:
