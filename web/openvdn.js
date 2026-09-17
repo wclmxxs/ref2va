@@ -4,7 +4,7 @@ import { api } from "/scripts/api.js";
 app.registerExtension({
   name: "openvdn.h200.preview",
   async beforeRegisterNodeDef(nodeType, nodeData) {
-    if (nodeData.name !== "OpenVDNH200Generate") return;
+    if (!["OpenVDNH200Generate", "OpenVDNH200Request"].includes(nodeData.name)) return;
     const executed = nodeType.prototype.onExecuted;
     nodeType.prototype.onExecuted = function (message) {
       executed?.apply(this, arguments);

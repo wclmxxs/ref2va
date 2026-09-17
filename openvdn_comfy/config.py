@@ -5,6 +5,7 @@ import os
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from .render_plan import make_plan
 
 ROOT = Path(__file__).resolve().parents[1]
 DEPS = ROOT / ".deps"
@@ -41,6 +42,9 @@ class Settings:
     softmax_ranks: int = 6
     warmup_steps: int = 2
     profile: bool = False
+    duration: float | None = None
+    ratio: str | None = None
+    resolution: int | None = None
 
     def validate(self):
         for name, low, high in (("num_frames", 107, 345), ("seed", 0, 2**63 - 1),
@@ -58,7 +62,11 @@ class Settings:
                 raise ValueError(f"{name} must be boolean")
         if self.softmax_backend not in ("flex", "decomposed", "ref"):
             raise ValueError("Unsupported softmax_backend")
+        self.render_plan()
         return self
+
+    def render_plan(self):
+        return make_plan(self.num_frames, self.duration, self.ratio, self.resolution)
 
     def inference_config(self, prompt_file, output):
         self.validate()
@@ -69,28 +77,10 @@ class Settings:
             "base_source": str(MODELS / "vdn/h3-base"),
             "vae_source": str(MODELS / "vdn/h3-base"),
             "render": {"prompt_file": str(prompt_file), "out": str(output),
-                       "num_frames": self.num_frames, "num_steps": 8,
+                       "num_frames": self.render_plan().sampling_frames, "num_steps": 8,
                        "warmup_steps": self.warmup_steps, "seed": self.seed,
                        "video_shift": 12.0, "audio_shift": 3.0, "record": True},
             "kernels": {"inference_kernels": self.inference_kernels, "softmax_backend": self.softmax_backend},
             "precision": {"dtype": "bfloat16", "fp8": {"enabled": self.fp8, "skip_end_blocks": 0}},
             "parallel": {"softmax_ranks": self.softmax_ranks, "profile": self.profile},
         }
-
-
-def inference_command(config):
-    # A JSON object is valid YAML; paths in the config avoid dotlist quoting
-    # errors for spaces, brackets and commas.
-    return [str(WORKER_PYTHON), "-m", "torch.distributed.run", "--standalone",
-            "--nnodes=1", "--nproc_per_node=8", "src/inference/infer_ulysses.py",
-            "--config", str(config)]
-
-
-def encode_command(prompt, refs, dest, short_edge):
-    args = [str(WORKER_PYTHON), "-m", "src.inference.encode_keyframes" if refs else "src.inference.encode_prompt",
-            "--prompt", prompt, "--out", str(dest), "--model_root", str(MODELS / "conditioner"),
-            "--device", "cuda:0"]
-    if refs:
-        args += ["--vae_root", str(MODELS / "vdn/h3-base"), "--ref_size", str(short_edge),
-                 "--refs", *map(str, refs)]
-    return args

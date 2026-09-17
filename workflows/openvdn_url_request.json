@@ -1,0 +1,68 @@
+{
+  "last_node_id": 1,
+  "last_link_id": 0,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "OpenVDNH200Request",
+      "pos": [
+        735,
+        95
+      ],
+      "size": [
+        550,
+        650
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "links": null,
+          "slot_index": 0
+        },
+        {
+          "name": "metrics_json",
+          "type": "STRING",
+          "links": null,
+          "slot_index": 1
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "OpenVDNH200Request"
+      },
+      "widgets_values": [
+        "The person in <Picture 1> walks toward the camera and waves. Natural ambient sound.",
+        10,
+        "9:16",
+        720,
+        "https://example.com/reference.png",
+        42,
+        "fixed",
+        768,
+        true,
+        true,
+        "flex",
+        6,
+        2,
+        false
+      ]
+    }
+  ],
+  "links": [],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.8,
+      "offset": [
+        30,
+        30
+      ]
+    }
+  },
+  "version": 0.4
+}

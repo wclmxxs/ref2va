@@ -1,1 +1,1 @@
-"""ComfyUI bridge to the unmodified OpenVDN eight-GPU entrypoint."""
+"""ComfyUI bridge to resident eight-GPU inference using OpenVDN components."""

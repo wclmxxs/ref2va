@@ -1,108 +1,123 @@
 # OpenVDN 8 步 · ComfyUI · 8×H200
 
-ComfyUI 负责参考图输入、任务队列和视频预览；推理调用固定版本的 [OpenVDN 官方仓库](https://github.com/OpenVDN/vdn-minimax-h3)。一条视频使用全部 8 张 H200，采用官方 H200 配置的 **6 个 softmax rank + 2 个 linear rank**，8 NFE，默认 FP8。
+一条视频使用全部 8 张 H200。ComfyUI 负责输入、队列和视频预览；常驻八卡进程调用固定版本的 [OpenVDN](https://github.com/OpenVDN/vdn-minimax-h3)，默认 FP8、6 个 softmax rank + 2 个 linear rank、8 NFE。
 
-这里的参考图模式是官方 **Ref2VA-like**：使用 FL2VA 权重接收参考图，**不是 MiniMax 的独立 Ref2VA transformer**。当前仅接收图片参考，不接收参考音频或参考视频。LightX2V 已从当前部署方案移除。
+图片参考模式是官方 **Ref2VA-like**：FL2VA 权重接收参考图，不是 MiniMax 的独立 Ref2VA transformer。暂不接入 LightX2V、Sol、跨步 DiT 缓存或整块 DiT 编译；`inference_kernels` 控制官方融合/局部编译内核组合。
 
-这是官方后端的简单封装。原先要求的 Sol、跨步 DiT 缓存、整块 DiT 编译没有接入：VDN 已有自己的混合注意力，官方没有提供这三个可直接复用的开关。界面的 `inference_kernels` 是官方融合/编译内核组合开关，不能当作整块 DiT 的 `torch.compile` 开关。
+## 一条命令启动
 
-## 在 8×H200 服务器部署
-
-环境：Linux x86_64，完整的 8×H200，能运行 CUDA 12.9 的 NVIDIA 驱动和可用的 NVLink/NCCL。安装需要 Git、curl、CA 证书和 C/C++ 编译工具。为模型、两个 Python 环境和编译缓存预留约 250 GB 空间。模型约 140 GB，其中 Qwen3-VL 条件编码器约 62 GB。
-
-在服务器拉取本仓库后，进入仓库目录，只需执行一个命令：
+已部署的服务器更新：
 
 ```bash
-bash deploy.sh
+cd /root/ref2va && git pull --ff-only && bash deploy.sh start
 ```
 
-默认依次完成环境安装、权重下载、八卡 NCCL 检查和 ComfyUI 启动；任一步失败都会停止，不会继续启动不完整的服务。重复运行会复用下载与安装缓存。`install`、`download`、`check`、`start` 子命令仍可用于单独排查。
+首次部署，在克隆的仓库目录执行 `bash deploy.sh`，自动安装固定版本源码、下载模型并启动。需要 Linux x86_64、8 张完整 H200、支持 CUDA 12.9 的驱动、NVLink/NCCL，约 250 GB 磁盘空间。命令在前台运行，可放入 tmux。
 
-浏览器访问 `http://服务器IP:8188`，在工作流列表打开 `openvdn_ref2va_like.json`（首次启动自动放入列表，后续保留你的修改）。在 Load Image 节点上传自己的参考图，编辑提示词后点击运行，生成节点会显示带音频的视频。增加参考图时复制 Load Image + OpenVDN Reference 两个节点，并用 `previous` 串联 Reference 节点；顺序对应 `<Picture 1>`、`<Picture 2>`……本封装最多 9 张。
+启动依次执行：
 
-命令在前台运行。可以放在 tmux 中；生成过程中先点 ComfyUI 的取消按钮，再退出服务。取消会终止当前编码进程或整组 torchrun 子进程。
+1. 停止本目录的旧服务。
+2. **自动停止所选 8 张 GPU 上已有的计算应用**，释放显存。识别到 systemd 应用服务或 Docker 容器时停止其服务/容器；其他情况停止推理进程树，先 TERM，再在超时后 KILL。不会卸载应用或永久禁用服务。清理动作写入 `.runtime/gpu-cleanup.json`。若外部调度器持续拉起应用，启动报错，不会无限杀进程。
+3. 检查模型、八卡环境与 NCCL。
+4. 加载八份 DiT 和 rank 0 的视频/音频 VAE；Qwen3-VL 条件编码器通过 Accelerate 分配到这 8 张 GPU，单卡权重预算 12 GiB，禁止 CPU/磁盘权重卸载。
+5. 使用一张合成参考图完成条件编码、正式 8 NFE、音视频解码及 MP4 编码预热。默认预热 10 秒、16:9、短边 720。
+6. 预热成功后才启动 ComfyUI，访问 `http://服务器IP:8188`。
 
-安装器固定 Python 3.12，并建立两个环境：
+这是专用八卡服务的启动行为，会中止这些卡上原有的生成任务。设置 `REF2VA_CLEAR_GPU_APPS=0` 可关闭自动清理，改为显存不足时直接退出。清理只在启动执行；生成期间不会停止其他应用。
 
-| 环境 | 用途 | 主要版本 |
-| --- | --- | --- |
-| `.venv-ui` | ComfyUI，CPU 模式 | ComfyUI 0.30.0、torch 2.10、Transformers 4.57.6 |
-| `.venv-vdn` | 官方编码和八卡推理 | torch 2.13.0+cu129、Transformers 5.15、FlashAttention 4 |
+模型全程常驻。后续生成复用 DiT、Qwen3-VL 和 VAE，不重新读权重，不执行额外去噪预热。同一 prompt、参考图内容、参考尺寸和模型版本命中条件缓存时，也会跳过编码。新序列长度/尺寸仍可能触发内核编译；启动预热不能覆盖所有输入形状。保留磁盘编译缓存，并在有限数量的新形状后重置 Dynamo 编译图记录，避免官方单次推理实现达到重编译上限。
 
-源码/模型的精确 revision 见 `sources.lock.json`。Diffusers 固定在官方指定的 base，并应用该 VDN 版本自带的全部补丁。重复安装不会重复打补丁；遇到本地修改会报错并保留文件。其余依赖按官方 `pyproject.toml` / ComfyUI requirements 安装，并非所有间接依赖都完全锁定。
+Ctrl-C 会回收 UI 和整个八卡进程组。取消正在推理的任务会终止整组 NCCL worker，并自动重新加载预热，期间生成接口返回 503。GPU/OOM 等非取消错误会保留 UI 和诊断接口，需执行上述启动命令恢复。
 
-可在上述命令前设置：
+## JSON 接口
+
+提交：`POST /openvdn/jobs`。返回 HTTP 202、`job_id`、`status_url` 和实际输出规格；通过 `GET /openvdn/jobs/{job_id}` 查询。该接口与 UI、CLI 共用队列/文件锁，一次只生成一条视频。
 
 ```bash
-export REF2VA_MODELS=/data/models/openvdn-h3  # 默认 ./models；download/start/render 使用同一个值
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-export REF2VA_PORT=8188
-export REF2VA_LISTEN=0.0.0.0
-# 如下载需要账号：export HF_TOKEN=你的HuggingFaceToken
+curl -sS http://43.218.119.131:8188/openvdn/jobs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "prompt": "The person in <Picture 1> walks toward the camera and waves. Natural ambient sound.",
+    "duration": 10,
+    "ratio": "9:16",
+    "resolution": 720,
+    "reference_image_urls": ["https://example.com/person.png"],
+    "seed": 42
+  }'
 ```
 
-推理进程使用本地权重并开启 Hub 离线模式，不会在生成过程中下载另一版模型。
+| 参数 | 含义 |
+| --- | --- |
+| `prompt` | 必填，最多 24000 字符；图片顺序对应 `<Picture 1>`、`<Picture 2>`…… |
+| `duration` | 秒，4–15，默认 5；按 24 fps 四舍五入到整数帧 |
+| `ratio` | 宽:高，如 `16:9`、`9:16`、`1:1`，默认 `16:9`；范围 1:4–4:1 |
+| `resolution` | 输出短边像素，256–1080 的偶数，默认 720；长边四舍五入到偶数 |
+| `reference_image_urls` | 必填，1–9 个 HTTP(S) 公网图片 URL，最多 20 MiB/张；不接收内网、文件或带凭据的 URL |
+| `reference_image_url` | 单张图片的简写；与复数参数二选一 |
+| `seed` | 默认 42 |
+| `reference_short_edge` | 编码参考图的短边，默认 768、32 的倍数；越大越耗时，独立于输出 `resolution` |
 
-## 控制项
+例如 `duration=10, ratio=9:16, resolution=720` 输出 **720×1280、240 帧、10 秒**。模型内部在 736×1280、243 帧上生成，再缩放到输出尺寸并裁到目标时长，音频同步裁剪。内部宽高对齐 32、帧数对齐 `17n+5`。内部画布面积不超过 1920×1088；支持参数范围不代表所有高分辨率、长时长、多参考组合都能装入显存。
 
-| 控制项 | 默认 | 含义 |
-| --- | --- | --- |
-| `task` | `ref2va_like` | 图片参考；可改为 `t2va` 并断开 references |
-| `num_frames` | 345 | 24 fps，约 14.4 秒；支持 107–345 的 `17n+5` 帧数 |
-| `seed` | 42 | 比较配置时固定 seed |
-| `reference_short_edge` | 768 | 每张参考图的短边；提高到 2048 会明显增加参考 token 和耗时 |
-| `fp8` | true | 官方 FP8 线性层；关闭使用 BF16，可能改变速度、显存及结果 |
-| `inference_kernels` | true | 官方融合和局部编译内核；关闭也不代表 Flex/Triton 不编译 |
-| `softmax_backend` | flex | 官方 H200 默认；可比较 decomposed / ref |
-| `softmax_ranks` | 6 | 6 softmax + 2 linear；0 切换为普通 Ulysses，仍使用 8 卡 |
-| `warmup_steps` | 2 | 计时前额外执行并丢弃的预热 NFE；正式采样仍是 8 NFE |
-| `profile` | false | 开启各 rank 的 CUDA 分段计时；性能对比时通常关闭 |
+成功状态包含 `video_url`（以 `/view?...` 开头，相对于服务地址）和完整 `metrics`。失败包含错误详情。状态保存在磁盘，服务器重启后未完成任务标为 interrupted；不会自动重跑。
 
-输出画布沿用官方固定的 **1344×768**。保持官方训练时的 video/audio shift=12/3，不开放无对应权重的步数或 shift 调节。八卡通信、注意力、采样和解码代码均直接使用官方实现。
+`GET /openvdn/health` 返回 `ready`、当前阶段、八卡信息和常驻模型的 `profile`。就绪/忙碌返回 200，失败或重新预热返回 503。POST 在后端未就绪时返回 503；模型配置与常驻配置不符返回 400。
 
-## 首次验证与计时
+## ComfyUI 与 CLI
 
-先用官方已编码的参考图示例，跳过 Qwen3-VL 编码，验证八卡后端：
+工作流列表包含：
 
-```bash
-./deploy.sh render \
-  --prompt-file .deps/openvdn/prompts/reference/example_ref2va.pt \
-  --output output/official_ref2va_like.mp4
-```
+- `openvdn_url_request.json`：填写时长、比例、短边、参考图片 URL。
+- `openvdn_ref2va_like.json`：兼容原工作流，通过 Load Image 上传图片，Reference 节点可串联；原节点仍用 1344×768 和 `num_frames`。可选择 `t2va` 并断开参考图。
 
-自己的提示词和参考图也可从命令行测试，调用的后端与 ComfyUI 相同：
+首次启动放入工作流列表，后续不会覆盖用户保存的修改。结果节点预览带声音的视频。
+
+服务启动后，CLI 复用同一常驻后端：
 
 ```bash
-./deploy.sh render \
+bash deploy.sh render \
   --prompt 'The person in <Picture 1> walks toward the camera and waves. Natural ambient sound.' \
-  --refs input/person.png \
-  --seed 42 --num-frames 345 \
+  --refs input/person.png --duration 10 --ratio 9:16 --resolution 720 \
   --output output/my_ref2va_like.mp4
 ```
 
-查看 `./deploy.sh render --help` 获得其他参数。CLI 使用 `--no-fp8` 和 `--no-inference-kernels` 关闭对应控制。输出文件已存在会拒绝覆盖。
+`--prompt-file` 支持复用官方 `.pt` 条件缓存；不能与 prompt/refs 同传。输出已存在时拒绝覆盖。
 
-每条任务都执行以下流程：
+## 启动配置
 
-1. 对 prompt、参考图内容及模型版本计算缓存键。命中则复用条件张量；未命中则在 GPU 0 加载 Qwen3-VL 并编码，进程退出后释放显存。
-2. 启动官方八卡 `infer_ulysses.py`，加载模型、预热、执行正式 8 NFE；rank 0 解码视频与音频并写 MP4。
-3. 保存官方原始计时和封装层计时，退出整个八卡进程组。
+| 环境变量 | 默认 | 含义 |
+| --- | --- | --- |
+| `REF2VA_CLEAR_GPU_APPS` | 1 | 启动时清理所选 GPU 的计算应用；0 仅检查 |
+| `CUDA_VISIBLE_DEVICES` | 0,1,2,3,4,5,6,7 | 恰好 8 张卡，可用 GPU UUID |
+| `REF2VA_MODELS` | ./models | 下载、启动使用同一权重目录 |
+| `REF2VA_PORT` / `REF2VA_LISTEN` | 8188 / 0.0.0.0 | ComfyUI 地址 |
+| `REF2VA_FP8` | 1 | 官方 FP8 线性层；0 为 BF16 |
+| `REF2VA_INFERENCE_KERNELS` | 1 | 官方融合/局部编译内核；0 也不代表全部禁用编译 |
+| `REF2VA_SOFTMAX_BACKEND` | flex | flex / decomposed / ref |
+| `REF2VA_SOFTMAX_RANKS` | 6 | 6+2；0 为普通八卡 Ulysses |
+| `REF2VA_PROFILE` | 0 | 各 rank 分段计时 |
+| `REF2VA_WARMUP_DURATION` | 10 | 启动预热时长 |
+| `REF2VA_WARMUP_RATIO` | 16:9 | 启动预热画幅 |
+| `REF2VA_WARMUP_RESOLUTION` | 720 | 启动预热短边 |
+| `REF2VA_REFERENCE_SHORT_EDGE` | 768 | 启动预热参考图短边 |
 
-**每条任务都会重新加载 DiT**。磁盘上的编译缓存可复用，但这不是模型常驻服务；第一次编译可能需要数分钟。这里的“条件缓存”和“编译缓存”都不是跨去噪步的 DiT 结果缓存。同一目录的 UI/CLI 通过文件锁串行使用八卡；不要从多个部署副本同时占用同一组卡。
+要比较精度/内核/并行配置，修改相应环境变量再执行 `bash deploy.sh start`。API 省略这些字段时自动使用当前配置；显式传入 `fp8`、`inference_kernels`、`softmax_backend`、`softmax_ranks`、`profile` 必须与 `/openvdn/health` 一致，避免请求临时重载模型。旧 `warmup_steps` 字段保留兼容，常驻服务统一在启动执行 8 NFE，请求中不再额外预热。
 
-产物：
+固定 video/audio shift=12/3、8 NFE，不提供无对应权重的步数切换。`reference_short_edge=2048` 会显著增加参考 token 和显存。
 
-- ComfyUI 视频：`output/openvdn/*.mp4`
-- 官方计时和内核实际状态：`视频.mp4.inference.json`
-- 完整任务记录：`视频.mp4.metrics.json`，含 queue/encode/inference process/request wall time，以及官方 `upstream.timings`
-- 命令、配置和错误日志：`.runtime/jobs/<job_id>/`
-- 条件与编译缓存：`.runtime/conditioning/`、`.runtime/inductor/`、`.runtime/triton/`
-- ComfyUI 数据库：`.runtime/comfy-user/comfyui.db`；启动脚本显式设置路径并创建父目录，不依赖 ComfyUI 源码中的默认 `user/` 目录。
+## 环境、日志与验证
 
-官方报告的 H200 **18.3 秒**指 8 NFE 的去噪耗时，并非包含编码器、模型加载、预热和 MP4 编码的整条请求耗时，也不是这里测出的结果。与它对比应查看 `upstream.timings.denoise_seconds`；实际使用等待时间看 `request_wall_seconds`。参考图数量和大小也会影响去噪时间。[官方结果和说明](https://github.com/OpenVDN/vdn-minimax-h3#results)
+两套环境：`.venv-ui` 为 ComfyUI 0.30.0、CPU torch 2.10；`.venv-vdn` 为官方 torch 2.13.0+cu129、Transformers 5.15、FlashAttention 4。**UI 日志的 `Device: cpu` 是预期行为，CUDA 由常驻 worker 使用。** 精确源码/模型 revision 见 `sources.lock.json`，Diffusers 使用官方指定 base 和补丁；生成时离线读取固定权重。
 
-## 验证范围
+- 后端加载/推理日志：`.runtime/backend/worker.log`
+- GPU 清理记录：`.runtime/gpu-cleanup.json`
+- API 状态：`.runtime/api/jobs/`
+- 视频：`output/openvdn/*.mp4`；官方计时/内核状态：`视频.mp4.inference.json`
+- 请求耗时、缓存命中、实际规格：`视频.mp4.metrics.json`
+- 请求配置/结果：`.runtime/jobs/<job_id>/`
+- 条件及编译缓存：`.runtime/conditioning/`、`.runtime/inductor/`、`.runtime/triton/`
+- UI 数据库：`.runtime/comfy-user/comfyui.db`，启动显式指定并创建父目录。
 
-本地已验证 Python 请求/缓存/进程取消逻辑、官方 Diffusers 补丁可应用且可重复安装，以及固定版本 ComfyUI 在 CPU 环境中能注册这两个节点。没有在本机安装 Linux CUDA 环境、下载大模型或运行 H200 推理；画质、GPU 峰值显存及速度需要服务器实测。
+worker 异常时 UI/API 会返回出错 rank 的独立堆栈，并附日志末尾（最多 32 KiB / 160 行）。对比去噪速度看 `upstream.timings.denoise_seconds`；用户等待时间看 `request_wall_seconds`，还包括下载图片以外的排队、条件编码和输出编码。官方报告的 H200 18.3 秒是去噪耗时，并不是本项目实测端到端耗时。[官方结果](https://github.com/OpenVDN/vdn-minimax-h3#results)
 
-`./deploy.sh check --nccl` 会检查 8 张完整 H200、固定版本环境/模型、官方配置加载，以及真实的八卡 NCCL all-reduce/all-to-all。通过后再运行上述官方示例。源码、权重的授权条件见 [OpenVDN LICENSE](https://github.com/OpenVDN/vdn-minimax-h3#license) 和模型仓库说明。
+本地测试覆盖请求参数、尺寸/音频裁剪、URL 校验、REST 队列与状态、常驻进程 mailbox/取消、PID 身份、GPU 服务清理分支，以及官方 Ulysses 连续切换序列长度。CPU 测试无法验证 CUDA 内核、峰值显存、Qwen 多卡分配和最终画质；这些需在 8×H200 实测。已有两次服务器尝试均受其他 SGLang 服务占显存影响，没有成功视频，也没有本部署的速度结论。

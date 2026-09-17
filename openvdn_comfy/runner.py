@@ -15,7 +15,8 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .config import (ROOT, RUNTIME, UPSTREAM, WORKER_PYTHON, Settings, atomic_json,
-                     encode_command, inference_command, source_lock)
+                     source_lock)
+from .backend import call_worker
 
 _active = set()
 _active_lock = threading.Lock()
@@ -47,6 +48,8 @@ def worker_environment():
 
 def stop_group(process):
     # torchrun and all ranks share this group; a surviving rank would retain GPUs.
+    if getattr(process, "_openvdn_group_stopped", False):
+        return
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -60,6 +63,22 @@ def stop_group(process):
     except ProcessLookupError:
         pass
     process.wait()
+    process._openvdn_group_stopped = True
+
+
+def log_tail(path, max_bytes=32768, max_lines=160):
+    """Include worker diagnostics in the UI/API without loading an unbounded log."""
+    try:
+        with Path(path).open("rb") as stream:
+            size = stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, size - max_bytes))
+            data = stream.read(max_bytes)
+        if size > max_bytes:
+            data = data.partition(b"\n")[2] or data
+        text = "\n".join(data.decode("utf-8", errors="replace").splitlines()[-max_lines:]).strip()
+        return text or "(worker log is empty)"
+    except OSError as error:
+        return f"(could not read worker log: {error})"
 
 
 def run_process(command, log_path, interrupt=lambda: None, timeout=3600):
@@ -76,7 +95,8 @@ def run_process(command, log_path, interrupt=lambda: None, timeout=3600):
                     raise TimeoutError(f"GPU stage exceeded {timeout}s; see {log_path}")
                 time.sleep(0.2)
             if process.returncode:
-                raise RuntimeError(f"OpenVDN exited with code {process.returncode}; see {log_path}")
+                raise RuntimeError(f"OpenVDN exited with code {process.returncode}; see {log_path}\n"
+                                   f"--- worker log tail ---\n{log_tail(log_path)}")
         except BaseException:
             stop_group(process)
             raise
@@ -117,7 +137,7 @@ def conditioning_key(prompt, refs, short_edge):
 
 
 def generate(*, prompt="", refs=(), settings=None, output=None, prompt_file=None,
-             interrupt=lambda: None, process_runner=run_process):
+             interrupt=lambda: None, worker_call=call_worker, progress=lambda phase: None):
     settings = (settings or Settings()).validate()
     refs = [Path(path).resolve() for path in refs]
     if prompt_file is not None and (refs or prompt):
@@ -139,14 +159,15 @@ def generate(*, prompt="", refs=(), settings=None, output=None, prompt_file=None
         raise FileExistsError(f"Output already exists: {output}")
     output.parent.mkdir(parents=True, exist_ok=True)
     request = {"job_id": job_id, "settings": asdict(settings), "sources": source_lock(),
+               "render_plan": settings.render_plan().metadata(),
                "mode": "cached_prompt" if prompt_file else "ref2va_like" if refs else "t2va",
                "references": list(map(str, refs)), "prompt": prompt, "output": str(output)}
     atomic_json(job / "request.json", request)
     started = time.monotonic()
     try:
+        progress("waiting_for_gpus")
         with gpu_lock(interrupt):
             queue_seconds = time.monotonic() - started
-            encode_seconds, cache_hit = 0.0, prompt_file is not None
             if prompt_file:
                 cache = Path(prompt_file).resolve()
                 if not cache.is_file():
@@ -154,33 +175,18 @@ def generate(*, prompt="", refs=(), settings=None, output=None, prompt_file=None
             else:
                 key = conditioning_key(prompt, refs, settings.reference_short_edge)
                 cache = RUNTIME / "conditioning" / f"{key}.pt"
-                cache.parent.mkdir(parents=True, exist_ok=True)
-                cache_hit = cache.is_file() and cache.stat().st_size > 0
-                if not cache_hit:
-                    temporary = cache.with_suffix(f".{job_id}.tmp.pt")
-                    try:
-                        command = encode_command(prompt, refs, temporary, settings.reference_short_edge)
-                        atomic_json(job / "encode-command.json", command)
-                        encode_seconds = process_runner(command, job / "encode.log", interrupt=interrupt)
-                        if not temporary.is_file() or temporary.stat().st_size == 0:
-                            raise RuntimeError("Encoder succeeded without producing a prompt cache")
-                        temporary.replace(cache)
-                    finally:
-                        temporary.unlink(missing_ok=True)
-            cfg = settings.inference_config(cache, output)
-            atomic_json(job / "inference.json", cfg)
-            command = inference_command(job / "inference.json")
-            atomic_json(job / "inference-command.json", command)
-            inference_seconds = process_runner(command, job / "inference.log", interrupt=interrupt)
+            atomic_json(job / "inference.json", settings.inference_config(cache, output))
+            progress("inference")
+            metrics = worker_call({**request, "prompt_file": str(cache)}, interrupt=interrupt, progress=progress)
             if not output.is_file() or output.stat().st_size == 0:
                 raise RuntimeError("Inference succeeded without producing a video")
             upstream_record = json.loads(Path(str(output) + ".inference.json").read_text())
             if upstream_record["parallel"]["world_size"] != 8:
                 raise RuntimeError("Upstream result did not use 8 GPUs")
             result = {**request, "status": "complete", "log_directory": str(job),
-                      "conditioning_cache_hit": cache_hit, "prompt_file": str(cache),
-                      "queue_seconds": queue_seconds, "encode_seconds": encode_seconds,
-                      "inference_process_seconds": inference_seconds,
+                      "conditioning_cache_hit": metrics["conditioning_cache_hit"], "prompt_file": str(cache),
+                      "queue_seconds": queue_seconds, "encode_seconds": metrics["encode_seconds"],
+                      "inference_process_seconds": metrics["inference_process_seconds"], "resident": True,
                       "request_wall_seconds": time.monotonic() - started,
                       "upstream": upstream_record}
             atomic_json(str(output) + ".metrics.json", result)

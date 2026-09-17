@@ -22,6 +22,7 @@ def deployment(tmp_path):
     shutil.copy(ROOT / "deploy.sh", root / "deploy.sh")
     (root / "workflows").mkdir()
     (root / "workflows/openvdn_ref2va_like.json").write_text('{"starter": true}')
+    (root / "workflows/openvdn_url_request.json").write_text('{"url_starter": true}')
     mock = '#!/bin/sh\nprintf "%s:%s\\n" "$0" "$*" >> "$DEPLOY_TEST_LOG"\n'
     executable(root / ".runtime/bin/uv", mock)
     for env in ("ui", "vdn"):
@@ -45,11 +46,9 @@ def test_no_arguments_runs_every_stage_and_preserves_user_workflow(deployment):
         workflow.write_text('{"edited": true}')
     calls = (root / "calls.log").read_text().splitlines()
     stages = [line.split(":", 1)[1] for line in calls if "/bin/python:" in line]
-    expected = ["scripts/install_sources.py", "scripts/download.py", "scripts/doctor.py --nccl"]
+    expected = ["scripts/install_sources.py", "scripts/download.py", "scripts/doctor.py"]
     assert stages[:3] == expected
-    assert stages[3].startswith(".deps/ComfyUI/main.py --cpu")
-    assert "--user-directory " + str(root / ".runtime/comfy-user") in stages[3]
-    assert "--database-url sqlite:///" + str(root / ".runtime/comfy-user/comfyui.db") in stages[3]
+    assert stages[3] == str(root / "scripts/serve.py")
     assert (root / ".runtime/comfy-user").is_dir()
     assert stages[4:7] == expected
 

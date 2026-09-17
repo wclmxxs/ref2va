@@ -47,11 +47,10 @@ start_ui() {
     if [[ ! -e .runtime/comfy-user/default/workflows/openvdn_ref2va_like.json ]]; then
       cp workflows/openvdn_ref2va_like.json .runtime/comfy-user/default/workflows/
     fi
-    exec .venv-ui/bin/python .deps/ComfyUI/main.py --cpu --disable-dynamic-vram \
-      --listen "${REF2VA_LISTEN:-0.0.0.0}" --port "${REF2VA_PORT:-8188}" \
-      --output-directory "$ROOT/output" --input-directory "$ROOT/input" \
-      --user-directory "$ROOT/.runtime/comfy-user" \
-      --database-url "sqlite:///$ROOT/.runtime/comfy-user/comfyui.db" "$@"
+    if [[ ! -e .runtime/comfy-user/default/workflows/openvdn_url_request.json ]]; then
+      cp workflows/openvdn_url_request.json .runtime/comfy-user/default/workflows/
+    fi
+    exec .venv-ui/bin/python "$ROOT/scripts/serve.py" "$@"
 }
 
 case "$action" in
@@ -60,9 +59,9 @@ case "$action" in
     install_environment
     echo '[2/4] Downloading pinned model weights'
     download_models
-    echo '[3/4] Checking H200 environment and eight-rank NCCL'
-    check_runtime --nccl
-    echo "[4/4] Starting ComfyUI on port ${REF2VA_PORT:-8188}"
+    echo '[3/4] Checking H200 environment'
+    check_runtime
+    echo "[4/4] Releasing GPUs, preloading models, warming up, then starting ComfyUI on ${REF2VA_PORT:-8188}"
     start_ui "$@"
     ;;
   install) install_environment ;;
