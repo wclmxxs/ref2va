@@ -151,6 +151,9 @@ def test_supervisor_gates_ui_on_preload_and_reaps_worker(tmp_path, monkeypatch, 
     ("0::/system.slice/docker.service", None),
     ("0::/user.slice/user-0.slice/session-8.scope", None),
     ("0::/system.slice/systemd-logind.service", None),
+    ("0::/system.slice/supervisor.service", None),
+    ("0::/system.slice/kubelet.service", None),
+    ("0::/system.slice/amazon-ssm-agent.service", None),
 ])
 def test_cleanup_identifies_application_service_only(cgroup, expected):
     assert gpu_cleanup.service_owner(cgroup) == expected

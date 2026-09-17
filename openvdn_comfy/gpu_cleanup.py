@@ -29,7 +29,9 @@ def service_owner(cgroup):
         if match:
             unit = match[1]
             if unit not in {"ssh.service", "sshd.service", "docker.service", "containerd.service",
-                            "systemd-logind.service", "cron.service"} and not unit.startswith("systemd-"):
+                            "systemd-logind.service", "cron.service", "supervisor.service", "supervisord.service",
+                            "kubelet.service", "k3s.service", "k3s-agent.service", "ecs.service",
+                            "amazon-ssm-agent.service"} and not unit.startswith("systemd-"):
                 return unit
     return None
 
