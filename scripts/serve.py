@@ -12,7 +12,7 @@ import uuid
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import psutil
-from openvdn_comfy.backend import BACKEND, health, read_json, same_process, startup_settings, failure_detail
+from openvdn_comfy.backend import BACKEND, health, read_json, same_process, startup_settings, failure_detail, parallel_vae_enabled
 from openvdn_comfy.config import RUNTIME, UPSTREAM, WORKER_PYTHON, atomic_json
 from openvdn_comfy.gpu_cleanup import clear_gpu_applications, stop_tree
 from openvdn_comfy.gpu_check import ensure_free_gpus
@@ -51,7 +51,8 @@ def retire_previous_server():
 def launch_worker():
     settings = startup_settings()
     instance = uuid.uuid4().hex
-    atomic_json(BACKEND / "launch.json", {"instance": instance, "settings": asdict(settings)})
+    atomic_json(BACKEND / "launch.json", {"instance": instance, "settings": asdict(settings),
+                                        "parallel_vae": parallel_vae_enabled()})
     atomic_json(BACKEND / "inference.json", settings.inference_config(BACKEND / "warmup.pt", BACKEND / "warmup.mp4"))
     atomic_json(BACKEND / "state.json", {"instance": instance, "status": "loading", "phase": "starting_ranks"})
     command = [str(WORKER_PYTHON), "-m", "torch.distributed.run", "--standalone", "--nnodes=1",
@@ -83,6 +84,7 @@ def await_ready(process, timeout=3600):
 
 def main():
     startup_settings()  # Validate before stopping an already running deployment.
+    parallel_vae_enabled()
     BACKEND.mkdir(parents=True, exist_ok=True)
     retire_previous_server()
     lock = (BACKEND / "serve.lock").open("a")

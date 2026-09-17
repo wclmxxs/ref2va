@@ -96,6 +96,7 @@ bash deploy.sh render \
 | `REF2VA_SOFTMAX_BACKEND` | flex | flex / decomposed / ref |
 | `REF2VA_SOFTMAX_RANKS` | 6 | 6+2；0 为普通八卡 Ulysses |
 | `REF2VA_PROFILE` | 0 | 各 rank 分段计时 |
+| `REF2VA_VAE_PARALLEL` | 0 | 1 启用八卡视频 VAE 片段并行；启动时逐片段对照原版，校验通过才开放服务 |
 | `REF2VA_WARMUP_DURATION` | 10 | 启动预热时长 |
 | `REF2VA_WARMUP_RATIO` | 9:16 | 启动预热画幅 |
 | `REF2VA_WARMUP_RESOLUTION` | 768 | 启动预热短边 |
@@ -122,7 +123,21 @@ bash deploy.sh render \
 
 worker 异常时 UI/API 会返回出错 rank 的独立堆栈，并附日志末尾（最多 32 KiB / 160 行）。对比去噪速度看 `metrics.timings.denoise_seconds`；REST 从入队到完成看 `metrics.timings.api_wall_seconds`，实际处理看 `processing_wall_seconds`（排除 ComfyUI 排队）。旧 `request_wall_seconds` 保留，排除参考图下载和 ComfyUI 排队。官方报告的 H200 18.3 秒是去噪耗时，并不是本项目实测端到端耗时。[官方结果](https://github.com/OpenVDN/vdn-minimax-h3#results)
 
-本地测试覆盖请求参数、尺寸/音频裁剪、URL 校验、REST 队列与状态、常驻进程 mailbox/取消、PID 身份、GPU 服务清理分支，以及官方 Ulysses 连续切换序列长度。CPU 测试无法验证 CUDA 内核、峰值显存、Qwen 多卡分配和最终画质；这些需在 8×H200 实测。已有两次服务器尝试均受其他 SGLang 服务占显存影响，没有成功视频，也没有本部署的速度结论。
+本地测试覆盖请求参数、尺寸/音频裁剪、URL 校验、REST 队列与状态、常驻进程 mailbox/取消、PID 身份、GPU 服务清理分支，以及官方 Ulysses 连续切换序列长度。CPU 测试无法验证 CUDA 内核、峰值显存、Qwen 多卡分配和最终画质；这些需在 8×H200 实测。2026-09-17 已完成 13 个原模板：短边 768、8–15 秒，排除排队的处理耗时中位数 46.31 秒；包含不同输入首次编译，不能作为纯热态性能。
+
+## 可选：八卡视频 VAE 解码
+
+```bash
+cd /root/ref2va && git pull --ff-only && REF2VA_VAE_PARALLEL=1 bash deploy.sh start
+```
+
+单卡原版 VAE 将 10 秒视频（内部 243 帧）拆成 14 个独立的 `_decode_clip` 调用。本选项将这些调用轮流分配给八卡，每卡常驻同一份原版 float32 VAE 权重，继续使用 float16 autocast。rank 0 接收解码结果后调用原版 `decode()` 完成补帧、重叠融合和尾部裁剪；音频和视频编码保持原流程。不改变采样步数、参考图条件、模型权重或空间分块方式。
+
+启动预热额外逐片段执行 rank 0 原版解码，要求所有并行片段与原版逐元素一致且有限；不一致时启动失败，UI 不会显示就绪。校验记录保存在 `.runtime/backend/vae-parity.json`。失败可用 `REF2VA_VAE_PARALLEL=0 bash deploy.sh start` 恢复单卡解码。默认保持关闭，八卡实测前不承诺加速比。
+
+`/openvdn/health` 的 `video_vae_world_size` 返回 1 或 8。每次生成的 `metrics.upstream.video_vae_decode` 返回实际卡数、片段数、各卡计算时间和传输/组装时间；`video_vae_decode_seconds` 仍为完整视频解码墙钟时间，`output_wall_seconds` 包含它且只计一次。启动校验时间包含原版对照，不应用来判断生成速度。
+
+在版本 61245b4 上，同一 10 秒原模板热态处理 29.74 秒，其中采样 13.78 秒、视频 VAE 12.99 秒。提示词新增一句后首次处理 49.83 秒，再次处理 30.14 秒；前两步的额外开销与静态编译/掩码构建相关，尚未单独计量编译时间。下一步应分别比较八卡 VAE 和编译复用，避免把条件缓存命中或首次编译差异算成解码加速。
 
 
 ## 输出优化与阶段耗时（schema 2）

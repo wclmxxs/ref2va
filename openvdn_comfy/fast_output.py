@@ -109,17 +109,25 @@ def write_mp4(video, audio, sample_rate, plan, output, pixel_mean, pixel_std, ti
 
 
 def decode_and_save(latents, audio_latents, vae, audio_vae, output, device, plan, pixel_mean, pixel_std,
-                    phase=lambda _: None):
+                    phase=lambda _: None, decoded_video=None, video_decode_seconds=None):
     import torch
     timings = {}
     started = time.perf_counter()
     with torch.no_grad():
-        phase("decoding_video_vae")
-        with measured(timings, "video_vae_decode_seconds", device):
-            mean = torch.tensor(vae.config.latents_mean, device=device).view(1, -1, 1, 1, 1)
-            std = torch.tensor(vae.config.latents_std, device=device).view(1, -1, 1, 1, 1)
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
-                video = vae.decode(latents * std + mean, return_dict=False)[0]
+        if decoded_video is None:
+            if video_decode_seconds is not None:
+                raise ValueError("A predecoded video is required with video_decode_seconds")
+            phase("decoding_video_vae")
+            with measured(timings, "video_vae_decode_seconds", device):
+                mean = torch.tensor(vae.config.latents_mean, device=device).view(1, -1, 1, 1, 1)
+                std = torch.tensor(vae.config.latents_std, device=device).view(1, -1, 1, 1, 1)
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    video = vae.decode(latents * std + mean, return_dict=False)[0]
+        else:
+            if video_decode_seconds is None or video_decode_seconds < 0:
+                raise ValueError("Predecoded video requires nonnegative video_decode_seconds")
+            video = decoded_video
+            timings["video_vae_decode_seconds"] = video_decode_seconds
         phase("decoding_audio_vae")
         with measured(timings, "audio_vae_decode_seconds", device):
             mean = torch.tensor(audio_vae.config.latents_mean, device=device).view(1, -1, 1)
@@ -128,5 +136,7 @@ def decode_and_save(latents, audio_latents, vae, audio_vae, output, device, plan
             audio = audio.float().permute(1, 0, 2)[0]
         encoding = write_mp4(video, audio, audio_vae.config.sampling_rate, plan, output,
                              pixel_mean, pixel_std, timings, phase)
-    timings["output_wall_seconds"] = time.perf_counter() - started
+    # A distributed decode happened immediately before this call. Include its
+    # actual wall time once, preserving the existing end-to-end output metric.
+    timings["output_wall_seconds"] = time.perf_counter() - started + (video_decode_seconds or 0.)
     return timings, encoding

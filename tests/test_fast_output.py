@@ -74,3 +74,18 @@ def test_failed_pixel_stage_never_exposes_partial_mp4(tmp_path,native_audio,monk
     with pytest.raises(RuntimeError,match='transfer failed'):
         fast_output.write_mp4(torch.zeros(1,3,107,48,32),torch.zeros(2,192000),48000,plan,tmp_path/'out.mp4',(.5,)*3,(.5,)*3,{})
     assert list(tmp_path.iterdir())==[]
+
+
+def test_predecoded_video_is_not_decoded_again_and_time_is_counted_once(tmp_path, native_audio):
+    plan = make_plan(duration=4, ratio='9:16', resolution=256)
+    video = torch.zeros(1, 3, 107, 48, 32)
+    audio_vae = types.SimpleNamespace(
+        config=types.SimpleNamespace(latents_mean=[0.], latents_std=[1.], sampling_rate=48000),
+        decode=lambda z, **kw: (torch.zeros(2, 1, 192000),))
+    times, _ = fast_output.decode_and_save(None, torch.zeros(1, 1, 1), None, audio_vae,
+                                         tmp_path/'parallel.mp4', 'cpu', plan, (.5,)*3, (.5,)*3,
+                                         decoded_video=video, video_decode_seconds=2.)
+    assert times['video_vae_decode_seconds'] == 2.
+    assert times['output_wall_seconds'] >= 2. + times['audio_vae_decode_seconds']
+    with av.open(str(tmp_path/'parallel.mp4')) as container:
+        assert container.streams.video[0].frames == 96

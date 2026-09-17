@@ -13,7 +13,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from openvdn_comfy.backend import BACKEND, PROFILE_FIELDS, read_json
 from openvdn_comfy.config import MODELS, UPSTREAM, Settings, atomic_json
-from openvdn_comfy.fast_output import decode_and_save
+from openvdn_comfy.fast_output import decode_and_save, measured
+from openvdn_comfy.parallel_vae import decode_parallel
 from openvdn_comfy.resident_geometry import GeometryCache
 sys.path.insert(0, str(UPSTREAM))
 
@@ -74,6 +75,7 @@ def main():
 
     launch = read_json(BACKEND / "launch.json")
     instance = launch["instance"]
+    parallel_vae = launch.get("parallel_vae", False)
     settings = Settings(**launch["settings"]).validate()
     cfg = load_config(InferenceConfig, ["--config", str(BACKEND / "inference.json")],
                       extra_validators=[validate_ablation, validate_kernels, validate_parallel])
@@ -91,7 +93,8 @@ def main():
     def state(status, phase, **extra):
         if runtime.is_main:
             atomic_json(BACKEND / "state.json", {"instance": instance, "status": status, "phase": phase,
-                        "profile": profile, "world_size": 8, "metrics_schema_version": 2, "updated_at": time.time(), **extra})
+                        "profile": profile, "world_size": 8, "video_vae_world_size": 8 if parallel_vae else 1,
+                        "metrics_schema_version": 2, "updated_at": time.time(), **extra})
 
     state("loading", "loading_dit_and_vaes")
     model = build_inference_model(cfg, device, load_decoders=runtime.is_main, log=runtime.is_main)
@@ -99,6 +102,16 @@ def main():
         raise RuntimeError("Expected OpenVDN hybrid checkpoint")
     install_ulysses(model.transformer, runtime, softmax_ranks=settings.softmax_ranks)
     runtime.barrier()
+    if parallel_vae:
+        state("loading", "loading_parallel_video_vaes")
+        if not runtime.is_main:
+            from diffusers import AutoencoderKLMiniMaxH3
+            from src.paths import resolve_weights
+            # Match rank zero's native fp32 weights and autocast compute. Audio
+            # remains on rank zero; each video decoder stays resident after load.
+            model.vae = AutoencoderKLMiniMaxH3.from_pretrained(
+                resolve_weights(cfg.vae_source), subfolder="vae").to(device).eval().requires_grad_(False)
+        runtime.barrier()
     # Release temporary loading buffers before the rank-0 conditioner spans all GPUs.
     torch.cuda.empty_cache()
     runtime.barrier()
@@ -155,19 +168,37 @@ def main():
         profiles = [None] * 8
         dist.all_gather_object(profiles, {name: ms / 8 for name, ms in runtime.profile_milliseconds().items()})
         decode_start = time.monotonic()
+        decoded_video = None
+        video_decode_seconds = None
+        video_decode_details = {"world_size": 1, "native_temporal_assembly": True}
+        if parallel_vae:
+            state("loading" if warmup else "busy", "decoding_video_vae", token=request.get("token"))
+            decode_timings = {}
+            with measured(decode_timings, "video_vae_decode_seconds", device):
+                mean = torch.tensor(model.vae.config.latents_mean, device=device).view(1, -1, 1, 1, 1)
+                std = torch.tensor(model.vae.config.latents_std, device=device).view(1, -1, 1, 1, 1)
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    decoded_video, video_decode_details = decode_parallel(
+                        model.vae, latents * std + mean, rank=runtime.rank, world_size=runtime.world_size,
+                        verify=warmup)
+            video_decode_seconds = decode_timings["video_vae_decode_seconds"]
+            if warmup and runtime.is_main:
+                atomic_json(BACKEND / "vae-parity.json", {"instance": instance, **video_decode_details})
+                print(f"Parallel video VAE: startup parity passed for {video_decode_details['temporal_clips']} clips", flush=True)
         if runtime.is_main:
             state("loading" if warmup else "busy", "decoding", token=request.get("token"))
             output_timings, encoding = decode_and_save(
                 latents, audio, model.vae, model.audio_vae, request["output"], device, plan,
                 render.PIXEL_MEAN, render.PIXEL_STD,
-                phase=lambda phase: state("loading" if warmup else "busy", phase, token=request.get("token")))
+                phase=lambda phase: state("loading" if warmup else "busy", phase, token=request.get("token")),
+                decoded_video=decoded_video, video_decode_seconds=video_decode_seconds)
         runtime.barrier()
         timings = {"denoise_seconds": denoise_seconds, "seconds_per_step": denoise_seconds / 8,
                    "step_seconds": steps, "model_setup_seconds": 0,
                    "decode_and_encode_seconds": time.monotonic() - decode_start,
                    "parallel_profile_ms_per_nfe_by_rank": profiles}
         cleanup_start = time.monotonic()
-        del latents, audio, embeds, tags, conditions
+        del latents, audio, embeds, tags, conditions, decoded_video
         gc.collect()
         torch.cuda.empty_cache()
         runtime.barrier()
@@ -183,7 +214,8 @@ def main():
                       "parallel": {"kind": "ulysses_branch_parallel" if runtime.branch_parallel else "ulysses",
                                    "world_size": 8, "softmax_ranks": runtime.softmax_ranks,
                                    "warmup_steps": 8 if warmup else 0}, "timings": timings,
-                      "resident": True, "output_encoding": encoding, "new_geometry": new_shape, "flex_backend": flex_latch_state(),
+                      "resident": True, "output_encoding": encoding, "video_vae_decode": video_decode_details,
+                      "new_geometry": new_shape, "flex_backend": flex_latch_state(),
                       "render_plan": plan.metadata()}
             atomic_json(request["output"] + ".inference.json", record)
             return {"conditioning_cache_hit": cache_hit, "encode_seconds": encode_seconds,

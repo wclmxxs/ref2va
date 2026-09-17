@@ -14,6 +14,13 @@ BACKEND = RUNTIME / "backend"
 PROFILE_FIELDS = ("fp8", "inference_kernels", "softmax_backend", "softmax_ranks", "profile")
 
 
+def parallel_vae_enabled():
+    value = os.environ.get("REF2VA_VAE_PARALLEL", "0")
+    if value not in ("0", "1"):
+        raise ValueError("REF2VA_VAE_PARALLEL must be 0 or 1")
+    return value == "1"
+
+
 def startup_settings():
     def boolean(name, default):
         value = os.environ.get(name, str(int(default)))
