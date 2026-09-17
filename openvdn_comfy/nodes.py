@@ -135,7 +135,7 @@ class OpenVDNH200Request(OpenVDNH200Generate):
             result["timings"].update(reference_download_seconds=download_seconds, api_queue_seconds=queue_seconds,
                                      processing_wall_seconds=time.monotonic() - started,
                                      api_wall_seconds=queue_seconds + time.monotonic() - started)
-            result["metrics_schema_version"] = 2
+            result["metrics_schema_version"] = 4
             atomic_json(str(output) + ".metrics.json", result)
             atomic_json(Path(result["log_directory"]) / "result.json", result)
             video = {"filename": name, "subfolder": "openvdn", "type": "output"}

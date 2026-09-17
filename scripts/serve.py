@@ -15,6 +15,7 @@ import psutil
 from openvdn_comfy.backend import BACKEND, health, read_json, same_process, startup_settings, failure_detail, parallel_vae_enabled
 from openvdn_comfy.config import RUNTIME, UPSTREAM, WORKER_PYTHON, atomic_json
 from openvdn_comfy.compile_cache import cache_settings
+from openvdn_comfy.exact_runtime import enabled
 from openvdn_comfy.gpu_cleanup import clear_gpu_applications, stop_tree
 from openvdn_comfy.gpu_check import ensure_free_gpus
 from openvdn_comfy.runner import log_tail, stop_group, worker_environment
@@ -87,6 +88,8 @@ def main():
     startup_settings()  # Validate before stopping an already running deployment.
     parallel_vae_enabled()
     cache_settings()
+    enabled("REF2VA_EXACT_RUNTIME")
+    enabled("REF2VA_ASYNC_OUTPUT")
     BACKEND.mkdir(parents=True, exist_ok=True)
     retire_previous_server()
     lock = (BACKEND / "serve.lock").open("a")

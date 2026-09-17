@@ -165,7 +165,21 @@ cd /root/ref2va && git pull --ff-only && bash deploy.sh start
 
 ## 输出优化与阶段耗时
 
-使用原版视频/音频 VAE。输出阶段在 GPU 按 8 帧处理颜色、缩放、uint8 转换，提前裁掉超出目标时长的帧；只复制目标尺寸的 RGB 到 CPU。一个有界预取线程将下一批像素准备与当前批 CPU H.264 编码重叠，避免原流程整段 float32 像素展开和 CPU 插值。MP4 仍原子提交，失败不留下可被误认成功的文件。
+使用原版视频/音频 VAE。输出阶段在 GPU 按 8 帧处理颜色、缩放、uint8 转换，提前裁掉超出目标时长的帧；只复制目标尺寸的 RGB 到 CPU。默认使用两个固定大小的 pinned CPU 缓冲区，独立 CUDA stream 执行像素准备和非阻塞 D2H，CPU 同时编码已完成的批次。消费者只等待该批次的完成事件，编码结束后才复用缓冲区；不在每批前后同步整个 GPU。保留像素运算顺序、舍入、插值、libx264 `veryfast` / CRF 23 / 8 线程和 AAC 参数。MP4 仍原子提交，失败不留下可被误认成功的文件。
+
+`REF2VA_ASYNC_OUTPUT=0` 恢复原有单预取线程输出；CPU 测试也使用此路径。启动合成案例逐批比较异步传回的 RGB 与原同步路径，要求逐元素一致；失败则不开放 UI。`upstream.output_encoding` 返回 `async_pinned_output`、`pixel_timing_method` 和 `pixel_parity`。GPU 对照测试还覆盖非默认生产流、缓冲区复用、非整批尾帧，以及同步/异步输出 MP4 的解码后音视频一致性；在没有 CUDA 的环境中明确跳过，不计为通过。
+
+## 单次请求内的 DiT 去重与同步优化（schema 4）
+
+默认 `REF2VA_EXACT_RUNTIME=1`。本版完整运行 8 次 DiT，保留所有注意力和线性分支、FP8 设置、权重及采样器，不启用 Sol 或跨步残差缓存：
+
+- 同一次请求的 `RoPE(position_ids)`、`token_refiner(context_embedder(prompt_embeds))` 只计算一次，其余 7 次复用。输入存储、形状、stride、版本、dtype、设备与 autocast 变化会失效；请求结束或异常立即释放。不同请求不共享这些结果。
+- 每层线性输出投影的 GPU 布尔索引/`any()`/`sum().item()` 改为 CPU 已知区间切片，保留原 GEMM 的输入形状、连续布局和精度。
+- 每步计时使用 CUDA event，循环结束统一读取，去掉仅为计时增加的逐步全设备同步。模型本身需要的同步不变；没有改变完整隐藏特征的 gather 和输出投影次序。
+
+适配层只接受固定 OpenVDN 函数的完整源码 hash，保持 `.deps` 工作区不变；源码或注意力方法不匹配直接拒绝启动。启动及历史预热时，在相同输入上对比缓存常量与重算结果、每个 attention 模块第一次输出投影与原始布尔索引路径，要求有限且逐元素一致。各卡先完成去噪并交换校验状态，再统一报错，避免某一卡在 collective 前退出。记录位于 `.runtime/backend/exact-runtime-parity.json`、`warmup-report.json` 以及每次结果的 `upstream.exact_runtime.by_rank`。这是组件和预热案例校验，不是所有提示词的端到端质量证明；本地 CPU 通过也不代表 H200 已测性能。
+
+两个开关都只在启动配置：需要回退本轮优化时执行 `REF2VA_EXACT_RUNTIME=0 REF2VA_ASYNC_OUTPUT=0 bash deploy.sh start`，其余模型、并行 VAE 和编译缓存配置不变。`/openvdn/health` 返回开关及 `metrics_schema_version: 4`。
 
 `GET /openvdn/jobs/{id}` 成功结果的 `metrics.timings` 返回秒数：
 
@@ -175,11 +189,12 @@ cd /root/ref2va && git pull --ff-only && bash deploy.sh start
 | `reference_download_seconds` | 图片下载、校验和本地缓存 |
 | `conditioning_seconds` | 文本/图像条件编码与条件缓存；命中时接近零 |
 | `condition_load_seconds` | 条件张量加载至 GPU 和形状准备 |
-| `denoise_seconds` / `step_seconds` | 8 步采样总耗时 / 每一步 GPU 同步耗时 |
+| `denoise_seconds` / `step_seconds` | 8 步采样同步墙钟耗时 / 每步 CUDA event 时间，见 `step_timing_method`；关闭新路径时为原同步墙钟时间 |
 | `dynamo_compile_seconds` / `mask_build_seconds` | 去噪期间 Dynamo 编译框架时间 / GPU 同步的 mask 构建时间；已包含于去噪，可能互相重叠 |
 | `video_vae_decode_seconds` / `audio_vae_decode_seconds` | GPU 视频 / 音频 VAE 解码 |
 | `pixel_prepare_seconds` | GPU 颜色转换、缩放和 uint8 转换，逐批累计 |
 | `device_to_host_seconds` | 音视频 GPU→CPU 传输，逐批累计 |
+| `pixel_prefetch_wait_seconds` | 异步输出中 CPU 等待当前 RGB 批次完成的累计墙钟时间 |
 | `h264_encode_seconds` | RGB→视频帧转换和 CPU H.264 编码，包括 flush |
 | `audio_encode_and_mux_seconds` | CPU AAC 编码和音频封装 |
 | `mux_seconds` / `output_commit_seconds` | 视频封装/容器关闭 / 最终文件原子重命名 |
@@ -188,4 +203,4 @@ cd /root/ref2va && git pull --ff-only && bash deploy.sh start
 | `worker_wall_seconds` / `generation_wall_seconds` | 常驻 worker / 生成调用的墙钟耗时 |
 | `processing_wall_seconds` / `api_wall_seconds` | 含下载的处理耗时 / 另含 ComfyUI 排队的总耗时 |
 
-GPU 阶段在计时边界同步。像素准备与 H.264 编码有重叠，**不要把全部组件时间直接相加**；总耗时使用 `*_wall_seconds`。`upstream.output_encoding` 记录实际设备、编码预设和重叠标记，`upstream.new_geometry` 标记首次形状，`conditioning_cache_hit` 标记条件缓存。首次形状与重复形状应分别比较，不能将首次编译耗时误算为模型重载。旧 `decode_and_encode_seconds` 保留（含末尾八卡 barrier）。计时不包含客户端下载生成视频的网络耗时。
+去噪总计、VAE 等阶段仍在边界同步；每步、异步像素处理和视频 D2H 改为 CUDA event。event 时间可包含等待和主机未及时提交造成的间隙，不能当作纯 kernel 耗时之和；音频 D2H 仍采用原同步计时。像素准备、传输与 H.264 编码有重叠，**不要把全部组件时间直接相加**；总耗时使用 `*_wall_seconds`。`upstream.output_encoding` 记录实际设备、编码预设和重叠标记，`upstream.new_geometry` 标记首次形状，`conditioning_cache_hit` 标记条件缓存。首次形状与重复形状应分别比较，不能将首次编译耗时误算为模型重载。旧 `decode_and_encode_seconds` 保留（含末尾八卡 barrier）。计时不包含客户端下载生成视频的网络耗时。

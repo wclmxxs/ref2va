@@ -15,6 +15,7 @@ from openvdn_comfy.backend import BACKEND, PROFILE_FIELDS, read_json
 from openvdn_comfy.config import MODELS, RUNTIME, UPSTREAM, Settings, atomic_json, source_lock
 from openvdn_comfy.compile_cache import CompilerMonitor, cache_settings, summarize_compilation
 from openvdn_comfy.fast_output import decode_and_save, measured
+from openvdn_comfy.exact_runtime import ExactRuntime, enabled
 from openvdn_comfy.parallel_vae import decode_parallel
 from openvdn_comfy.resident_geometry import GeometryCache
 from openvdn_comfy.runner import conditioning_key
@@ -75,6 +76,7 @@ def main():
     from src.config.inference import InferenceConfig, validate_ablation, validate_kernels, validate_parallel
     from src.inference.utils.assemble import build_inference_model, render_record
     from src.inference.utils.ulysses import init_ulysses, install_ulysses
+    from src.inference.utils import ulysses
     from src.inference import render
 
     launch = read_json(BACKEND / "launch.json")
@@ -104,7 +106,9 @@ def main():
         if runtime.is_main:
             atomic_json(BACKEND / "state.json", {"instance": instance, "status": status, "phase": phase,
                         "profile": profile, "world_size": 8, "video_vae_world_size": 8 if parallel_vae else 1,
-                        "metrics_schema_version": 3, "compile_cache": compile_options,
+                        "metrics_schema_version": 4, "compile_cache": compile_options,
+                        "exact_runtime_enabled": enabled("REF2VA_EXACT_RUNTIME"),
+                        "async_output_enabled": enabled("REF2VA_ASYNC_OUTPUT"),
                         "updated_at": time.time(), **extra})
 
     state("loading", "loading_dit_and_vaes")
@@ -112,6 +116,7 @@ def main():
     if not model.is_hybrid:
         raise RuntimeError("Expected OpenVDN hybrid checkpoint")
     install_ulysses(model.transformer, runtime, softmax_ranks=settings.softmax_ranks)
+    exact_runtime = ExactRuntime(model.transformer, ulysses, render, active=enabled("REF2VA_EXACT_RUNTIME"))
     runtime.barrier()
     if parallel_vae:
         state("loading", "loading_parallel_video_vaes")
@@ -180,12 +185,22 @@ def main():
         steps = []
         compile_before = compiler.snapshot()
         denoise_start = time.monotonic()
-        latents, audio = render.generate_latents(
-            model.transformer, embeds, tags, plan.sampling_frames, 8, current.seed, device,
-            video_shift=12., audio_shift=3., runtime=runtime, step_seconds=steps, conditions=conditions)
+        with exact_runtime.request(verify=warmup):
+            latents, audio = exact_runtime.generate(
+                model.transformer, embeds, tags, plan.sampling_frames, 8, current.seed, device,
+                video_shift=12., audio_shift=3., runtime=runtime, step_seconds=steps, conditions=conditions)
+            # Include the sampler's final unpatchify/copies in the stage wall time.
+            torch.cuda.synchronize(device)
+            exact_report = exact_runtime.report()
         denoise_seconds = time.monotonic() - denoise_start
         compile_records = [None] * runtime.world_size
-        dist.all_gather_object(compile_records, {"rank": runtime.rank, **compiler.since(compile_before)})
+        dist.all_gather_object(compile_records, {"rank": runtime.rank, **compiler.since(compile_before),
+                                               "exact_runtime": exact_report})
+        exact_records = [{"rank": item["rank"], **item.pop("exact_runtime")} for item in compile_records]
+        if runtime.is_main and warmup:
+            atomic_json(BACKEND / "exact-runtime-parity.json", {"instance": instance, "by_rank": exact_records})
+        if any(item["parity"]["checked"] and item["parity"]["exact"] is not True for item in exact_records):
+            raise RuntimeError("Exact runtime startup parity failed; restart with REF2VA_EXACT_RUNTIME=0")
         compilation = {**summarize_compilation(compile_records), **geometries.last}
         geometries.commit()
         compilation.update(geometries.last)
@@ -221,10 +236,11 @@ def main():
                 latents, audio, model.vae, model.audio_vae, request["output"], device, plan,
                 render.PIXEL_MEAN, render.PIXEL_STD,
                 phase=lambda phase: state("loading" if warmup else "busy", phase, token=request.get("token")),
-                decoded_video=decoded_video, video_decode_seconds=video_decode_seconds)
+                decoded_video=decoded_video, video_decode_seconds=video_decode_seconds, verify_output=warmup)
         runtime.barrier()
         timings = {"denoise_seconds": denoise_seconds, "seconds_per_step": denoise_seconds / 8,
                    "step_seconds": steps, "model_setup_seconds": 0,
+                   "step_timing_method": exact_report["step_timing_method"],
                    "dynamo_compile_seconds": compilation["dynamo_compile_seconds"],
                    "mask_build_seconds": compilation["mask_build_seconds"],
                    "decode_and_encode_seconds": time.monotonic() - decode_start,
@@ -248,6 +264,7 @@ def main():
                                    "warmup_steps": 8 if warmup else 0}, "timings": timings,
                       "resident": True, "output_encoding": encoding, "video_vae_decode": video_decode_details,
                       "compilation": compilation,
+                      "exact_runtime": {"enabled": exact_runtime.active, "by_rank": exact_records},
                       "new_geometry": new_shape, "flex_backend": flex_latch_state(),
                       "render_plan": plan.metadata()}
             if not denoise_only:
@@ -280,6 +297,7 @@ def main():
             replay_metrics.append({"prompt_file": replay["prompt_file"],
                                    "render_plan": result["upstream"]["render_plan"],
                                    "timings": result["upstream"]["timings"],
+                                   "exact_runtime": result["upstream"]["exact_runtime"],
                                    "compilation": result["upstream"]["compilation"]})
             print(f"Startup history warmup {index + 1}/{len(replay_box[0])} complete", flush=True)
     if runtime.is_main:

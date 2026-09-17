@@ -89,3 +89,69 @@ def test_predecoded_video_is_not_decoded_again_and_time_is_counted_once(tmp_path
     assert times['output_wall_seconds'] >= 2. + times['audio_vae_decode_seconds']
     with av.open(str(tmp_path/'parallel.mp4')) as container:
         assert container.streams.video[0].frames == 96
+
+
+@pytest.mark.parametrize('dtype', [torch.float16, torch.float32])
+@pytest.mark.parametrize('resolution', [256, 258])
+def test_preparation_matches_previous_math_with_uneven_tail(dtype, resolution):
+    torch.manual_seed(7)
+    plan = make_plan(duration=4.125, ratio='9:16', resolution=resolution)
+    video = torch.randn(1, 3, plan.output_frames + 5, 48, 32, dtype=dtype)
+    mean, std = (.485, .456, .406), (.229, .224, .225)
+    legacy = (video.float() * torch.tensor(std).view(1,3,1,1,1) + torch.tensor(mean).view(1,3,1,1,1)).clamp(0,1)
+    legacy = (legacy[0].permute(1,2,3,0)*255).round().to(torch.uint8)
+    expected = torch.cat(list(output_chunks(legacy, plan)))
+    actual = torch.cat([fast_output.prepare_pixels(video, i, plan, mean, std)
+                        for i in range(0, plan.output_frames, 8)])
+    assert torch.equal(actual, expected)
+
+
+def test_encoder_failure_closes_prefetch_and_removes_partial(tmp_path, native_audio, monkeypatch):
+    closed = []
+    def broken_chunks(*args):
+        try:
+            yield 0, torch.zeros(8, 456, 256, 3, dtype=torch.uint8)
+            raise RuntimeError('prefetch failed after first batch')
+        finally:
+            closed.append(True)
+    monkeypatch.setattr(fast_output, 'threaded_pixels', broken_chunks)
+    plan = make_plan(duration=4, ratio='9:16', resolution=256)
+    with pytest.raises(RuntimeError, match='prefetch failed'):
+        fast_output.write_mp4(torch.zeros(1,3,107,48,32), torch.zeros(2,192000), 48000, plan,
+                             tmp_path/'broken.mp4', (.5,)*3, (.5,)*3, {})
+    assert closed == [True] and not list(tmp_path.iterdir())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA pinned D2H pipeline required')
+def test_cuda_two_buffers_preserve_pixels_and_stream_dependencies():
+    plan = make_plan(duration=4.125, ratio='9:16', resolution=256)
+    source_stream = torch.cuda.Stream()
+    with torch.cuda.stream(source_stream):
+        video = torch.randn(1, 3, plan.output_frames + 4, 48, 32, device='cuda')
+        producer = fast_output.PinnedPixels(video, plan, (.5,)*3, (.5,)*3, {}, verify=True)
+    chunks = list((start, chunk.clone()) for start, chunk in producer.chunks())
+    expected = torch.cat([fast_output.pixel_chunk(video, i, plan, (.5,)*3, (.5,)*3, {})
+                          for i in range(0, plan.output_frames, 8)])
+    assert torch.equal(torch.cat([chunk for _, chunk in chunks]), expected)
+    assert [start for start, _ in chunks] == list(range(0, plan.output_frames, 8))
+    assert producer.checked_chunks == len(chunks)
+    assert len(producer.buffers) == 2 and all(b.is_pinned() for b in producer.buffers)
+    assert not producer.pending
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA pinned D2H pipeline required')
+def test_cuda_real_mp4_matches_synchronous_encoder(tmp_path, native_audio, monkeypatch):
+    plan = make_plan(duration=4.125, ratio='9:16', resolution=256)
+    video = torch.randn(1,3,plan.output_frames+4,48,32, device='cuda')
+    audio = torch.randn(2,198000, device='cuda') * .01
+    files = [tmp_path/'sync.mp4', tmp_path/'async.mp4']
+    for option, path in zip(('0', '1'), files):
+        monkeypatch.setenv('REF2VA_ASYNC_OUTPUT', option)
+        encoding = fast_output.write_mp4(video, audio, 48000, plan, path, (.5,)*3, (.5,)*3, {}, verify=True)
+        assert encoding['async_pinned_output'] == (option == '1')
+    for media in ('video', 'audio'):
+        with av.open(str(files[0])) as a, av.open(str(files[1])) as b:
+            first = [torch.from_numpy(f.to_ndarray()) for f in a.decode(**{media: 0})]
+            second = [torch.from_numpy(f.to_ndarray()) for f in b.decode(**{media: 0})]
+            assert len(first) == len(second)
+            assert all(torch.equal(x, y) for x, y in zip(first, second))
