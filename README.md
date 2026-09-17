@@ -19,7 +19,7 @@ cd /root/ref2va && git pull --ff-only && bash deploy.sh start
 1. 停止本目录的旧服务。
 2. **自动停止所选 8 张 GPU 上已有的计算应用**，释放显存。识别到 systemd 应用服务或 Docker 容器时停止其服务/容器；其他情况停止推理进程树，先 TERM，再在超时后 KILL。不会卸载应用或永久禁用服务。清理动作写入 `.runtime/gpu-cleanup.json`。若外部调度器持续拉起应用，启动报错，不会无限杀进程。
 3. 检查模型、八卡环境与 NCCL。
-4. 加载八份 DiT 和 rank 0 的视频/音频 VAE；Qwen3-VL 条件编码器通过 Accelerate 分配到这 8 张 GPU，单卡权重预算 12 GiB，禁止 CPU/磁盘权重卸载。
+4. 加载八份 DiT、默认八份视频 VAE 和 rank 0 的音频 VAE；Qwen3-VL 条件编码器通过 Accelerate 分配到这 8 张 GPU，单卡权重预算 12 GiB，禁止 CPU/磁盘权重卸载。
 5. 使用一张合成参考图完成条件编码、正式 8 NFE、音视频解码及 MP4 编码预热。默认预热 10 秒、9:16、短边 768。
 6. 预热成功后才启动 ComfyUI，访问 `http://服务器IP:8188`。
 
@@ -96,7 +96,9 @@ bash deploy.sh render \
 | `REF2VA_SOFTMAX_BACKEND` | flex | flex / decomposed / ref |
 | `REF2VA_SOFTMAX_RANKS` | 6 | 6+2；0 为普通八卡 Ulysses |
 | `REF2VA_PROFILE` | 0 | 各 rank 分段计时 |
-| `REF2VA_VAE_PARALLEL` | 0 | 1 启用八卡视频 VAE 片段并行；启动时逐片段对照原版，校验通过才开放服务 |
+| `REF2VA_VAE_PARALLEL` | 1 | 八卡视频 VAE 片段并行及预分配 tile 拼接；启动时逐片段对照未优化原版，校验通过才开放服务；0 恢复原版单卡 |
+| `REF2VA_COMPILE_SHAPES` | 32 | 编译图轮换前保留的成功几何配置数，8–64；达到容量后才重置 Dynamo，保留磁盘缓存和 mask LRU |
+| `REF2VA_WARMUP_RECENT` | 8 | 启动时额外预热最近成功形状，0 关闭，最大为编译形状容量减 1；增加启动时间以减少首次业务请求耗时 |
 | `REF2VA_WARMUP_DURATION` | 10 | 启动预热时长 |
 | `REF2VA_WARMUP_RATIO` | 9:16 | 启动预热画幅 |
 | `REF2VA_WARMUP_RESOLUTION` | 768 | 启动预热短边 |
@@ -125,22 +127,43 @@ worker 异常时 UI/API 会返回出错 rank 的独立堆栈，并附日志末�
 
 本地测试覆盖请求参数、尺寸/音频裁剪、URL 校验、REST 队列与状态、常驻进程 mailbox/取消、PID 身份、GPU 服务清理分支，以及官方 Ulysses 连续切换序列长度。CPU 测试无法验证 CUDA 内核、峰值显存、Qwen 多卡分配和最终画质；这些需在 8×H200 实测。2026-09-17 已完成 13 个原模板：短边 768、8–15 秒，排除排队的处理耗时中位数 46.31 秒；包含不同输入首次编译，不能作为纯热态性能。
 
-## 可选：八卡视频 VAE 解码
+## 默认八卡视频 VAE 解码
 
 ```bash
-cd /root/ref2va && git pull --ff-only && REF2VA_VAE_PARALLEL=1 bash deploy.sh start
+cd /root/ref2va && git pull --ff-only && bash deploy.sh start
 ```
 
-单卡原版 VAE 将 10 秒视频（内部 243 帧）拆成 14 个独立的 `_decode_clip` 调用。本选项将这些调用轮流分配给八卡，每卡常驻同一份原版 float32 VAE 权重，继续使用 float16 autocast。rank 0 接收解码结果后调用原版 `decode()` 完成补帧、重叠融合和尾部裁剪；音频和视频编码保持原流程。不改变采样步数、参考图条件、模型权重或空间分块方式。
+单卡原版 VAE 将 10 秒视频（内部 243 帧）拆成 14 个独立的 `_decode_clip` 调用。默认将这些调用轮流分配给八卡，每卡常驻同一份原版 float32 VAE 权重，继续使用 float16 autocast。rank 0 接收解码结果后调用原版 `decode()` 完成补帧、重叠融合和尾部裁剪；音频和视频编码保持原流程。不改变采样步数、参考图条件、模型权重或空间分块方式。
 
-启动预热额外逐片段执行 rank 0 原版解码，要求所有并行片段与原版逐元素一致且有限；不一致时启动失败，UI 不会显示就绪。校验记录保存在 `.runtime/backend/vae-parity.json`。失败可用 `REF2VA_VAE_PARALLEL=0 bash deploy.sh start` 恢复单卡解码。默认保持关闭，八卡实测前不承诺加速比。
+每个时间片段内部仍使用原版空间 tile 和重叠区域。借鉴 SGLang 路径，空间拼接先分配最终张量，再逐块拷入，省掉各行 `cat` 再整幅 `cat` 的大张量拷贝；小型融合权重按设备、精度、重叠长度缓存。先纵向再横向融合、浮点乘加顺序均保持原版。这里只并行完整时间片段，不对 ViT 层做空间切分，也不新增 padding 或改注意力后端。
 
-`/openvdn/health` 的 `video_vae_world_size` 返回 1 或 8。每次生成的 `metrics.upstream.video_vae_decode` 返回实际卡数、片段数、各卡计算时间和传输/组装时间；`video_vae_decode_seconds` 仍为完整视频解码墙钟时间，`output_wall_seconds` 包含它且只计一次。启动校验时间包含原版对照，不应用来判断生成速度。
+启动预热额外逐片段执行 rank 0 未优化的原版解码，要求所有并行/优化片段与原版逐元素一致且有限；不一致时启动失败，UI 不会显示就绪。校验记录保存在 `.runtime/backend/vae-parity.json`。失败可用 `REF2VA_VAE_PARALLEL=0 bash deploy.sh start` 恢复单卡解码。CPU 测试通过不代表已完成 H200 性能验证，实测前不承诺加速比。
+
+`/openvdn/health` 的 `video_vae_world_size` 返回 1 或 8。每次生成的 `metrics.upstream.video_vae_decode` 返回实际卡数、片段数、`spatial_tiles_by_rank`、各卡计算时间和传输/组装时间；`video_vae_decode_seconds` 仍为完整视频解码墙钟时间，`output_wall_seconds` 包含它且只计一次。启动校验时间包含原版对照，不应用来判断生成速度。
 
 在版本 61245b4 上，同一 10 秒原模板热态处理 29.74 秒，其中采样 13.78 秒、视频 VAE 12.99 秒。提示词新增一句后首次处理 49.83 秒，再次处理 30.14 秒；前两步的额外开销与静态编译/掩码构建相关，尚未单独计量编译时间。下一步应分别比较八卡 VAE 和编译复用，避免把条件缓存命中或首次编译差异算成解码加速。
 
 
-## 输出优化与阶段耗时（schema 2）
+## 编译缓存及启动预热（schema 3）
+
+保留 `.runtime/inductor/`、`.runtime/triton/`，显式开启 PyTorch FX graph/AOTAutograd 磁盘缓存；这些环境变量可由部署覆盖。缓存目录应随部署保留，PyTorch 自己按源码、硬件和编译配置判定能否复用，不在 H200/B200 之间强行复用二进制。
+
+原先每 8 种几何配置就重置全部编译记录，现默认允许 32 种成功配置，并给每个静态 helper 预留多版本编译预算。超过容量才轮换 Dynamo 图，mask 的原有 64 项 LRU 不随之清空。保留超出编译预算直接报错的行为，避免 Flex 静默进入高显存 eager 路径。`geometry_seen` 仅表示进程执行过该输入布局，实际新图编译与磁盘缓存命中另由 PyTorch 计数返回，不能混为一谈。
+
+启动先完成一次完整 8 NFE、视频/音频 VAE、输出编码和数值校验，再用 `.runtime/backend/warmup-history.json` 中最近 8 个成功配置预热完整 8 NFE。历史预热直接加载已有条件 `.pt`，不重新下载图片或编码，也不导出重复视频。首次升级会从相同源码/模型版本的 `.runtime/jobs/*/result.json` 成功记录迁移；缺失缓存、失败记录和不匹配配置会跳过。固定启动参考图的条件缓存也按内容/源码版本复用。所有预热完成后才开放服务，记录在 `.runtime/backend/warmup-report.json`。
+
+本版不做 4096 token padding，也不把 FLASH Flex 改为动态形状：当前 OpenVDN 的有效 conditioning 和 mask 布局不能直接套用 SGLang 的分桶规则。新布局仍可能首次编译；优化的是已有布局的复用、重启预热和可观测性。
+
+`metrics.upstream.compilation` 返回：
+
+- `geometry_id` / `geometry_seen` / `successful_geometries`：布局指纹、此前是否成功运行和当前保留数。
+- `reset` / `reset_reason` / `generation`：是否因容量轮换及轮换次数。
+- `compiled_new_graph`：本次去噪是否有 Dynamo 新图；不是所有底层 JIT 的通用命中标记。
+- `by_rank`：各卡的 `unique_graphs`、`fxgraph_cache_hits/misses`、`mask_hits/misses`、`dynamo_compile_seconds`、`mask_build_seconds`。
+
+`metrics.timings.dynamo_compile_seconds` 和 `mask_build_seconds` 取各卡最大值，不累加并发的八卡时间。前者来自 PyTorch `entire_frame_compile`，包含 tracing/图缓存加载等编译框架工作，不单指 CUDA kernel 编译；后者在 mask 缓存未命中时 GPU 同步计时。两者都嵌套在 `denoise_seconds` 内，彼此也可能重叠，不可加到去噪或总耗时上。
+
+## 输出优化与阶段耗时
 
 使用原版视频/音频 VAE。输出阶段在 GPU 按 8 帧处理颜色、缩放、uint8 转换，提前裁掉超出目标时长的帧；只复制目标尺寸的 RGB 到 CPU。一个有界预取线程将下一批像素准备与当前批 CPU H.264 编码重叠，避免原流程整段 float32 像素展开和 CPU 插值。MP4 仍原子提交，失败不留下可被误认成功的文件。
 
@@ -153,6 +176,7 @@ cd /root/ref2va && git pull --ff-only && REF2VA_VAE_PARALLEL=1 bash deploy.sh st
 | `conditioning_seconds` | 文本/图像条件编码与条件缓存；命中时接近零 |
 | `condition_load_seconds` | 条件张量加载至 GPU 和形状准备 |
 | `denoise_seconds` / `step_seconds` | 8 步采样总耗时 / 每一步 GPU 同步耗时 |
+| `dynamo_compile_seconds` / `mask_build_seconds` | 去噪期间 Dynamo 编译框架时间 / GPU 同步的 mask 构建时间；已包含于去噪，可能互相重叠 |
 | `video_vae_decode_seconds` / `audio_vae_decode_seconds` | GPU 视频 / 音频 VAE 解码 |
 | `pixel_prepare_seconds` | GPU 颜色转换、缩放和 uint8 转换，逐批累计 |
 | `device_to_host_seconds` | 音视频 GPU→CPU 传输，逐批累计 |

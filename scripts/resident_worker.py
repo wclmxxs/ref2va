@@ -12,10 +12,14 @@ import traceback
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from openvdn_comfy.backend import BACKEND, PROFILE_FIELDS, read_json
-from openvdn_comfy.config import MODELS, UPSTREAM, Settings, atomic_json
+from openvdn_comfy.config import MODELS, RUNTIME, UPSTREAM, Settings, atomic_json, source_lock
+from openvdn_comfy.compile_cache import CompilerMonitor, cache_settings, summarize_compilation
 from openvdn_comfy.fast_output import decode_and_save, measured
 from openvdn_comfy.parallel_vae import decode_parallel
 from openvdn_comfy.resident_geometry import GeometryCache
+from openvdn_comfy.runner import conditioning_key
+from openvdn_comfy.vae_tiles import ClipDecoder
+from openvdn_comfy.warmup_history import WarmupHistory
 sys.path.insert(0, str(UPSTREAM))
 
 
@@ -76,6 +80,12 @@ def main():
     launch = read_json(BACKEND / "launch.json")
     instance = launch["instance"]
     parallel_vae = launch.get("parallel_vae", False)
+    compile_options = launch.get("compile_cache", cache_settings())
+    torch._dynamo.config.recompile_limit = max(
+        compile_options["recompile_limit"], torch._dynamo.config.recompile_limit)
+    torch._dynamo.config.accumulated_recompile_limit = max(
+        compile_options["recompile_limit"] * 4, torch._dynamo.config.accumulated_recompile_limit)
+    torch._dynamo.config.fail_on_recompile_limit_hit = True
     settings = Settings(**launch["settings"]).validate()
     cfg = load_config(InferenceConfig, ["--config", str(BACKEND / "inference.json")],
                       extra_validators=[validate_ablation, validate_kernels, validate_parallel])
@@ -94,7 +104,8 @@ def main():
         if runtime.is_main:
             atomic_json(BACKEND / "state.json", {"instance": instance, "status": status, "phase": phase,
                         "profile": profile, "world_size": 8, "video_vae_world_size": 8 if parallel_vae else 1,
-                        "metrics_schema_version": 2, "updated_at": time.time(), **extra})
+                        "metrics_schema_version": 3, "compile_cache": compile_options,
+                        "updated_at": time.time(), **extra})
 
     state("loading", "loading_dit_and_vaes")
     model = build_inference_model(cfg, device, load_decoders=runtime.is_main, log=runtime.is_main)
@@ -121,14 +132,19 @@ def main():
     # Cache checkpoint metadata once; hashing the checkpoint per job is unnecessary.
     base_record = render_record(cfg, model) if runtime.is_main else None
     from src.models.softmax_attention import flex_attention as flex_module
+    compiler = CompilerMonitor(flex_module, device)
+    clip_decoder = ClipDecoder(model.vae) if parallel_vae else None
+    history = WarmupHistory(BACKEND / "warmup-history.json", source_lock(), profile,
+                            capacity=compile_options["max_shapes"]) if runtime.is_main else None
 
     def reset_compiler():
         torch._dynamo.reset()
-        flex_module._MASK_CACHE.clear()
+        # BlockMasks are deterministic tensors, independent of Dynamo's graph
+        # lifetime. Keep their existing bounded LRU across a graph rotation.
         gc.collect()
-    geometries = GeometryCache(reset_compiler)
+    geometries = GeometryCache(reset_compiler, max_shapes=compile_options["max_shapes"])
 
-    def run(request, warmup=False):
+    def run(request, warmup=False, denoise_only=False):
         current = Settings(**request["settings"]).validate()
         if any(getattr(current, name) != profile[name] for name in PROFILE_FIELDS):
             raise ValueError("Request must use the resident model profile")
@@ -138,6 +154,8 @@ def main():
         worker_start = time.monotonic()
         encode_start = time.monotonic()
         cache_hit = cache.is_file() and cache.stat().st_size > 0
+        if request.get("require_cached_prompt") and not cache_hit:
+            raise RuntimeError(f"Warmup conditioning cache disappeared: {cache}")
         if runtime.is_main and not cache_hit:
             state("loading" if warmup else "busy", "encoding_references", token=request.get("token"))
             cache.parent.mkdir(parents=True, exist_ok=True)
@@ -160,32 +178,44 @@ def main():
         condition_load_seconds = time.monotonic() - prepare_start
         runtime.reset_profile()
         steps = []
+        compile_before = compiler.snapshot()
         denoise_start = time.monotonic()
         latents, audio = render.generate_latents(
             model.transformer, embeds, tags, plan.sampling_frames, 8, current.seed, device,
             video_shift=12., audio_shift=3., runtime=runtime, step_seconds=steps, conditions=conditions)
         denoise_seconds = time.monotonic() - denoise_start
+        compile_records = [None] * runtime.world_size
+        dist.all_gather_object(compile_records, {"rank": runtime.rank, **compiler.since(compile_before)})
+        compilation = {**summarize_compilation(compile_records), **geometries.last}
+        geometries.commit()
+        compilation.update(geometries.last)
         profiles = [None] * 8
         dist.all_gather_object(profiles, {name: ms / 8 for name, ms in runtime.profile_milliseconds().items()})
         decode_start = time.monotonic()
         decoded_video = None
         video_decode_seconds = None
         video_decode_details = {"world_size": 1, "native_temporal_assembly": True}
-        if parallel_vae:
+        output_timings, encoding = {}, {}
+        if parallel_vae and not denoise_only:
             state("loading" if warmup else "busy", "decoding_video_vae", token=request.get("token"))
             decode_timings = {}
+            clip_decoder.tile_count = 0
             with measured(decode_timings, "video_vae_decode_seconds", device):
                 mean = torch.tensor(model.vae.config.latents_mean, device=device).view(1, -1, 1, 1, 1)
                 std = torch.tensor(model.vae.config.latents_std, device=device).view(1, -1, 1, 1, 1)
                 with torch.autocast(device_type="cuda", dtype=torch.float16):
                     decoded_video, video_decode_details = decode_parallel(
                         model.vae, latents * std + mean, rank=runtime.rank, world_size=runtime.world_size,
-                        verify=warmup)
+                        verify=warmup, clip_decode=clip_decoder)
+            tile_counts = [None] * runtime.world_size
+            dist.all_gather_object(tile_counts, clip_decoder.tile_count)
+            video_decode_details.update(spatial_tiles_by_rank=tile_counts,
+                                        stitch="preallocated_native_blending")
             video_decode_seconds = decode_timings["video_vae_decode_seconds"]
             if warmup and runtime.is_main:
                 atomic_json(BACKEND / "vae-parity.json", {"instance": instance, **video_decode_details})
                 print(f"Parallel video VAE: startup parity passed for {video_decode_details['temporal_clips']} clips", flush=True)
-        if runtime.is_main:
+        if runtime.is_main and not denoise_only:
             state("loading" if warmup else "busy", "decoding", token=request.get("token"))
             output_timings, encoding = decode_and_save(
                 latents, audio, model.vae, model.audio_vae, request["output"], device, plan,
@@ -195,6 +225,8 @@ def main():
         runtime.barrier()
         timings = {"denoise_seconds": denoise_seconds, "seconds_per_step": denoise_seconds / 8,
                    "step_seconds": steps, "model_setup_seconds": 0,
+                   "dynamo_compile_seconds": compilation["dynamo_compile_seconds"],
+                   "mask_build_seconds": compilation["mask_build_seconds"],
                    "decode_and_encode_seconds": time.monotonic() - decode_start,
                    "parallel_profile_ms_per_nfe_by_rank": profiles}
         cleanup_start = time.monotonic()
@@ -215,9 +247,13 @@ def main():
                                    "world_size": 8, "softmax_ranks": runtime.softmax_ranks,
                                    "warmup_steps": 8 if warmup else 0}, "timings": timings,
                       "resident": True, "output_encoding": encoding, "video_vae_decode": video_decode_details,
+                      "compilation": compilation,
                       "new_geometry": new_shape, "flex_backend": flex_latch_state(),
                       "render_plan": plan.metadata()}
-            atomic_json(request["output"] + ".inference.json", record)
+            if not denoise_only:
+                atomic_json(request["output"] + ".inference.json", record)
+            if not warmup or denoise_only:
+                history.remember(compilation["geometry_id"], request)
             return {"conditioning_cache_hit": cache_hit, "encode_seconds": encode_seconds,
                     "inference_process_seconds": denoise_seconds + timings["decode_and_encode_seconds"],
                     "upstream": record}
@@ -227,11 +263,29 @@ def main():
     if runtime.is_main:
         Image.new("RGB", (576, 768), (100, 120, 140)).save(warm_ref)
     runtime.barrier()
-    warm_request = {"settings": asdict(settings), "prompt_file": str(BACKEND / f"warmup-{instance}.pt"),
-                    "prompt": "The person in <Picture 1> walks through a hallway. Natural ambient sound.",
+    warm_prompt = "The person in <Picture 1> walks through a hallway. Natural ambient sound."
+    warm_key = conditioning_key(warm_prompt, [warm_ref], settings.reference_short_edge)
+    warm_request = {"settings": asdict(settings), "prompt_file": str(BACKEND / f"warmup-{warm_key}.pt"),
+                    "prompt": warm_prompt,
                     "references": [str(warm_ref)], "output": str(BACKEND / "warmup.mp4")}
     run(warm_request, warmup=True)
-    state("ready", "idle", startup_seconds=time.monotonic() - setup_start, warmup_plan=settings.render_plan().metadata(), metrics_schema_version=2)
+    replay_box = [history.requests(compile_options["warmup_recent"], RUNTIME / "jobs") if runtime.is_main else None]
+    dist.broadcast_object_list(replay_box, src=0)
+    replay_metrics = []
+    for index, replay in enumerate(replay_box[0]):
+        replay["output"] = str(BACKEND / f"warmup-history-{index}.mp4")
+        state("loading", "warming_up_recent_shapes", warmup_index=index + 1, warmup_count=len(replay_box[0]))
+        result = run(replay, warmup=True, denoise_only=True)
+        if runtime.is_main:
+            replay_metrics.append({"prompt_file": replay["prompt_file"],
+                                   "render_plan": result["upstream"]["render_plan"],
+                                   "timings": result["upstream"]["timings"],
+                                   "compilation": result["upstream"]["compilation"]})
+            print(f"Startup history warmup {index + 1}/{len(replay_box[0])} complete", flush=True)
+    if runtime.is_main:
+        atomic_json(BACKEND / "warmup-report.json", {"instance": instance, "requests": replay_metrics})
+    state("ready", "idle", startup_seconds=time.monotonic() - setup_start,
+          warmup_plan=settings.render_plan().metadata(), replayed_shapes=len(replay_box[0]))
     print(f"Rank {runtime.rank}: resident models loaded and warmed up", flush=True)
     last_token = None
     while True:

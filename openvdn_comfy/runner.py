@@ -43,6 +43,8 @@ def worker_environment():
     env.setdefault("OMP_NUM_THREADS", "8")
     env.setdefault("TORCHINDUCTOR_CACHE_DIR", str(RUNTIME / "inductor"))
     env.setdefault("TRITON_CACHE_DIR", str(RUNTIME / "triton"))
+    env.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
+    env.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "1")
     return env
 
 

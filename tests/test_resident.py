@@ -45,6 +45,7 @@ def test_actual_upstream_ulysses_changes_geometry_without_reloading(monkeypatch)
         assert sum(runtime.splits) == length
         assert runtime.softmax_ranks == 6
         assert sum(runtime.softmax_head_splits) == sum(runtime.linear_head_splits) == 56
+        cache.commit()
     assert resets == [True]
 
 

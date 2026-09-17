@@ -1,4 +1,5 @@
 import ast
+import math
 from pathlib import Path
 import os
 import subprocess
@@ -9,9 +10,10 @@ import pytest
 import torch
 
 from openvdn_comfy.parallel_vae import assemble_native, clip_plan, clip_provider, decode_parallel, pad_latents
+from openvdn_comfy.vae_tiles import ClipDecoder
 
 
-def native_decoder():
+def native_decoder(spatial=False):
     root = Path(__file__).resolve().parents[1]
     path = root / 'work/patch-check/diffusers/src/diffusers/models/autoencoders/autoencoder_kl_minimax_h3.py'
     if not path.exists():
@@ -20,10 +22,13 @@ def native_decoder():
         pytest.skip('Pinned Diffusers sources not installed')
     tree = ast.parse(path.read_text())
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'AutoencoderKLMiniMaxH3')
-    methods = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in ('_decode', '_blend', 'decode')]
+    names = ('_decode', '_blend', 'decode')
+    if spatial:
+        names += ('_split_tiles', '_stitch_tiles', '_decode_clip')
+    methods = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in names]
     for n in methods:
         n.decorator_list = []
-    ns = {'torch': torch, 'DecoderOutput': object}
+    ns = {'torch': torch, 'math': math, 'DecoderOutput': object}
     exec(compile(ast.Module(body=methods, type_ignores=[]), str(path), 'exec'), ns)
 
     class Decoder(torch.nn.Module):
@@ -41,9 +46,48 @@ def native_decoder():
             # missing overlap cannot accidentally pass this parity test.
             return (z[:, :3] + z.mean()).repeat_interleave(4, 2).repeat_interleave(2, 3).repeat_interleave(2, 4)
 
-    for name in ('_decode', '_blend', 'decode'):
+    for name in names:
         setattr(Decoder, name, ns[name])
-    return Decoder()
+    vae = Decoder()
+    if spatial:
+        vae.use_tiling = True
+        vae.tile_sample_min_height = vae.tile_sample_min_width = 8
+        vae.tile_sample_min_overlap_height = vae.tile_sample_min_overlap_width = 2
+        vae.post_quant_conv = torch.nn.Identity()
+        class Core(torch.nn.Module):
+            def forward(self, z):
+                return (z[:, :3] + z.mean()).repeat_interleave(4, 2).repeat_interleave(2, 3).repeat_interleave(2, 4)
+        vae.decoder = Core()
+    return vae
+
+
+@pytest.mark.parametrize('dtype', [torch.float16, torch.float32])
+@pytest.mark.parametrize('shape', [(3, 4), (6, 7), (8, 12)])
+def test_optimized_tiles_match_native_overlap_edges_and_dtype(dtype, shape):
+    vae = native_decoder(spatial=True)
+    torch.manual_seed(17)
+    z = torch.randn(1, 24, 7, *shape, dtype=dtype)
+    original = vae._decode_clip(z)
+    decode = ClipDecoder(vae)
+    got = decode(z)
+    assert torch.equal(got, original)
+    assert torch.isfinite(got).all()
+    assert decode.tile_count > 0
+    assert '_blend' not in vae.__dict__ and '_stitch_tiles' not in vae.__dict__
+    # Warm cached weights are reused without retaining large decoded tensors.
+    weights = list(decode.weights.values())
+    assert torch.equal(decode(z + .125), vae._decode_clip(z + .125))
+    assert [id(w) for w in weights] == [id(w) for w in decode.weights.values()]
+
+
+def test_tile_overrides_restore_when_decode_fails():
+    vae = native_decoder(spatial=True)
+    def broken(_):
+        raise RuntimeError('tile failed')
+    vae.decoder.forward = broken
+    with pytest.raises(RuntimeError, match='tile failed'):
+        ClipDecoder(vae)(torch.zeros(1, 24, 7, 6, 7))
+    assert '_blend' not in vae.__dict__ and '_stitch_tiles' not in vae.__dict__
 
 
 @pytest.mark.parametrize('length', [7, 8, 12, 27, 32, 57, 72, 87, 107])
@@ -125,6 +169,15 @@ def distributed_worker():
                 assert torch.equal(video, vae.decode(z, return_dict=False)[0])
             else:
                 assert video is None
+        # Exercise the real spatial splitting/stitching and temporal assembly
+        # together, across real processes, against the unmodified native path.
+        spatial_vae = native_decoder(spatial=True)
+        z = torch.arange(24 * 12 * 6 * 7, dtype=torch.float32).reshape(1, 24, 12, 6, 7) / 1000
+        video, info = decode_parallel(spatial_vae, z, rank=rank, world_size=world,
+                                      verify=True, clip_decode=ClipDecoder(spatial_vae))
+        assert info['parity']['exact']
+        if rank == 0:
+            assert torch.equal(video, spatial_vae.decode(z, return_dict=False)[0])
         # Only one replica drifts. All ranks must drain communication and fail;
         # otherwise the test hangs and the process-group timeout catches it.
         if rank == 1:

@@ -15,7 +15,7 @@ PROFILE_FIELDS = ("fp8", "inference_kernels", "softmax_backend", "softmax_ranks"
 
 
 def parallel_vae_enabled():
-    value = os.environ.get("REF2VA_VAE_PARALLEL", "0")
+    value = os.environ.get("REF2VA_VAE_PARALLEL", "1")
     if value not in ("0", "1"):
         raise ValueError("REF2VA_VAE_PARALLEL must be 0 or 1")
     return value == "1"

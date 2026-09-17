@@ -86,7 +86,7 @@ def assemble_native(vae, z, bounds, get_clip, verify=False):
     return video, parity
 
 
-def decode_parallel(vae, z, *, rank, world_size, verify=False):
+def decode_parallel(vae, z, *, rank, world_size, verify=False, clip_decode=None):
     """All ranks enter; return the video on rank zero, and diagnostics everywhere.
 
 Each worker buffers only its own clips (2 for a 10-second video on 8 GPUs).
@@ -104,9 +104,10 @@ before reporting a numerical mismatch to all ranks.
         torch.cuda.synchronize(z.device)
     compute_start = time.perf_counter()
     local = {}
+    decoder = clip_decode or vae._decode_clip
     for index, (start, end) in enumerate(bounds):
         if index % world_size == rank:
-            local[index] = vae._decode_clip(prepared[:, :, start:end]).contiguous()
+            local[index] = decoder(prepared[:, :, start:end]).contiguous()
     if z.is_cuda:
         torch.cuda.synchronize(z.device)
     compute_seconds = time.perf_counter() - compute_start
