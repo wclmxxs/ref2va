@@ -188,7 +188,8 @@ def generate(*, prompt="", refs=(), settings=None, output=None, prompt_file=None
                       "queue_seconds": queue_seconds, "encode_seconds": metrics["encode_seconds"],
                       "inference_process_seconds": metrics["inference_process_seconds"], "resident": True,
                       "request_wall_seconds": time.monotonic() - started,
-                      "upstream": upstream_record}
+                      "upstream": upstream_record, "timings": {**upstream_record["timings"],
+                          "gpu_queue_seconds": queue_seconds, "generation_wall_seconds": time.monotonic() - started}}
             atomic_json(str(output) + ".metrics.json", result)
             atomic_json(job / "result.json", result)
             return result

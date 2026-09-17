@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from openvdn_comfy.backend import BACKEND, PROFILE_FIELDS, read_json
 from openvdn_comfy.config import MODELS, UPSTREAM, Settings, atomic_json
-from openvdn_comfy.encode_output import requested_encoder
+from openvdn_comfy.fast_output import decode_and_save
 from openvdn_comfy.resident_geometry import GeometryCache
 sys.path.insert(0, str(UPSTREAM))
 
@@ -91,7 +91,7 @@ def main():
     def state(status, phase, **extra):
         if runtime.is_main:
             atomic_json(BACKEND / "state.json", {"instance": instance, "status": status, "phase": phase,
-                        "profile": profile, "world_size": 8, "updated_at": time.time(), **extra})
+                        "profile": profile, "world_size": 8, "metrics_schema_version": 2, "updated_at": time.time(), **extra})
 
     state("loading", "loading_dit_and_vaes")
     model = build_inference_model(cfg, device, load_decoders=runtime.is_main, log=runtime.is_main)
@@ -105,7 +105,6 @@ def main():
     state("loading", "loading_conditioner")
     conditioner = Conditioner(model.vae, device) if runtime.is_main else None
     runtime.barrier()
-    original_encoder = render.encode_video
     # Cache checkpoint metadata once; hashing the checkpoint per job is unnecessary.
     base_record = render_record(cfg, model) if runtime.is_main else None
     from src.models.softmax_attention import flex_attention as flex_module
@@ -123,6 +122,7 @@ def main():
         plan = current.render_plan()
         render.LATENT_H, render.LATENT_W = plan.generation_height // 16, plan.generation_width // 16
         cache = Path(request["prompt_file"])
+        worker_start = time.monotonic()
         encode_start = time.monotonic()
         cache_hit = cache.is_file() and cache.stat().st_size > 0
         if runtime.is_main and not cache_hit:
@@ -139,9 +139,12 @@ def main():
             torch.cuda.empty_cache()
         runtime.barrier()
         encode_seconds = time.monotonic() - encode_start
+        prepare_start = time.monotonic()
         embeds, tags, conditions = render.load_prompt(str(cache), str(device))
         new_shape = geometries.prepare(runtime, plan, embeds, tags, conditions)
         state("loading" if warmup else "busy", "warming_up" if warmup else "denoising", token=request.get("token"))
+        torch.cuda.synchronize(device)
+        condition_load_seconds = time.monotonic() - prepare_start
         runtime.reset_profile()
         steps = []
         denoise_start = time.monotonic()
@@ -154,21 +157,25 @@ def main():
         decode_start = time.monotonic()
         if runtime.is_main:
             state("loading" if warmup else "busy", "decoding", token=request.get("token"))
-            render.encode_video = requested_encoder(original_encoder, plan)
-            try:
-                render.decode_and_save(latents, audio, model.vae, model.audio_vae, request["output"], str(device))
-            finally:
-                render.encode_video = original_encoder
+            output_timings, encoding = decode_and_save(
+                latents, audio, model.vae, model.audio_vae, request["output"], device, plan,
+                render.PIXEL_MEAN, render.PIXEL_STD,
+                phase=lambda phase: state("loading" if warmup else "busy", phase, token=request.get("token")))
         runtime.barrier()
         timings = {"denoise_seconds": denoise_seconds, "seconds_per_step": denoise_seconds / 8,
                    "step_seconds": steps, "model_setup_seconds": 0,
                    "decode_and_encode_seconds": time.monotonic() - decode_start,
                    "parallel_profile_ms_per_nfe_by_rank": profiles}
+        cleanup_start = time.monotonic()
         del latents, audio, embeds, tags, conditions
         gc.collect()
         torch.cuda.empty_cache()
         runtime.barrier()
+        cleanup_seconds = time.monotonic() - cleanup_start
         if runtime.is_main:
+            timings.update(output_timings)
+            timings.update(conditioning_seconds=encode_seconds, condition_load_seconds=condition_load_seconds,
+                           cleanup_seconds=cleanup_seconds, worker_wall_seconds=time.monotonic() - worker_start)
             from src.inference.utils.assemble import flex_latch_state
             actual_config = current.inference_config(cache, request["output"])
             actual_config["render"]["warmup_steps"] = 8 if warmup else 0
@@ -176,7 +183,7 @@ def main():
                       "parallel": {"kind": "ulysses_branch_parallel" if runtime.branch_parallel else "ulysses",
                                    "world_size": 8, "softmax_ranks": runtime.softmax_ranks,
                                    "warmup_steps": 8 if warmup else 0}, "timings": timings,
-                      "resident": True, "new_geometry": new_shape, "flex_backend": flex_latch_state(),
+                      "resident": True, "output_encoding": encoding, "new_geometry": new_shape, "flex_backend": flex_latch_state(),
                       "render_plan": plan.metadata()}
             atomic_json(request["output"] + ".inference.json", record)
             return {"conditioning_cache_hit": cache_hit, "encode_seconds": encode_seconds,
@@ -192,7 +199,7 @@ def main():
                     "prompt": "The person in <Picture 1> walks through a hallway. Natural ambient sound.",
                     "references": [str(warm_ref)], "output": str(BACKEND / "warmup.mp4")}
     run(warm_request, warmup=True)
-    state("ready", "idle", startup_seconds=time.monotonic() - setup_start, warmup_plan=settings.render_plan().metadata())
+    state("ready", "idle", startup_seconds=time.monotonic() - setup_start, warmup_plan=settings.render_plan().metadata(), metrics_schema_version=2)
     print(f"Rank {runtime.rank}: resident models loaded and warmed up", flush=True)
     last_token = None
     while True:

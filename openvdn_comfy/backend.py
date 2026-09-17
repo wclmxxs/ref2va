@@ -22,8 +22,8 @@ def startup_settings():
         return value == "1"
     return Settings(
         duration=float(os.environ.get("REF2VA_WARMUP_DURATION", "10")),
-        ratio=os.environ.get("REF2VA_WARMUP_RATIO", "16:9"),
-        resolution=int(os.environ.get("REF2VA_WARMUP_RESOLUTION", "720")),
+        ratio=os.environ.get("REF2VA_WARMUP_RATIO", "9:16"),
+        resolution=int(os.environ.get("REF2VA_WARMUP_RESOLUTION", "768")),
         reference_short_edge=int(os.environ.get("REF2VA_REFERENCE_SHORT_EDGE", "768")),
         fp8=boolean("REF2VA_FP8", True), inference_kernels=boolean("REF2VA_INFERENCE_KERNELS", True),
         softmax_backend=os.environ.get("REF2VA_SOFTMAX_BACKEND", "flex"),

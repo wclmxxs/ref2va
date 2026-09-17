@@ -20,7 +20,7 @@ cd /root/ref2va && git pull --ff-only && bash deploy.sh start
 2. **自动停止所选 8 张 GPU 上已有的计算应用**，释放显存。识别到 systemd 应用服务或 Docker 容器时停止其服务/容器；其他情况停止推理进程树，先 TERM，再在超时后 KILL。不会卸载应用或永久禁用服务。清理动作写入 `.runtime/gpu-cleanup.json`。若外部调度器持续拉起应用，启动报错，不会无限杀进程。
 3. 检查模型、八卡环境与 NCCL。
 4. 加载八份 DiT 和 rank 0 的视频/音频 VAE；Qwen3-VL 条件编码器通过 Accelerate 分配到这 8 张 GPU，单卡权重预算 12 GiB，禁止 CPU/磁盘权重卸载。
-5. 使用一张合成参考图完成条件编码、正式 8 NFE、音视频解码及 MP4 编码预热。默认预热 10 秒、16:9、短边 720。
+5. 使用一张合成参考图完成条件编码、正式 8 NFE、音视频解码及 MP4 编码预热。默认预热 10 秒、9:16、短边 768。
 6. 预热成功后才启动 ComfyUI，访问 `http://服务器IP:8188`。
 
 这是专用八卡服务的启动行为，会中止这些卡上原有的生成任务。设置 `REF2VA_CLEAR_GPU_APPS=0` 可关闭自动清理，改为显存不足时直接退出。清理只在启动执行；生成期间不会停止其他应用。
@@ -97,8 +97,10 @@ bash deploy.sh render \
 | `REF2VA_SOFTMAX_RANKS` | 6 | 6+2；0 为普通八卡 Ulysses |
 | `REF2VA_PROFILE` | 0 | 各 rank 分段计时 |
 | `REF2VA_WARMUP_DURATION` | 10 | 启动预热时长 |
-| `REF2VA_WARMUP_RATIO` | 16:9 | 启动预热画幅 |
-| `REF2VA_WARMUP_RESOLUTION` | 720 | 启动预热短边 |
+| `REF2VA_WARMUP_RATIO` | 9:16 | 启动预热画幅 |
+| `REF2VA_WARMUP_RESOLUTION` | 768 | 启动预热短边 |
+| `REF2VA_X264_PRESET` | veryfast | CPU H.264 编码预设，可改 medium；保持 CRF 23，更快预设可能增大文件并改变压缩细节 |
+| `REF2VA_X264_THREADS` | 8 | H.264 编码线程数，1–64 |
 | `REF2VA_REFERENCE_SHORT_EDGE` | 768 | 启动预热参考图短边 |
 
 要比较精度/内核/并行配置，修改相应环境变量再执行 `bash deploy.sh start`。API 省略这些字段时自动使用当前配置；显式传入 `fp8`、`inference_kernels`、`softmax_backend`、`softmax_ranks`、`profile` 必须与 `/openvdn/health` 一致，避免请求临时重载模型。旧 `warmup_steps` 字段保留兼容，常驻服务统一在启动执行 8 NFE，请求中不再额外预热。
@@ -118,6 +120,33 @@ bash deploy.sh render \
 - 条件及编译缓存：`.runtime/conditioning/`、`.runtime/inductor/`、`.runtime/triton/`
 - UI 数据库：`.runtime/comfy-user/comfyui.db`，启动显式指定并创建父目录。
 
-worker 异常时 UI/API 会返回出错 rank 的独立堆栈，并附日志末尾（最多 32 KiB / 160 行）。对比去噪速度看 `upstream.timings.denoise_seconds`；用户等待时间看 `request_wall_seconds`，还包括下载图片以外的排队、条件编码和输出编码。官方报告的 H200 18.3 秒是去噪耗时，并不是本项目实测端到端耗时。[官方结果](https://github.com/OpenVDN/vdn-minimax-h3#results)
+worker 异常时 UI/API 会返回出错 rank 的独立堆栈，并附日志末尾（最多 32 KiB / 160 行）。对比去噪速度看 `metrics.timings.denoise_seconds`；REST 从入队到完成看 `metrics.timings.api_wall_seconds`，实际处理看 `processing_wall_seconds`（排除 ComfyUI 排队）。旧 `request_wall_seconds` 保留，排除参考图下载和 ComfyUI 排队。官方报告的 H200 18.3 秒是去噪耗时，并不是本项目实测端到端耗时。[官方结果](https://github.com/OpenVDN/vdn-minimax-h3#results)
 
 本地测试覆盖请求参数、尺寸/音频裁剪、URL 校验、REST 队列与状态、常驻进程 mailbox/取消、PID 身份、GPU 服务清理分支，以及官方 Ulysses 连续切换序列长度。CPU 测试无法验证 CUDA 内核、峰值显存、Qwen 多卡分配和最终画质；这些需在 8×H200 实测。已有两次服务器尝试均受其他 SGLang 服务占显存影响，没有成功视频，也没有本部署的速度结论。
+
+
+## 输出优化与阶段耗时（schema 2）
+
+使用原版视频/音频 VAE。输出阶段在 GPU 按 8 帧处理颜色、缩放、uint8 转换，提前裁掉超出目标时长的帧；只复制目标尺寸的 RGB 到 CPU。一个有界预取线程将下一批像素准备与当前批 CPU H.264 编码重叠，避免原流程整段 float32 像素展开和 CPU 插值。MP4 仍原子提交，失败不留下可被误认成功的文件。
+
+`GET /openvdn/jobs/{id}` 成功结果的 `metrics.timings` 返回秒数：
+
+| 字段 | 含义 |
+| --- | --- |
+| `api_queue_seconds` / `gpu_queue_seconds` | ComfyUI 入队等待 / 共享 GPU 锁等待 |
+| `reference_download_seconds` | 图片下载、校验和本地缓存 |
+| `conditioning_seconds` | 文本/图像条件编码与条件缓存；命中时接近零 |
+| `condition_load_seconds` | 条件张量加载至 GPU 和形状准备 |
+| `denoise_seconds` / `step_seconds` | 8 步采样总耗时 / 每一步 GPU 同步耗时 |
+| `video_vae_decode_seconds` / `audio_vae_decode_seconds` | GPU 视频 / 音频 VAE 解码 |
+| `pixel_prepare_seconds` | GPU 颜色转换、缩放和 uint8 转换，逐批累计 |
+| `device_to_host_seconds` | 音视频 GPU→CPU 传输，逐批累计 |
+| `h264_encode_seconds` | RGB→视频帧转换和 CPU H.264 编码，包括 flush |
+| `audio_encode_and_mux_seconds` | CPU AAC 编码和音频封装 |
+| `mux_seconds` / `output_commit_seconds` | 视频封装/容器关闭 / 最终文件原子重命名 |
+| `output_wall_seconds` | 完整解码和输出的实际墙钟耗时 |
+| `cleanup_seconds` | 张量清理、释放临时 CUDA 缓存和多卡同步 |
+| `worker_wall_seconds` / `generation_wall_seconds` | 常驻 worker / 生成调用的墙钟耗时 |
+| `processing_wall_seconds` / `api_wall_seconds` | 含下载的处理耗时 / 另含 ComfyUI 排队的总耗时 |
+
+GPU 阶段在计时边界同步。像素准备与 H.264 编码有重叠，**不要把全部组件时间直接相加**；总耗时使用 `*_wall_seconds`。`upstream.output_encoding` 记录实际设备、编码预设和重叠标记，`upstream.new_geometry` 标记首次形状，`conditioning_cache_hit` 标记条件缓存。首次形状与重复形状应分别比较，不能将首次编译耗时误算为模型重载。旧 `decode_and_encode_seconds` 保留（含末尾八卡 barrier）。计时不包含客户端下载生成视频的网络耗时。

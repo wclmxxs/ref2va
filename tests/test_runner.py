@@ -27,7 +27,7 @@ def fake_success(calls):
         cache.write_bytes(b"encoded-tensors")
         output = Path(request["output"])
         output.write_bytes(b"video")
-        Path(str(output) + ".inference.json").write_text(json.dumps({"parallel": {"world_size": 8}}))
+        Path(str(output) + ".inference.json").write_text(json.dumps({"parallel": {"world_size": 8}, "timings": {"denoise_seconds": .2, "step_seconds": [.025] * 8}}))
         return {"conditioning_cache_hit": hit, "encode_seconds": 0 if hit else .1, "inference_process_seconds": .2}
     return run
 
@@ -68,6 +68,8 @@ def test_preencoded_prompt_skips_conditioner(runtime):
     result = runner.generate(prompt_file=cache, output=runtime / "x.mp4", worker_call=fake_success(calls))
     assert len(calls) == 1
     assert result["encode_seconds"] == 0
+    assert result["timings"]["step_seconds"] == [.025] * 8
+    assert result["timings"]["gpu_queue_seconds"] >= 0
     with pytest.raises(ValueError):
         runner.generate(prompt_file=cache, prompt="ambiguous", worker_call=fake_success(calls))
 

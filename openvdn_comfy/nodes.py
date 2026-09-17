@@ -2,16 +2,17 @@ import hashlib
 import io
 import json
 import uuid
+import time
 from pathlib import Path
 from urllib.parse import urlencode
 
 import numpy as np
 from PIL import Image
 
-from .config import RUNTIME, Settings
+from .config import RUNTIME, Settings, atomic_json
 from .runner import generate
 from .references import download_references, parse_urls
-from .jobs import update_job
+from .jobs import update_job, read_job
 
 
 class OpenVDNReference:
@@ -116,17 +117,27 @@ class OpenVDNH200Request(OpenVDNH200Generate):
         from comfy_execution.utils import get_executing_context
         context = get_executing_context()
         job_id = context.prompt_id if context else None
+        started, started_wall = time.monotonic(), time.time()
+        job_record = read_job(job_id) if job_id else None
+        queue_seconds = max(0., started_wall - job_record["created_at"]) if job_record else 0.
         try:
             settings = Settings(duration=duration, ratio=ratio, resolution=resolution, **kwargs).validate()
             urls = parse_urls(reference_image_urls)
             update_job(job_id, status="running", phase="downloading_references")
             refs = await download_references(urls, mm.throw_exception_if_processing_interrupted)
+            download_seconds = time.monotonic() - started
             name = f"vdn8_{uuid.uuid4().hex}.mp4"
             output = Path(folder_paths.get_output_directory()) / "openvdn" / name
             import asyncio
             result = await asyncio.to_thread(generate, prompt=prompt, refs=refs, settings=settings, output=output,
                               interrupt=mm.throw_exception_if_processing_interrupted,
                               progress=lambda phase: update_job(job_id, status="running", phase=phase))
+            result["timings"].update(reference_download_seconds=download_seconds, api_queue_seconds=queue_seconds,
+                                     processing_wall_seconds=time.monotonic() - started,
+                                     api_wall_seconds=queue_seconds + time.monotonic() - started)
+            result["metrics_schema_version"] = 2
+            atomic_json(str(output) + ".metrics.json", result)
+            atomic_json(Path(result["log_directory"]) / "result.json", result)
             video = {"filename": name, "subfolder": "openvdn", "type": "output"}
             update_job(job_id, status="succeeded", phase="complete", video_url="/view?" + urlencode(video), metrics=result)
             return {"ui": {"openvdn_videos": [video]},
