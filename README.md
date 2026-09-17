@@ -97,6 +97,7 @@ export REF2VA_LISTEN=0.0.0.0
 - 完整任务记录：`视频.mp4.metrics.json`，含 queue/encode/inference process/request wall time，以及官方 `upstream.timings`
 - 命令、配置和错误日志：`.runtime/jobs/<job_id>/`
 - 条件与编译缓存：`.runtime/conditioning/`、`.runtime/inductor/`、`.runtime/triton/`
+- ComfyUI 数据库：`.runtime/comfy-user/comfyui.db`；启动脚本显式设置路径并创建父目录，不依赖 ComfyUI 源码中的默认 `user/` 目录。
 
 官方报告的 H200 **18.3 秒**指 8 NFE 的去噪耗时，并非包含编码器、模型加载、预热和 MP4 编码的整条请求耗时，也不是这里测出的结果。与它对比应查看 `upstream.timings.denoise_seconds`；实际使用等待时间看 `request_wall_seconds`。参考图数量和大小也会影响去噪时间。[官方结果和说明](https://github.com/OpenVDN/vdn-minimax-h3#results)
 

@@ -49,6 +49,8 @@ def test_no_arguments_runs_every_stage_and_preserves_user_workflow(deployment):
     assert stages[:3] == expected
     assert stages[3].startswith(".deps/ComfyUI/main.py --cpu")
     assert "--user-directory " + str(root / ".runtime/comfy-user") in stages[3]
+    assert "--database-url sqlite:///" + str(root / ".runtime/comfy-user/comfyui.db") in stages[3]
+    assert (root / ".runtime/comfy-user").is_dir()
     assert stages[4:7] == expected
 
 

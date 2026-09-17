@@ -50,7 +50,8 @@ start_ui() {
     exec .venv-ui/bin/python .deps/ComfyUI/main.py --cpu --disable-dynamic-vram \
       --listen "${REF2VA_LISTEN:-0.0.0.0}" --port "${REF2VA_PORT:-8188}" \
       --output-directory "$ROOT/output" --input-directory "$ROOT/input" \
-      --user-directory "$ROOT/.runtime/comfy-user" "$@"
+      --user-directory "$ROOT/.runtime/comfy-user" \
+      --database-url "sqlite:///$ROOT/.runtime/comfy-user/comfyui.db" "$@"
 }
 
 case "$action" in
