@@ -92,15 +92,22 @@ def diagnose_case(kernel, q, k, v, folder, heads):
                   repeat_exact=bool(torch.equal(actual, again)), hot_compile_misses=hot['compile_misses'])
     result['passed'] = (result['sparse']['passed'] and result['all_exact']['passed']
                         and result['repeat_exact'] and not hot['compile_misses'])
+    # Keep intermediate evidence even after the output check passes, so a
+    # precision fix can be checked without deliberately causing another failure.
+    kc, vc, threshold = prepare_rectangular(q, k, v, scale=kwargs['scale'], tau=kwargs['tau'])
+    ref_kc, ref_vc, ref_threshold = reference_preprocess(q, k, v, kwargs['scale'], kwargs['tau'])
+    result['preprocess'] = {}
+    for name, a, b in (('kc', kc, ref_kc), ('vc', vc, ref_vc), ('threshold', threshold, ref_threshold)):
+        metrics = error_metrics(a, b)
+        # Attention's absolute output tolerance is not a suitable gate for V
+        # block sums. These are measurements, not a second output pass/fail test.
+        metrics.pop('passed')
+        result['preprocess'][name] = metrics
+    margin, routes = route_details(q, kc, threshold, kwargs['scale'], kwargs['sink_tokens'])
+    ref_margin, ref_routes = route_details(q, ref_kc, ref_threshold, kwargs['scale'], kwargs['sink_tokens'])
+    result['reference_route_differences_after_preprocess'] = int((routes != ref_routes).sum())
+    result['minimum_reference_threshold_margin'] = float(ref_margin.abs().min())
     if not result['passed']:
-        kc, vc, threshold = prepare_rectangular(q, k, v, scale=kwargs['scale'], tau=kwargs['tau'])
-        ref_kc, ref_vc, ref_threshold = reference_preprocess(q, k, v, kwargs['scale'], kwargs['tau'])
-        result['preprocess'] = {name: error_metrics(a, b) for name, a, b in (
-            ('kc', kc, ref_kc), ('vc', vc, ref_vc), ('threshold', threshold, ref_threshold))}
-        margin, routes = route_details(q, kc, threshold, kwargs['scale'], kwargs['sink_tokens'])
-        ref_margin, ref_routes = route_details(q, ref_kc, ref_threshold, kwargs['scale'], kwargs['sink_tokens'])
-        result['reference_route_differences_after_preprocess'] = int((routes != ref_routes).sum())
-        result['minimum_reference_threshold_margin'] = float(ref_margin.abs().min())
         # Copy only synthetic test data, never model weights or user media.
         tensors = dict(q=q, k=k, v=v, sparse=actual, repeated=again, all_exact=exact,
                        expected=expected, dense=dense, kc=kc, vc=vc, threshold=threshold,
@@ -125,6 +132,7 @@ def main():
     parser.add_argument('--output-dir', type=Path, default=ROOT/'output/sol-diagnostics')
     args = parser.parse_args()
     import torch
+    import triton
     from openvdn_comfy.sol_kernel import SolKernel
     torch.cuda.set_device(args.device)
     device = torch.device('cuda', args.device)
@@ -132,7 +140,8 @@ def main():
     folder = args.output_dir/run_id
     report = dict(run_id=run_id, status='running', passed=False, cases=[],
                   revision=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
-                  torch_version=torch.__version__, device=torch.cuda.get_device_name(device),
+                  torch_version=torch.__version__, triton_version=triton.__version__,
+                  device=torch.cuda.get_device_name(device),
                   matmul_precision=torch.get_float32_matmul_precision(),
                   allow_tf32=torch.backends.cuda.matmul.allow_tf32)
     def persist():

@@ -44,7 +44,7 @@ def _reduce_kc_kernel(
     values = k_desc.load(
         [batch, block * BLOCK, head, d_tile * TILE_D]
     ).reshape([BLOCK, TILE_D])
-    summary = tl.sum(values, axis=0) / block_len
+    summary = tl.sum(values, axis=0, dtype=tl.float32) / block_len
     offsets = d_tile * TILE_D + tl.arange(0, TILE_D)
     tl.store(
         kc + ((batch * N + block) * H + head) * D + offsets,
@@ -81,7 +81,7 @@ def _reduce_vc_kernel(
     values = v_desc.load(
         [batch, block * BLOCK, head, d_tile * TILE_D]
     ).reshape([BLOCK, TILE_D])
-    summary = tl.sum(values, axis=0)
+    summary = tl.sum(values, axis=0, dtype=tl.float32)
     offsets = d_tile * TILE_D + tl.arange(0, TILE_D)
     tl.store(
         vc + ((batch * N + block) * H + head) * D + offsets,
@@ -125,8 +125,10 @@ def _reduce_kv_kernel(
     v_values = v_desc.load(
         [batch, block * BLOCK, head, d_tile * TILE_D]
     ).reshape([BLOCK, TILE_D])
-    k_summary = tl.sum(k_values, axis=0) / block_len
-    v_summary = tl.sum(v_values, axis=0)
+    # Triton 3.7 retains BF16 for an untyped sum. Accumulate in FP32 and
+    # round only on store: BF16 intermediate sums can flip threshold routes.
+    k_summary = tl.sum(k_values, axis=0, dtype=tl.float32) / block_len
+    v_summary = tl.sum(v_values, axis=0, dtype=tl.float32)
     offsets = d_tile * TILE_D + tl.arange(0, TILE_D)
     output_offsets = ((batch * N + block) * H + head) * D + offsets
     valid = offsets < D

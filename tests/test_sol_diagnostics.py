@@ -57,6 +57,10 @@ def test_diagnostic_captures_numeric_failure_without_hiding_exact_success(tmp_pa
     report = diagnose_case(Kernel(), q, k, v, tmp_path, 2)
     assert report['passed'] is not mismatch
     assert report['all_exact']['passed'] and report['repeat_exact']
+    assert report['reference_route_differences_after_preprocess'] == 0
+    for metric in report['preprocess'].values():
+        assert metric['finite'] and metric['max_abs'] == 0
+        assert 'passed' not in metric  # Block sums do not use output tolerances.
     assert json.loads((tmp_path/'heads-2.json').read_text()) == report
     if mismatch:
         bundle = torch.load(tmp_path/report['sample_file'], weights_only=True)

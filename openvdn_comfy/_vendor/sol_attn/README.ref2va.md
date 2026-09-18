@@ -18,7 +18,7 @@ Local rectangular host/preprocess and VDN-window adaptations live outside the
 vendor directory in `sol_kernel.py`, `sol_plan.py`, and `sol_attention.py`.
 The host disables the square recipe's unconditional full-Q-tile route reduction
 when Tq is not divisible by 64, using SM90's existing guarded reduction.
-CUDA math is otherwise unchanged. No SM100/SM120 backend is exposed here.
+The SM90 attention math is otherwise unchanged. No SM100/SM120 backend is exposed here.
 
 The SM90 compatibility converter accepts CuTe 4.6's keyword arguments. Its
 legacy NamedTuple handling is scoped to Sol compilation and restored in a
@@ -28,3 +28,11 @@ The private FlashAttention `fmax` helper uses the inferred-result NVVM binding
 shipped in pinned CuTe 4.6.0.dev0, including its CUDA 12.9 build. The upstream
 CUDA-version test incorrectly selected the old explicit-result signature on
 that build. The operation, operands, attributes and reduction order are unchanged.
+
+K/V summary reductions explicitly accumulate in FP32 before storing BF16
+centroids/value sums. Triton 3.7.1's `sum` implementation retains floating input
+dtype unless one is specified (despite its generated documentation describing
+automatic promotion). BF16 intermediate rounding can change near-threshold
+sparse routing decisions. Both the fused and separate summary kernels use
+the same FP32 accumulation; summary storage and the attention kernel stay BF16.
+Source: https://github.com/triton-lang/triton/blob/v3.7.1/python/triton/language/standard.py

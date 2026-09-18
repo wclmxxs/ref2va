@@ -402,6 +402,8 @@ cd /root/ref2va && git pull --ff-only && bash deploy.sh install-sol && bash depl
 
 可继续使用 Cache-DiT RDT 0.25。切换 native→Sol 的那一步会在所有 rank 清空旧残差，避免复用上个计算阶段的残差；其后仍按 RDT 实际判断。首次效果对照建议先保持相同 seed/提示词/参考图和缓存参数，同时记录实际缓存步数；要单独分析 Sol 的误差，再关闭 Cache-DiT 比较。
 
+Sol 的 K/V 预处理显式使用 FP32 累加，最后写回 BF16 质心与块内 V 总和。当前 Triton 3.7.1 的 `sum` 实现不会自动提升浮点输入类型；直接累加 BF16 会在阈值附近翻转稀疏路由。此修复不修改路由规则、`sol_tau` 或数值校验容差，也不影响 `native` attention。
+
 返回 `metrics.upstream.optimizations.attention`：
 
 - `sol.sparse_executed`、`sparse_kernel_launches_all_ranks`：是否真的调用，以及各 rank 调用总数。调用不等于加速或测得稀疏率；不在热路径额外同步统计每个选中块。
@@ -422,6 +424,8 @@ NCCL_NVLS_ENABLE=0 .venv-vdn/bin/torchrun --standalone --nproc_per_node=8 script
 ```
 
 脚本保留校验器的随机数序列，检查 9/10/11/12/14 heads 的精确路径、稀疏路径、重复执行、预处理及 CPU 参考结果。数值不匹配会继续收集其他 head 的结果，最终以非零退出，不会放宽容差或启动服务。报告和失败的合成张量保存在 `output/sol-diagnostics/<run_id>/`，`latest.json` 指向最近一次；保存的均为随机测试输入，无模型权重或用户素材。ComfyUI 仍运行时可通过现有 `/view` 接口读取这些诊断文件。
+
+通过的 case 也记录 K/V 汇总、阈值偏差及独立计算的路由差异，方便核对精度修复。预处理中 V 总和的量级与 attention 输出不同，因此只报告偏差，不套用 attention 输出的绝对容差。
 
 部署后用同一份请求跑热态对照（默认 native/Sol 两组，各 1 次冷、3 次热；不重启）：
 

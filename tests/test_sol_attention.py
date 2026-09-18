@@ -255,3 +255,44 @@ def test_real_sm90_rectangular_sparse_and_exact_arithmetic():
         pytest.skip('SM90 required')
     kernel = SolKernel()
     assert kernel.verify(torch.device('cuda', torch.cuda.current_device()))['passed']
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='Hopper GPU required')
+@pytest.mark.parametrize('heads', [9, 12, 14])
+@pytest.mark.parametrize('kind', ['kc', 'vc', 'kv'])
+def test_real_sm90_summary_accumulates_before_bf16_rounding(heads, kind):
+    from triton.tools.tensor_descriptor import TensorDescriptor
+    from openvdn_comfy._vendor.sol_attn import preprocess as p
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip('SM90 required')
+    device = torch.device('cuda', torch.cuda.current_device())
+    rng = torch.Generator().manual_seed(928)
+    # Binary fractions make all FP32 partial sums and full-block means exact.
+    # BF16 intermediate reductions lose low bits before the final store. A
+    # constant five-token K tail also has an exactly representable centroid.
+    k, v = [(torch.randint(-256, 257, (2, 517, heads, 128), generator=rng).float()/8)
+            .to(torch.bfloat16) for _ in range(2)]
+    k[:, 512:] = .125
+    expected_kc = torch.stack([x.double().mean(1).to(k.dtype) for x in k.split(64, 1)], 1).to(device)
+    expected_vc = torch.stack([x.double().sum(1).to(v.dtype) for x in v.split(64, 1)], 1).to(device)
+    k, v = k.to(device), v.to(device)
+    kd, vd = [TensorDescriptor.from_tensor(x, [1, 64, 1, 128]) for x in (k, v)]
+    kc, vc = torch.empty_like(expected_kc), torch.empty_like(expected_vc)
+    args = (517, heads, 9, 128, 64, 128)
+    for warps in (4, 8):
+        kc.fill_(float('nan'))
+        vc.fill_(float('nan'))
+        # Exercise both reduction layouts directly, regardless of which one
+        # the production autotuner selects on this GPU.
+        grid = (1, 9, 2*heads)
+        config = dict(num_warps=warps, num_stages=1)
+        if kind == 'kv':
+            p._reduce_kv_kernel.fn[grid](kd, vd, kc, vc, *args, **config)
+        elif kind == 'kc':
+            p._reduce_kc_kernel.fn[grid](kd, kc, *args, **config)
+        else:
+            p._reduce_vc_kernel.fn[grid](vd, vc, *args, **config)
+        if kind in ('kc', 'kv'):
+            torch.testing.assert_close(kc, expected_kc, rtol=0, atol=0)
+        if kind in ('vc', 'kv'):
+            torch.testing.assert_close(vc, expected_vc, rtol=0, atol=0)
