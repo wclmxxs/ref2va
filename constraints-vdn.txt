@@ -1,3 +1,6 @@
 torch==2.13.0
 torchvision==0.28.0
+# Shared by native FA4, quack and optional Sol. Do not upgrade Sol in isolation.
+nvidia-cutlass-dsl==4.6.0.dev0
+nvidia-cutlass-dsl-libs-base==4.6.0.dev0
 # Other direct dependencies are pinned by the official pyproject.toml.

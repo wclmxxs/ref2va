@@ -2,6 +2,7 @@
 
 from typing import Tuple, get_origin
 from functools import lru_cache
+from contextlib import contextmanager
 from dataclasses import dataclass, fields
 
 import os
@@ -33,24 +34,27 @@ cute_compile_og = cute.compile
 # At call time, pass None for these fields; the compile-time value is baked in.
 import cutlass.cute._tvm_ffi_args_spec_converter as _converter_module  # noqa
 
-_original_convert_single_arg = _converter_module._convert_single_arg
+def _converter_wrapper(original):
+    # Ref2VA: CuTe 4.6 passes is_constexpr as a keyword. Preserve it, and
+    # scope the legacy Sol NamedTuple handling to Sol compilation only.
+    def convert(arg, arg_name, arg_type, ctx, **kwargs):
+        if arg_type is not None and get_origin(arg_type) is cutlass.Constexpr:
+            return spec.ConstNone(arg_name)
+        if (isinstance(arg, tuple) and hasattr(type(arg), "_fields")
+                and (arg_type is None or not hasattr(arg_type, "_fields"))):
+            return original(arg, arg_name, type(arg), ctx, **kwargs)
+        return original(arg, arg_name, arg_type, ctx, **kwargs)
+    return convert
 
 
-def _patched_convert_single_arg(arg, arg_name, arg_type, ctx):
-    if arg_type is not None and get_origin(arg_type) is cutlass.Constexpr:
-        return spec.ConstNone(arg_name)
-    # If arg is a NamedTuple but arg_type doesn't have _fields (e.g. annotated as tuple),
-    # redirect so the converter uses the NamedTuple's own type hints.
-    if (
-        isinstance(arg, tuple)
-        and hasattr(type(arg), "_fields")
-        and (arg_type is None or not hasattr(arg_type, "_fields"))
-    ):
-        return _original_convert_single_arg(arg, arg_name, type(arg), ctx)
-    return _original_convert_single_arg(arg, arg_name, arg_type, ctx)
-
-
-_converter_module._convert_single_arg = _patched_convert_single_arg
+@contextmanager
+def converter_compatibility():
+    original = _converter_module._convert_single_arg
+    _converter_module._convert_single_arg = _converter_wrapper(original)
+    try:
+        yield
+    finally:
+        _converter_module._convert_single_arg = original
 
 
 torch2cute_dtype_map = {

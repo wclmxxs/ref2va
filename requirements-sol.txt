@@ -1,4 +1,5 @@
 # Optional Hopper attention only. Preserve the installed CUDA PyTorch/FA4 stack.
-nvidia-cutlass-dsl>=4.6.2,<4.8
+# FA4 4.0.0b26 and the installed quack kernels require this exact prerelease.
+nvidia-cutlass-dsl==4.6.0.dev0
 cuda-bindings>=12.9,<14
 apache-tvm-ffi>=0.1.12,<0.2

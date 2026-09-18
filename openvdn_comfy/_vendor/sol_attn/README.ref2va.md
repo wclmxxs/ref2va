@@ -19,3 +19,7 @@ vendor directory in `sol_kernel.py`, `sol_plan.py`, and `sol_attention.py`.
 The host disables the square recipe's unconditional full-Q-tile route reduction
 when Tq is not divisible by 64, using SM90's existing guarded reduction.
 CUDA math is otherwise unchanged. No SM100/SM120 backend is exposed here.
+
+The SM90 compatibility converter accepts CuTe 4.6's keyword arguments. Its
+legacy NamedTuple handling is scoped to Sol compilation and restored in a
+finally block, rather than changing the resident FA4 converter on import.

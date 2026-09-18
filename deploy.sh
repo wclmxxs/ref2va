@@ -37,9 +37,7 @@ download_models() {
 
 install_sol() {
     [[ -x .runtime/bin/uv && -x .venv-vdn/bin/python ]] || { echo 'Run bash deploy.sh install first'; exit 1; }
-    .runtime/bin/uv pip install --python .venv-vdn/bin/python -r requirements-sol.txt -c constraints-vdn.txt
-    .runtime/bin/uv pip check --python .venv-vdn/bin/python
-    .venv-vdn/bin/python -c 'from openvdn_comfy.sol_kernel import SolKernel; SolKernel.dependencies(); print("Sol SM90 imports OK; GPU arithmetic check runs on first opt-in")'
+    .venv-vdn/bin/python scripts/install_sol.py
 }
 
 check_runtime() {

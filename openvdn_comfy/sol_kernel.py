@@ -118,8 +118,10 @@ class SolKernel:
                 # rectangular final Q tile use the kernel's existing guarded path.
                 if q.shape[1] % 64:
                     operator.sol_attn_assume_lane_group_route_reduce = False
-                compiled = cute.compile(operator, *args, float(scale), sink_range,
-                                        stream=stream, options='--enable-tvm-ffi')
+                from ._vendor.sol_attn.sm90._compat.cute_dsl_utils import converter_compatibility
+                with converter_compatibility():
+                    compiled = cute.compile(operator, *args, float(scale), sink_range,
+                                            stream=stream, options='--enable-tvm-ffi')
                 self.compile_seconds += time.perf_counter()-started
                 self.compile_misses += 1
                 self.compiled[key] = compiled

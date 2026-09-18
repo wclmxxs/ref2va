@@ -375,6 +375,8 @@ cd /root/ref2va && git pull --ff-only && bash deploy.sh install-sol && bash depl
 
 默认仍使用 `attention_kernel=native`，启动不会全量预热 Sol。首次请求选择 Sol 时，各 rank 先执行独立数学参考校验，包括 Q/K 不等长、尾块、全精确及稀疏分支；失败明确报错，不静默退回原 attention。第一次出现的形状可能编译，之后复用进程内 CuTe callable 和 Triton 编译缓存。CuTe callable 最多保留 128 个形状（LRU）；不把重启后首次加载宣称为进程内命中。依赖导入通过不等于 H200 数值/性能验证通过。
 
+`install-sol` 使用 FA4 `4.0.0b26` / quack 要求的 `nvidia-cutlass-dsl==4.6.0.dev0`，显式允许该预发行版。它保留已安装的 torch（包括 cu129 后缀）、torchvision、triton、FA4、quack 版本，先联合解析依赖，再安装并检查三套内核的导入。如果此前被 Sol 安装命令升到 4.7.1，再执行同一条更新命令即可：脚本会先移除 4.7 拆出的 `libs-core` / `libs-cu12`，再恢复 4.6，避免共享路径残留；不通过跳过依赖检查掩盖冲突。
+
 在原请求中增加：
 
 ```json
