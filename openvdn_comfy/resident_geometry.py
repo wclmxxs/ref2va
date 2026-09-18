@@ -29,6 +29,7 @@ class GeometryCache:
                          plan.generation_width, plan.generation_height, plan.sampling_frames,
                          bucket.capacity, bucket.video_tokens, str(embeds.dtype),
                          bool(conditions))
+        signature = (*signature, getattr(runtime, '_ref2va_attention_signature', ('native', False)))
         fingerprint = hashlib.sha256(json.dumps(signature).encode()).hexdigest()
         new_shape = fingerprint not in self.shapes
         reset = new_shape and len(self.shapes) >= self.max_shapes

@@ -106,17 +106,26 @@ def project_video_rows(attn, out, linear_local, runtime, layout, x):
 
 
 class ExactRuntime:
-    def __init__(self, transformer, ulysses, render, *, active=True, block_runtime=None, token_buckets=None):
+    def __init__(self, transformer, ulysses, render, *, active=True, block_runtime=None, token_buckets=None, attention_runtime=None):
         self.active = active
         self.generate = render.generate_latents
         self.values = {}
         self.in_request = False
-        if not active and block_runtime is None and token_buckets is None:
+        if not active and block_runtime is None and token_buckets is None and attention_runtime is None:
             return
         forwards = {}
         for name in ("_ulysses_attention_forward", "_branch_parallel_attention_forward"):
             edits = [(PROJECTION_OLD, PROJECTION_NEW)] if active else []
             extra = {"_ref2va_project": project_video_rows}
+            if attention_runtime is not None:
+                from .attention_runtime import isolated, window_attention
+                edits.append(('if full_cover:', 'if full_cover and not _ref2va_isolated(self):'))
+                extra.update(_ref2va_isolated=isolated, _window_softmax_branch=window_attention)
+                if name == '_ulysses_attention_forward':
+                    # Full-cover isolation changes only the softmax dispatch;
+                    # it must not enable a previously inactive linear branch.
+                    edits.append(('        linear_active = True\n    else:',
+                                  '        linear_active = not full_cover\n    else:'))
             # Bucket gaps now participate in native attention. Keep its full-cover
             # dispatch and window kernel instead of wrapping them in score_mod.
             forwards[name] = rewrite(getattr(ulysses, name), edits, extra) if edits else getattr(ulysses, name)

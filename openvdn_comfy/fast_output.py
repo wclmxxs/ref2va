@@ -138,18 +138,12 @@ def threaded_pixels(video, plan, mean, std, timings):
 
 
 def write_mp4(video, audio, sample_rate, plan, output, pixel_mean, pixel_std, timings, phase=lambda _: None,
-              *, verify=False):
+              *, verify=False, pixel_chunks=None):
     import av
     import torch.nn.functional as F
     from diffusers.utils.export_utils import _write_audio, _prepare_audio_stream
-    if video.ndim != 5 or video.shape[0] != 1 or video.shape[1] != 3 or video.shape[2] < plan.output_frames:
+    if pixel_chunks is None and (video.ndim != 5 or video.shape[0] != 1 or video.shape[1] != 3 or video.shape[2] < plan.output_frames):
         raise ValueError("Unexpected VAE output shape or insufficient frames")
-    samples = round(plan.output_frames / plan.fps * sample_rate)
-    audio = audio[..., :samples]
-    if audio.shape[-1] < samples:
-        audio = F.pad(audio, (0, samples - audio.shape[-1]))
-    with measured(timings, "device_to_host_seconds", audio.device):
-        audio = audio.cpu()
     path = Path(output)
     path.parent.mkdir(parents=True, exist_ok=True)
     partial = path.with_name(path.stem + ".partial" + path.suffix)
@@ -159,9 +153,9 @@ def write_mp4(video, audio, sample_rate, plan, output, pixel_mean, pixel_std, ti
     threads = int(os.environ.get("REF2VA_X264_THREADS", "8"))
     if not 1 <= threads <= 64:
         raise ValueError("REF2VA_X264_THREADS must be 1–64")
-    asynchronous = enabled("REF2VA_ASYNC_OUTPUT") and video.is_cuda
+    asynchronous = pixel_chunks is None and enabled("REF2VA_ASYNC_OUTPUT") and video.is_cuda
     producer = PinnedPixels(video, plan, pixel_mean, pixel_std, timings, verify=verify) if asynchronous else None
-    chunks = producer.chunks() if producer else threaded_pixels(video, plan, pixel_mean, pixel_std, timings)
+    chunks = pixel_chunks if pixel_chunks is not None else (producer.chunks() if producer else threaded_pixels(video, plan, pixel_mean, pixel_std, timings))
     phase("encoding_mp4")
     try:
         from contextlib import closing
@@ -186,6 +180,13 @@ def write_mp4(video, audio, sample_rate, plan, output, pixel_mean, pixel_std, ti
                 with measured(timings, "h264_encode_seconds"):
                     packets = stream.encode()
                 mux(packets)
+                audio = audio() if callable(audio) else audio
+                samples = round(plan.output_frames / plan.fps * sample_rate)
+                audio = audio[..., :samples]
+                if audio.shape[-1] < samples:
+                    audio = F.pad(audio, (0, samples - audio.shape[-1]))
+                with measured(timings, "device_to_host_seconds", audio.device):
+                    audio = audio.cpu()
                 with measured(timings, "audio_encode_and_mux_seconds"):
                     _write_audio(container, audio_stream, audio, sample_rate, av)
                 with measured(timings, "mux_seconds"):
@@ -196,16 +197,16 @@ def write_mp4(video, audio, sample_rate, plan, output, pixel_mean, pixel_std, ti
         partial.unlink(missing_ok=True)
         raise
     return {"video_codec": "libx264", "preset": preset, "crf": 23, "threads": threads,
-            "pixel_device": str(video.device), "prefetch_chunks": 1,
-            "async_pinned_output": asynchronous, "host_buffer_slots": 2,
+            "pixel_device": str(video.device) if video is not None else "streamed", "prefetch_chunks": 2 if asynchronous else 0 if pixel_chunks is not None else 1,
+            "async_pinned_output": asynchronous, "host_buffer_slots": 2 if asynchronous else 0,
             "pixel_timing_method": "cuda_events" if asynchronous else "synchronized_wall",
             "pixel_parity": {"checked": bool(producer and verify),
                              "chunks_checked": producer.checked_chunks if producer else 0},
-            "component_times_overlap": True}
+            "component_times_overlap": True, "streaming_vae_output": pixel_chunks is not None}
 
 
 def decode_and_save(latents, audio_latents, vae, audio_vae, output, device, plan, pixel_mean, pixel_std,
-                    phase=lambda _: None, decoded_video=None, video_decode_seconds=None, verify_output=False):
+                    phase=lambda _: None, decoded_video=None, video_decode_seconds=None, verify_output=False, stream_writer=None):
     import torch
     timings = {}
     started = time.perf_counter()
@@ -230,8 +231,13 @@ def decode_and_save(latents, audio_latents, vae, audio_vae, output, device, plan
             std = torch.tensor(audio_vae.config.latents_std, device=device).view(1, -1, 1)
             audio = audio_vae.decode(audio_latents * std + mean, return_dict=False)[0]
             audio = audio.float().permute(1, 0, 2)[0]
-        encoding = write_mp4(video, audio, audio_vae.config.sampling_rate, plan, output,
-                             pixel_mean, pixel_std, timings, phase, verify=verify_output)
+        if stream_writer is None:
+            encoding = write_mp4(video, audio, audio_vae.config.sampling_rate, plan, output,
+                                 pixel_mean, pixel_std, timings, phase, verify=verify_output)
+        else:
+            phase("finishing_mp4")
+            streamed_timings, encoding = stream_writer.finish(audio, video)
+            timings.update(streamed_timings)
     # A distributed decode happened immediately before this call. Include its
     # actual wall time once, preserving the existing end-to-end output metric.
     timings["output_wall_seconds"] = time.perf_counter() - started + (video_decode_seconds or 0.)

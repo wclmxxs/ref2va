@@ -61,7 +61,7 @@ class OpenVDNH200Generate:
             "softmax_ranks": ("INT", {"default": 6, "min": 0, "max": 7}),
             "warmup_steps": ("INT", {"default": 2, "min": 0, "max": 8}),
             "profile": ("BOOLEAN", {"default": False}),
-        }, "optional": {"references": ("OPENVDN_REFS",), **cache_inputs()}}
+        }, "optional": {"references": ("OPENVDN_REFS",), **cache_inputs(), **optimization_inputs()}}
 
     RETURN_TYPES = ("VIDEO", "STRING")
     RETURN_NAMES = ("video", "metrics_json")
@@ -107,7 +107,7 @@ class OpenVDNH200Request(OpenVDNH200Generate):
             "resolution": ("INT", {"default": 720, "min": 256, "max": 1080, "step": 2}),
             "reference_image_urls": ("STRING", {"multiline": True, "default": "", "tooltip": "One HTTP(S) image URL per line, or a JSON array; order is <Picture 1>, <Picture 2>, ..."}),
             **{name: legacy[name] for name in ("seed", "reference_short_edge", "fp8", "inference_kernels", "softmax_backend", "softmax_ranks", "warmup_steps", "profile")},
-        }, "optional": cache_inputs()}
+        }, "optional": {**cache_inputs(), **optimization_inputs()}}
 
     DESCRIPTION = "Reference-image URLs to video. Duration is in seconds, ratio is width:height, resolution is the output short edge. Uses all 8 GPUs and official Ref2VA-like weights."
 
@@ -167,3 +167,14 @@ NODE_CLASS_MAPPINGS = {"OpenVDNReference": OpenVDNReference, "OpenVDNH200Generat
 NODE_DISPLAY_NAME_MAPPINGS = {"OpenVDNReference": "OpenVDN · Reference Image",
                               "OpenVDNH200Generate": "OpenVDN · 8×H200 · 8 NFE (Ref2VA-like)",
                               "OpenVDNH200Request": "OpenVDN · URL References · Duration / Ratio / Resolution"}
+
+
+def optimization_inputs():
+    return {
+        "fast_communication": ("BOOLEAN", {"default": True}),
+        "attention_kernel": (["native", "decomposed"],),
+        "linear_stats_chunk_frames": ([16, 8, 32],),
+        "isolate_padding": ("BOOLEAN", {"default": False}),
+        "streaming_output": ("BOOLEAN", {"default": True}),
+        "cleanup_policy": (["adaptive", "always"],),
+    }

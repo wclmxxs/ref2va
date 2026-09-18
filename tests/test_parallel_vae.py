@@ -160,13 +160,17 @@ def distributed_worker():
     rank, world = dist.get_rank(), dist.get_world_size()
     vae = native_decoder()
     with torch.no_grad():
-        for length in (7, 8, 72, 107):
+        for length, streaming in [(n, s) for n in (7, 8, 72, 107) for s in (False, True)]:
             z = torch.arange(24 * length, dtype=torch.float32).reshape(1, 24, length, 1, 1) / 1000
-            video, info = decode_parallel(vae, z, rank=rank, world_size=world, verify=True)
+            emitted = []
+            video, info = decode_parallel(vae, z, rank=rank, world_size=world, verify=True, streaming=streaming,
+                                          on_chunk=(lambda x: emitted.append(x.clone())) if streaming and rank == 0 else None)
             assert info['parity']['exact']
             assert sum(r['clips'] for r in info['by_rank']) == info['temporal_clips']
             if rank == 0:
                 assert torch.equal(video, vae.decode(z, return_dict=False)[0])
+                if streaming:
+                    assert torch.equal(torch.cat(emitted, dim=2)[:, :, :video.shape[2]], video)
             else:
                 assert video is None
         # Exercise the real spatial splitting/stitching and temporal assembly
@@ -197,3 +201,21 @@ def distributed_worker():
 
 if __name__ == '__main__':
     distributed_worker()
+
+
+@pytest.mark.parametrize('length', [7, 8, 12, 32, 72, 107])
+def test_streamed_callback_is_native_frame_order_after_tail_trim(length):
+    from openvdn_comfy.parallel_vae import streamed_assembly
+    vae = native_decoder()
+    z = torch.randn(1, 24, length, 2, 1)
+    expected = vae.decode(z, return_dict=False)[0]
+    chunks = []
+    with streamed_assembly(vae, lambda chunk: chunks.append(chunk.clone())):
+        actual = vae.decode(z, return_dict=False)[0]
+    assert torch.equal(actual, expected)
+    assert torch.equal(torch.cat(chunks, dim=2)[:, :, :actual.shape[2]], expected)
+    assert '_decode' not in vae.__dict__
+    with pytest.raises(RuntimeError, match='consumer broke'):
+        with streamed_assembly(vae, lambda _: (_ for _ in ()).throw(RuntimeError('consumer broke'))):
+            vae.decode(z, return_dict=False)
+    assert '_decode' not in vae.__dict__

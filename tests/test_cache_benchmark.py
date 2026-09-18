@@ -54,3 +54,36 @@ def test_old_server_rejected_before_submitting_jobs(tmp_path):
             return {'ready': True, 'metrics_schema_version': 5}
     with pytest.raises(RuntimeError, match='schema 6'):
         benchmark(Old(), [], tmp_path)
+
+
+def test_pipeline_benchmark_preserves_content_and_excludes_cold_or_compiling_runs():
+    from scripts.benchmark_attention_pipeline import VARIANTS, summarize
+    from openvdn_comfy.optimization_options import FIELDS
+    assert all(set(v)==set(FIELDS) for v in VARIANTS.values())
+    rows=[{'variant':'baseline','pass':0,'graph_reused':False,'denoise_seconds':999,
+           'output_seconds':2,'processing_seconds':1001,'cached_steps':[4,6],'video_url':'warm'},
+          {'variant':'baseline','pass':1,'graph_reused':True,'denoise_seconds':11,
+           'output_seconds':4,'processing_seconds':16,'cached_steps':[4,6],'video_url':'hot'},
+          {'variant':'combined','pass':1,'graph_reused':False,'denoise_seconds':50,
+           'output_seconds':3,'processing_seconds':54,'cached_steps':[4,6],'video_url':'compiled'}]
+    summary=summarize(rows)
+    assert summary[0]['denoise_seconds']==11 and summary[0]['videos']==['hot']
+    assert summary[1]['denoise_seconds'] is None
+
+
+def test_pipeline_benchmark_resumes_accepted_job_without_duplicate_post(tmp_path):
+    import json
+    from scripts.benchmark_attention_pipeline import sample
+    request={'prompt':'unchanged'}
+    (tmp_path/'request.json').write_text(json.dumps(request))
+    (tmp_path/'submit.json').write_text(json.dumps({'status_url':'/openvdn/jobs/existing'}))
+    class Client:
+        timeout=5
+        def http(self,path,body=None):
+            assert body is None, 'Resume must not POST'
+            return {'ready':True,'instance':'same'} if path.endswith('health') else {'status':'succeeded'}
+    assert sample(Client(),request,tmp_path,'same')['status']=='succeeded'
+    (tmp_path/'submit.json').unlink()
+    import pytest
+    with pytest.raises(RuntimeError,match='Uncertain POST'):
+        sample(Client(),request,tmp_path,'same')

@@ -323,3 +323,19 @@ def test_pinned_forward_with_dit_controller_cache_off_matches_native(exact_enabl
             for _ in range(8):
                 model(**kwargs)
             assert controller.cache.report()['executed_blocks'] == 400
+
+
+def test_attention_hooks_preserve_full_cover_linear_disable_and_all_source_contracts():
+    from openvdn_comfy.attention_runtime import AttentionRuntime
+    from openvdn_comfy.token_buckets import TokenBuckets
+    ulysses, render = sources()
+    model = DummyTransformer(ulysses)
+    attention = AttentionRuntime([model.attn], TokenBuckets(2048), lambda *a: None)
+    ExactRuntime(model, ulysses, render, active=True, attention_runtime=attention)
+    assert model.attn._ref2va_attention is attention
+    # Both standard and branch-parallel forwards were rewritten successfully
+    # against the pinned source. Inspect the generated, auditable standard path.
+    import linecache
+    source = ''.join(linecache.getlines('<ref2va-exact/_ulysses_attention_forward.py>'))
+    assert 'if full_cover and not _ref2va_isolated(self):' in source
+    assert 'linear_active = not full_cover' in source

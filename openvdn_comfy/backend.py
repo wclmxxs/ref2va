@@ -34,6 +34,12 @@ def startup_settings():
         resolution=int(os.environ.get("REF2VA_WARMUP_RESOLUTION", "768")),
         reference_short_edge=int(os.environ.get("REF2VA_REFERENCE_SHORT_EDGE", "768")),
         fp8=boolean("REF2VA_FP8", True), inference_kernels=boolean("REF2VA_INFERENCE_KERNELS", True),
+        fast_communication=boolean("REF2VA_FAST_COMMUNICATION", True),
+        linear_stats_chunk_frames=int(os.environ.get("REF2VA_LINEAR_STATS_CHUNK_FRAMES", "16")),
+        attention_kernel=os.environ.get("REF2VA_ATTENTION_KERNEL", "native"),
+        isolate_padding=boolean("REF2VA_ISOLATE_PADDING", False),
+        streaming_output=boolean("REF2VA_STREAMING_OUTPUT", True),
+        cleanup_policy=os.environ.get("REF2VA_CLEANUP_POLICY", "adaptive"),
         softmax_backend=os.environ.get("REF2VA_SOFTMAX_BACKEND", "flex"),
         softmax_ranks=int(os.environ.get("REF2VA_SOFTMAX_RANKS", "6")),
         profile=boolean("REF2VA_PROFILE", False), warmup_steps=8).validate()

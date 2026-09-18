@@ -8,13 +8,14 @@ import uuid
 from aiohttp import web
 
 from .config import Settings
+from .optimization_options import FIELDS as OPTIMIZATION_FIELDS
 from .cache_dit import FIELDS as CACHE_FIELDS
 from .jobs import create_job, read_job, update_job
 from .references import parse_urls
 from .backend import health, validate_profile, PROFILE_FIELDS
 
 OPTIONS = ("seed", "reference_short_edge", "fp8", "inference_kernels", "softmax_backend",
-           "softmax_ranks", "warmup_steps", "profile", *CACHE_FIELDS)
+           "softmax_ranks", "warmup_steps", "profile", *CACHE_FIELDS, *OPTIMIZATION_FIELDS)
 
 
 def normalize_request(body):
@@ -65,7 +66,7 @@ def register_routes(server=None):
                     raise web.HTTPRequestEntityTooLarge(max_size=131072, actual_size=len(content))
             body = json.loads(content)
             if isinstance(body, dict):
-                body = {**backend["profile"], **body}
+                body = {**backend["profile"], **backend.get("request_options", {}).get("optimizations", {}), **body}
             normalized, settings = normalize_request(body)
             validate_profile(settings, backend)
         except (ValueError, TypeError) as error:

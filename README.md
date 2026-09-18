@@ -320,3 +320,47 @@ python3 scripts/benchmark_optimizations.py \
 依次比较 6+2、5+3、4+4 的无缓存热态速度，每种 1 次预热、3 次测速、1 次独立 profile；再在实测最快且热态没有新图编译的布局上比较三个缓存阈值，每种 1 次预热、3 次测速。整轮默认生成 27 条视频，串行使用同一服务；不重启、不结束其他应用。所有参数保持原请求，除布局/分析开关/缓存开关和阈值外不修改提示词、参考图、seed、尺寸或时长。启动实例变化或任务失败立即停止，不静默重试生成。已有结果目录拒绝覆盖。
 
 输出 `results.json`、`summary.json`、`report.md` 和每次请求/完整响应，包括视频链接、缓存命中数、编译情况、每卡分析。报告的耗时只统计独立热态样本中位数，不混入预热或 profile；须另外观看缓存与无缓存视频比较动作、身份和音画同步。未完成 H200 实测前，不承诺某种布局或缓存阈值一定更快。
+
+## Attention、通信与流式输出优化（schema 7）
+
+```bash
+cd /root/ref2va && git pull --ff-only && bash deploy.sh start
+```
+
+没有新增依赖。启动仍只做一个基础样例，不全量预热各种内核/形状。通信优化启用前，在每张卡上用小张量对比原 pack/unpack，并实际执行一次不等长 NCCL 往返；任意卡不一致就停止启动。视频输出继续执行原有真实 VAE clip 校验，并额外核对流式 RGB 像素与完整视频后处理的结果。首次运行新的内核/参数会编译，之后复用。
+
+以下字段可通过 REST、ComfyUI 或 CLI 逐请求切换：
+
+| 字段 | 默认 | 作用 |
+|---|---|---|
+| `fast_communication` | `true` | 每层从逐目标打包改成两个 Triton kernel，并融合回传后的 head 重排。NCCL payload、顺序、精度和异步 work/buffer 生存期不变；不量化通信。只作用于 branch-parallel 布局。 |
+| `attention_kernel` | `native` | `native` 保留当前 FA4/Flex 路径；`decomposed` 用上游 dense + varlen 分解相同窗口，保留相同桶。需要比较速度和浮点误差，不自动宣称更快。 |
+| `linear_stats_chunk_frames` | `16` | 可选 `8/16/32`，调整 linear 分支逐帧统计的 GEMM 批次，方程与精度不变。32 减少批次数、增加峰值显存；cuBLAS 算法可能随批次改变。 |
+| `isolate_padding` | `false` | 仅在 `softmax_backend=flex`、`attention_kernel=native` 时可用。用 BlockMask 排除中间 gap 的 key，保持完整块的快速路径，不使用 score_mod；full-cover 情况也通过隔离 mask，不激活额外 linear 分支。是否满足低开销目标须实测。 |
+| `streaming_output` | `true` | 并行 VAE 边解码边传回 clip；rank 0 按原生时间混合顺序提交有效帧，CPU H.264 与后续解码重叠。编码队列最多 4 个像素块，非零卡最多保留 2 个异步发送；异常会退出线程并删除 partial MP4。关闭时恢复整段解码后编码。 |
+| `cleanup_policy` | `adaptive` | 热态请求结束保留 CUDA 空闲内存池。新编译、启动校验、显存压力或每 32 次请求清理；`always` 恢复每次 gc/empty_cache。新的条件编码前所有卡仍释放空闲缓存，给 Qwen 跨卡临时分配腾出空间。 |
+
+服务启动默认值也可通过 `REF2VA_FAST_COMMUNICATION`、`REF2VA_ATTENTION_KERNEL`、`REF2VA_LINEAR_STATS_CHUNK_FRAMES`、`REF2VA_ISOLATE_PADDING`、`REF2VA_STREAMING_OUTPUT`、`REF2VA_CLEANUP_POLICY` 设置。若要完全恢复此前调度，用 `REF2VA_FAST_COMMUNICATION=0 REF2VA_STREAMING_OUTPUT=0 REF2VA_CLEANUP_POLICY=always bash deploy.sh start`。现有 `REF2VA_ASYNC_OUTPUT` 控制非流式输出的 pinned-memory 预取。
+
+返回 `metrics.upstream.optimizations`，包含实际参数、通信小张量/真实 NCCL 一致性检查、attention 选择和清理原因。隔离开启时 `compilation.token_bucket.policy=prefix_gap_isolated_v3`，`padding_attention=excluded_keys`；默认仍为 `prefix_gap_unmasked_v2`。隔离与原生不补齐在有效 key 集合上等价，浮点核/矩阵尺寸不同，不能承诺生成视频逐像素一致。Cache-DiT 仍按原参数独立运行。
+
+流式模式的 `video_vae_decode_seconds` 是包含传输、拼接、像素提交/队列反压的阶段 wall time，不是纯 VAE GPU 算子时间。新增 `video_vae_compute_max_rank_seconds` 来自逐 clip CUDA event，取八卡中最大的累计 decode 时间；`video_vae_decode.by_rank` 保留各卡明细。`output_pipeline_wall_seconds` 是整个重叠流水线耗时，`first_pixel_chunk_seconds` 表示第一批像素交给编码器的延迟。H.264、VAE、D2H 等组件现在有更多重叠，**不累加这些字段估算总耗时**；使用 `processing_wall_seconds` / `decode_and_encode_seconds` 比较端到端结果。
+
+### 可恢复的逐项对照
+
+用同一个 768 参考图、768 输出、RDT 0.25 的请求文件：
+
+```bash
+python3 scripts/benchmark_attention_pipeline.py --server http://43.218.119.131:8188 \
+  --request-file case.json --output-dir work/attention-pipeline --repeat 3
+```
+
+默认 8 组（原调度、仅通信、仅流式、仅清理、三者合并、合并+decomposed、合并+linear32、合并+隔离），每组 1 次冷启动/预热和 3 次交错热态样本，总共 32 条。可用 `--variants baseline combined` 先跑 8 条。请求内容、seed、时长、分辨率、参考图和 Cache-DiT 参数保持一致。热态仍触发 Dynamo 编译的组标为无效，不参与速度结论。输出请求、完整状态、视频链接、分步耗时、缓存实际跳步、`summary.json` 和 `report.md`。同目录可恢复已接受的任务，不会因轮询中断重新提交生成；接受状态不确定的 POST 会停止并要求检查队列。
+
+可选、不加载模型的八卡 kernel 校验（请在 GPU 空闲时运行，不属于默认启动全量预热）：
+
+```bash
+.venv-vdn/bin/torchrun --standalone --nproc_per_node=8 scripts/validate_optimization_kernels.py
+```
+
+覆盖 1+7 至 7+1 的 pack/unpack/NCCL，以及 FA4 隔离窗口/full-cover 和 decomposed 对 fp32 dense 参考的容差校验。**本地 CPU 回归通过不等于 H200 新路径已通过；只有服务器校验与热态对照完成后才能报告实际加速。**

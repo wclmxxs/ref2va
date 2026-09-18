@@ -16,6 +16,11 @@ from openvdn_comfy.config import MODELS, RUNTIME, UPSTREAM, Settings, atomic_jso
 from openvdn_comfy.compile_cache import CompilerMonitor, cache_settings, summarize_compilation
 from openvdn_comfy.fast_output import decode_and_save, measured
 from openvdn_comfy.exact_runtime import ExactRuntime, enabled
+from openvdn_comfy.attention_runtime import AttentionRuntime
+from openvdn_comfy.communication import CommunicationRuntime
+from openvdn_comfy.request_cleanup import RequestCleanup
+from openvdn_comfy.streaming_output import StreamingMP4
+from openvdn_comfy.optimization_options import FIELDS as OPTIMIZATION_FIELDS
 from openvdn_comfy.dit_runtime import DiTRuntime, summarize_profiles, summarize_cache
 from openvdn_comfy.cache_dit import FIELDS as CACHE_FIELDS
 from openvdn_comfy.parallel_vae import decode_parallel
@@ -117,10 +122,11 @@ def main():
             atomic_json(BACKEND / "state.json", {"instance": instance, "status": status, "phase": phase,
                         "profile": {**profile, **{name: getattr(settings, name) for name in REQUEST_DEFAULT_FIELDS}},
                         "request_options": {"softmax_ranks": list(range(8)), "profile": True,
+                                            "optimizations": {name: getattr(settings, name) for name in OPTIMIZATION_FIELDS},
                                             "cache_dit": {name: getattr(settings, name) for name in CACHE_FIELDS}},
                         "active_softmax_ranks": runtime.softmax_ranks,
                         "world_size": 8, "video_vae_world_size": 8 if parallel_vae else 1,
-                        "metrics_schema_version": 6, "compile_cache": compile_options,
+                        "metrics_schema_version": 7, "compile_cache": compile_options,
                         "token_bucket_policy": BUCKET_POLICY if compile_options["token_bucket"] and settings.softmax_backend == "flex" else "native",
                         "startup_warmup": startup_report,
                         "exact_runtime_enabled": enabled("REF2VA_EXACT_RUNTIME"),
@@ -137,8 +143,15 @@ def main():
     # Native decomposed/reference paths remain available, without padded tokens.
     bucket_stride = compile_options["token_bucket"] if settings.softmax_backend == "flex" else 0
     buckets = TokenBuckets(bucket_stride)
+    attention_runtime = AttentionRuntime(dit_runtime.hybrids, buckets, ulysses._window_softmax_branch)
+    communication = CommunicationRuntime(runtime)
+    state("loading", "checking_communication_kernels")
+    if settings.fast_communication:
+        communication.verify(head_dim=dit_runtime.hybrids[0].head_dim)
+    cleanup = RequestCleanup()
     exact_runtime = ExactRuntime(model.transformer, ulysses, render, active=enabled("REF2VA_EXACT_RUNTIME"),
-                                 block_runtime=dit_runtime, token_buckets=buckets if bucket_stride else None)
+                                 block_runtime=dit_runtime, token_buckets=buckets if bucket_stride else None,
+                                 attention_runtime=attention_runtime)
     runtime.barrier()
     if parallel_vae:
         state("loading", "loading_parallel_video_vaes")
@@ -184,6 +197,13 @@ def main():
         cache_hit = cache.is_file() and cache.stat().st_size > 0
         if request.get("require_cached_prompt") and not cache_hit:
             raise RuntimeError(f"Warmup conditioning cache disappeared: {cache}")
+        if not cache_hit:
+            # Qwen on rank zero temporarily allocates on all eight GPUs. Return
+            # each diffusion process's retained allocator blocks before encoding
+            # a new prompt/reference, then keep hot inference requests fast.
+            gc.collect()
+            torch.cuda.empty_cache()
+        runtime.barrier()
         if runtime.is_main and not cache_hit:
             state(run_status, "encoding_references", token=request.get("token"))
             cache.parent.mkdir(parents=True, exist_ok=True)
@@ -204,6 +224,11 @@ def main():
                                  render.audio_latent_num_frames(plan.sampling_frames) * render.AUDIO_CHANNELS,
                                  render.video_latent_num_frames(plan.sampling_frames, 17, 5), bucket_stride)
         buckets.prepare(bucket, device)
+        attention_runtime.select(current)
+        if current.fast_communication and communication.parity is None:
+            communication.verify(head_dim=dit_runtime.hybrids[0].head_dim)
+        communication.select(current.fast_communication)
+        runtime._ref2va_attention_signature = (current.attention_kernel, current.isolate_padding, current.linear_stats_chunk_frames)
         dit_runtime.select_layout(current.softmax_ranks)
         new_shape = geometries.prepare(runtime, plan, embeds, tags, conditions, bucket=bucket)
         phase = "warming_up" if warmup else "verifying_warm_cache" if startup else "denoising"
@@ -234,8 +259,11 @@ def main():
             atomic_json(BACKEND / "exact-runtime-parity.json", {"instance": instance, "by_rank": exact_records})
         if any(item["parity"]["checked"] and item["parity"]["exact"] is not True for item in exact_records):
             raise RuntimeError("Exact runtime startup parity failed; restart with REF2VA_EXACT_RUNTIME=0")
+        bucket_report = bucket.metadata()
+        if current.isolate_padding and bucket_stride:
+            bucket_report.update(policy="prefix_gap_isolated_v3", padding_attention="excluded_keys")
         compilation = {**summarize_compilation(compile_records), **geometries.last,
-                       "token_bucket": bucket.metadata()}
+                       "token_bucket": bucket_report}
         geometries.commit()
         compilation.update(geometries.last)
         profiles = [item["profile"]["ms_per_nfe"] for item in dit_records]
@@ -244,33 +272,45 @@ def main():
         video_decode_seconds = None
         video_decode_details = {"world_size": 1, "native_temporal_assembly": True}
         output_timings, encoding = {}, {}
-        if parallel_vae and not denoise_only:
-            state(run_status, "decoding_video_vae", token=request.get("token"))
-            decode_timings = {}
-            clip_decoder.tile_count = 0
-            with measured(decode_timings, "video_vae_decode_seconds", device):
-                mean = torch.tensor(model.vae.config.latents_mean, device=device).view(1, -1, 1, 1, 1)
-                std = torch.tensor(model.vae.config.latents_std, device=device).view(1, -1, 1, 1, 1)
-                with torch.autocast(device_type="cuda", dtype=torch.float16):
-                    decoded_video, video_decode_details = decode_parallel(
-                        model.vae, latents * std + mean, rank=runtime.rank, world_size=runtime.world_size,
-                        verify=warmup, clip_decode=clip_decoder)
-            tile_counts = [None] * runtime.world_size
-            dist.all_gather_object(tile_counts, clip_decoder.tile_count)
-            video_decode_details.update(spatial_tiles_by_rank=tile_counts,
-                                        stitch="preallocated_native_blending")
-            video_decode_seconds = decode_timings["video_vae_decode_seconds"]
-            if warmup and runtime.is_main:
-                atomic_json(BACKEND / "vae-parity.json", {"instance": instance, **video_decode_details})
-                print(f"Parallel video VAE: startup parity passed for {video_decode_details['temporal_clips']} clips", flush=True)
-        if runtime.is_main and not denoise_only:
-            state(run_status, "decoding", token=request.get("token"))
-            output_timings, encoding = decode_and_save(
-                latents, audio, model.vae, model.audio_vae, request["output"], device, plan,
-                render.PIXEL_MEAN, render.PIXEL_STD,
-                phase=lambda phase: state(run_status, phase, token=request.get("token")),
-                decoded_video=decoded_video, video_decode_seconds=video_decode_seconds, verify_output=warmup)
-        runtime.barrier()
+        stream_writer = (StreamingMP4(plan, request["output"], model.audio_vae.config.sampling_rate,
+                                      render.PIXEL_MEAN, render.PIXEL_STD, verify=warmup)
+                         if current.streaming_output and parallel_vae and runtime.is_main and not denoise_only else None)
+        try:
+            if parallel_vae and not denoise_only:
+                state(run_status, "decoding_video_vae", token=request.get("token"))
+                decode_timings = {}
+                clip_decoder.tile_count = 0
+                with measured(decode_timings, "video_vae_decode_seconds", device):
+                    mean = torch.tensor(model.vae.config.latents_mean, device=device).view(1, -1, 1, 1, 1)
+                    std = torch.tensor(model.vae.config.latents_std, device=device).view(1, -1, 1, 1, 1)
+                    with torch.autocast(device_type="cuda", dtype=torch.float16):
+                        decoded_video, video_decode_details = decode_parallel(
+                            model.vae, latents * std + mean, rank=runtime.rank, world_size=runtime.world_size,
+                            verify=warmup, clip_decode=clip_decoder, streaming=current.streaming_output,
+                            on_chunk=stream_writer.submit if stream_writer else None)
+                tile_counts = [None] * runtime.world_size
+                dist.all_gather_object(tile_counts, clip_decoder.tile_count)
+                video_decode_details.update(spatial_tiles_by_rank=tile_counts,
+                                            stitch="preallocated_native_blending",
+                                            wall_time_scope="decode, transport, assembly, and pixel-queue backpressure"
+                                            if current.streaming_output else "decode, transport, assembly")
+                video_decode_seconds = decode_timings["video_vae_decode_seconds"]
+                if warmup and runtime.is_main:
+                    atomic_json(BACKEND / "vae-parity.json", {"instance": instance, **video_decode_details})
+                    print(f"Parallel video VAE: startup parity passed for {video_decode_details['temporal_clips']} clips", flush=True)
+            if runtime.is_main and not denoise_only:
+                state(run_status, "decoding", token=request.get("token"))
+                output_timings, encoding = decode_and_save(
+                    latents, audio, model.vae, model.audio_vae, request["output"], device, plan,
+                    render.PIXEL_MEAN, render.PIXEL_STD,
+                    phase=lambda phase: state(run_status, phase, token=request.get("token")),
+                    decoded_video=decoded_video, video_decode_seconds=video_decode_seconds, verify_output=warmup,
+                    stream_writer=stream_writer)
+            runtime.barrier()
+        except BaseException as error:
+            if stream_writer is not None:
+                stream_writer.abort(error)
+            raise
         timings = {"denoise_seconds": denoise_seconds, "seconds_per_step": denoise_seconds / 8,
                    "step_seconds": steps, "model_setup_seconds": 0,
                    "step_timing_method": exact_report["step_timing_method"],
@@ -282,12 +322,14 @@ def main():
                    "parallel_profile_ms_per_nfe_by_rank": profiles}
         cleanup_start = time.monotonic()
         del latents, audio, embeds, tags, conditions, decoded_video
-        gc.collect()
-        torch.cuda.empty_cache()
+        cleanup_report = cleanup.run(torch, device, current.cleanup_policy,
+                                     compiled=compilation["compiled_new_graph"], warmup=warmup)
         runtime.barrier()
         cleanup_seconds = time.monotonic() - cleanup_start
         if runtime.is_main:
             timings.update(output_timings)
+            if video_decode_details.get('streaming'):
+                timings['video_vae_compute_max_rank_seconds'] = max(r['compute_seconds'] for r in video_decode_details['by_rank'])
             timings.update(conditioning_seconds=encode_seconds, condition_load_seconds=condition_load_seconds,
                            cleanup_seconds=cleanup_seconds, worker_wall_seconds=time.monotonic() - worker_start)
             from src.inference.utils.assemble import flex_latch_state
@@ -297,7 +339,11 @@ def main():
                       "parallel": {"kind": "ulysses_branch_parallel" if runtime.branch_parallel else "ulysses",
                                    "world_size": 8, "softmax_ranks": runtime.softmax_ranks,
                                    "warmup_steps": 8 if warmup else 0}, "timings": timings,
-                      "resident": True, "output_encoding": encoding, "video_vae_decode": video_decode_details,
+                      "resident": True, "output_encoding": encoding,
+                      "optimizations": {"requested": {name: getattr(current, name) for name in OPTIMIZATION_FIELDS},
+                                        "communication": {"enabled": communication.active, "parity": communication.parity,
+                                                          "pack_launches_per_layer": 2 if communication.active and runtime.branch_parallel else None},
+                                        "attention": attention_runtime.report(), "cleanup": cleanup_report}, "video_vae_decode": video_decode_details,
                       "compilation": compilation,
                       "conditioning": conditioning,
                       "exact_runtime": {"enabled": exact_runtime.active, "by_rank": exact_records},

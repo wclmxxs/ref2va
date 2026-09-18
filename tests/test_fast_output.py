@@ -155,3 +155,58 @@ def test_cuda_real_mp4_matches_synchronous_encoder(tmp_path, native_audio, monke
             second = [torch.from_numpy(f.to_ndarray()) for f in b.decode(**{media: 0})]
             assert len(first) == len(second)
             assert all(torch.equal(x, y) for x, y in zip(first, second))
+
+
+def test_streaming_writer_matches_video_pixels_audio_pts_and_bounded_queue(tmp_path, native_audio):
+    from openvdn_comfy.streaming_output import StreamingMP4
+    plan = make_plan(duration=4, ratio='9:16', resolution=256)
+    torch.manual_seed(2)
+    video = torch.randn(1, 3, 107, 48, 32)
+    audio = torch.zeros(2, 192000)
+    mean, std = (.5,)*3, (.5,)*3
+    expected_path, actual_path = tmp_path/'buffered.mp4', tmp_path/'streamed.mp4'
+    fast_output.write_mp4(video, audio, 48000, plan, expected_path, mean, std, {})
+    writer = StreamingMP4(plan, actual_path, 48000, mean, std, verify=True)
+    try:
+        for start in range(0, 107, 17):
+            writer.submit(video[:, :, start:start+17])
+        timings, encoding = writer.finish(audio, video)
+    except BaseException as error:
+        writer.abort(error)
+        raise
+    assert encoding['streaming_pixel_parity']['exact']
+    assert encoding['streaming_vae_output'] and writer.queue.maxsize == 4
+    assert timings['first_pixel_chunk_seconds'] < timings['output_pipeline_wall_seconds']
+    with av.open(str(expected_path)) as a, av.open(str(actual_path)) as b:
+        assert a.streams.video[0].frames == b.streams.video[0].frames == 96
+        assert a.streams.audio[0].duration == b.streams.audio[0].duration
+        # Same RGB pixels, codec parameters and frame order must encode identically.
+        for x,y in zip(a.decode(video=0), b.decode(video=0)):
+            assert (x.pts,x.time_base)==(y.pts,y.time_base)
+            assert (x.to_ndarray()==y.to_ndarray()).all()
+
+
+def test_streaming_writer_aborts_without_blocked_thread_or_partial_file(tmp_path, native_audio):
+    from openvdn_comfy.streaming_output import StreamingMP4
+    plan = make_plan(duration=4, ratio='9:16', resolution=256)
+    writer = StreamingMP4(plan, tmp_path/'abort.mp4', 48000, (.5,)*3, (.5,)*3)
+    writer.submit(torch.zeros(1,3,17,48,32))
+    writer.abort(RuntimeError('producer failed'))
+    assert writer.writer.done() and not list(tmp_path.iterdir())
+
+
+def test_streaming_writer_propagates_encoder_error_without_queue_deadlock(tmp_path, native_audio, monkeypatch):
+    from openvdn_comfy import streaming_output
+    import threading
+    failed = threading.Event()
+    def broken(*args, **kwargs):
+        failed.set()
+        raise RuntimeError('encoder failed')
+    monkeypatch.setattr(streaming_output, 'write_mp4', broken)
+    plan = make_plan(duration=4, ratio='9:16', resolution=256)
+    writer = streaming_output.StreamingMP4(plan,tmp_path/'bad.mp4',48000,(.5,)*3,(.5,)*3)
+    assert failed.wait(2)
+    with pytest.raises(RuntimeError,match='encoder failed'):
+        writer.submit(torch.zeros(1,3,17,48,32))
+    writer.abort(RuntimeError('abort'))
+    assert writer.writer.done() and not list(tmp_path.iterdir())

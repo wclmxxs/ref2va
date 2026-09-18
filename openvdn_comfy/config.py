@@ -45,6 +45,12 @@ class Settings:
     duration: float | None = None
     ratio: str | None = None
     resolution: int | None = None
+    fast_communication: bool = True
+    linear_stats_chunk_frames: int = 16
+    attention_kernel: str = "native"
+    isolate_padding: bool = False
+    streaming_output: bool = True
+    cleanup_policy: str = "adaptive"
     cache_dit: bool = False
     cache_dit_threshold: float = 0.08
     cache_dit_fn_blocks: int = 8
@@ -70,6 +76,8 @@ class Settings:
                 raise ValueError(f"{name} must be boolean")
         if self.softmax_backend not in ("flex", "decomposed", "ref"):
             raise ValueError("Unsupported softmax_backend")
+        from .optimization_options import validate
+        validate(self)
         from .cache_dit import CacheConfig
         CacheConfig.from_settings(self).validate()
         self.render_plan()
