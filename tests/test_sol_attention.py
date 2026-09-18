@@ -1,4 +1,5 @@
 from dataclasses import replace
+import ast
 import hashlib
 import json
 from pathlib import Path
@@ -19,12 +20,30 @@ def dense(q, k, v, scale):
                 scale=scale)[0].transpose(0, 1)
 
 
+def upstream_window_bounds(frames, radius, chunk):
+    root = Path(__file__).resolve().parents[1]
+    for folder in ('work/upstream/openvdn', '.deps/openvdn'):
+        path = root/folder/'src/models/softmax_attention/window.py'
+        if path.exists():
+            tree = ast.parse(path.read_text())
+            tree.body = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'window_bounds']
+            ns = {}
+            exec(compile(tree, str(path), 'exec'), ns)
+            return ns['window_bounds'](frames, radius, chunk)
+    pytest.skip('Pinned OpenVDN sources not installed')
+
+
 @pytest.mark.parametrize('anchors', ['none', 'rows', 'columns', 'both'])
 @pytest.mark.parametrize('prefix', [None, 0, 2, 5])
-@pytest.mark.parametrize('full', [False, True])
-def test_window_adapter_matches_original_restricted_domain(anchors, prefix, full):
+@pytest.mark.parametrize('windows', ['clamped', 'frame', 'chunk', 'full', 'full_unclamped'])
+def test_window_adapter_matches_original_restricted_domain(anchors, prefix, windows):
     layout = SimpleNamespace(video_start=5, video_end=26, seq_len=29, num_frames=7, tokens_per_frame=3)
-    bounds = [(0, 6)]*7 if full else [(0, 1), (0, 1), (1, 3), (1, 3), (4, 6), (4, 6), (5, 6)]
+    if windows in ('frame', 'chunk'):
+        bounds = upstream_window_bounds(7, 1, 5 if windows == 'chunk' else 0)
+        assert bounds[0][0] < 0 and bounds[-1][1] >= 7
+    else:
+        bounds = {'full': [(0, 6)]*7, 'full_unclamped': [(-9, 15)]*7,
+                  'clamped': [(0, 1), (0, 1), (1, 3), (1, 3), (4, 6), (4, 6), (5, 6)]}[windows]
     # Independently construct the original VDN boolean domain.
     mask = torch.zeros((29, 29), dtype=torch.bool)
     for qi in range(29):

@@ -60,8 +60,11 @@ class WindowPlan:
             if f in dense_rows:
                 continue
             lo, hi = bounds[f]
-            if not (0 <= lo <= hi < frames):
-                raise ValueError('Invalid VDN window bounds')
+            # OpenVDN supplies inclusive, UNCLAMPED frame/chunk bounds.
+            # Negative lo and hi >= frames are normal at either video edge;
+            # the native mask only evaluates keys in the real frame domain.
+            if max(lo, 0) > min(hi, frames-1):
+                raise ValueError(f'VDN window {f} [{lo}, {hi}] has no frames in [0, {frames-1}]')
             if groups and groups[-1][-1]+1 == f and bounds[groups[-1][-1]] == bounds[f]:
                 groups[-1].append(f)
             else:
@@ -69,7 +72,8 @@ class WindowPlan:
         self.batches = OrderedDict()
         for fs in groups:
             lo, hi = bounds[fs[0]]
-            local = merge(frame(f) for f in range(lo, hi+1) if f not in dense_columns)
+            local = merge(frame(f) for f in range(max(lo, 0), min(hi+1, frames))
+                          if f not in dense_columns)
             # Keep protected K/V first, even when anchors are nonadjacent in the
             # original sequence. This is a permutation, never a second softmax.
             group = WindowGroup(merge(frame(f) for f in fs), (*sink, *local), length(sink))
