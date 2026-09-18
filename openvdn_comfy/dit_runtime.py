@@ -87,6 +87,10 @@ class DiTRuntime:
             self.runtime.reset_profile()
 
     def run(self, packed, args, video_indices, audio_indices):
+        attention = getattr(self.hybrids[0], '_ref2va_attention', None)
+        if attention is not None and attention.begin_step(self.cache.step):
+            self.cache.clear()
+            self.cache.consecutive = 0
         cfg = self.cache.config
         if cfg.enabled and cfg.threshold > 0 and cfg.max_cached_steps > 0:
             layout = self.hybrids[0].layout

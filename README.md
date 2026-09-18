@@ -2,7 +2,7 @@
 
 一条视频使用全部 8 张 H200。ComfyUI 负责输入、队列和视频预览；常驻八卡进程调用固定版本的 [OpenVDN](https://github.com/OpenVDN/vdn-minimax-h3)，默认 FP8、6 个 softmax rank + 2 个 linear rank、8 NFE。
 
-图片参考模式是官方 **Ref2VA-like**：FL2VA 权重接收参考图，不是 MiniMax 的独立 Ref2VA transformer。支持默认关闭的 DBCache 跨步缓存；暂不接入 LightX2V、Sol 或整块 DiT 编译；`inference_kernels` 控制官方融合/局部编译内核组合。
+图片参考模式是官方 **Ref2VA-like**：FL2VA 权重接收参考图，不是 MiniMax 的独立 Ref2VA transformer。支持默认关闭的 DBCache 跨步缓存、可选 Sol 窗口 softmax；暂不接入 LightX2V 或整块 DiT 编译；`inference_kernels` 控制官方融合/局部编译内核组合。
 
 ## 一条命令启动
 
@@ -364,3 +364,57 @@ python3 scripts/benchmark_attention_pipeline.py --server http://43.218.119.131:8
 ```
 
 覆盖 1+7 至 7+1 的 pack/unpack/NCCL，以及 FA4 隔离窗口/full-cover 和 decomposed 对 fp32 dense 参考的容差校验。**本地 CPU 回归通过不等于 H200 新路径已通过；只有服务器校验与热态对照完成后才能报告实际加速。**
+
+## Sol 窗口 attention（schema 8，H100/H200 实验后端）
+
+更新并补齐可选依赖，只执行这一条；不重新下载模型，不更换 CUDA PyTorch：
+
+```bash
+cd /root/ref2va && git pull --ff-only && bash deploy.sh install-sol && bash deploy.sh start
+```
+
+默认仍使用 `attention_kernel=native`，启动不会全量预热 Sol。首次请求选择 Sol 时，各 rank 先执行独立数学参考校验，包括 Q/K 不等长、尾块、全精确及稀疏分支；失败明确报错，不静默退回原 attention。第一次出现的形状可能编译，之后复用进程内 CuTe callable 和 Triton 编译缓存。CuTe callable 最多保留 128 个形状（LRU）；不把重启后首次加载宣称为进程内命中。依赖导入通过不等于 H200 数值/性能验证通过。
+
+在原请求中增加：
+
+```json
+{
+  "attention_kernel": "sol",
+  "sol_tau": 1.0,
+  "sol_dense_steps": 1,
+  "sol_dense_layers": 2,
+  "softmax_ranks": 6
+}
+```
+
+- `attention_kernel`：`native / decomposed / sol`，支持 REST、ComfyUI 和 CLI 逐请求切换。
+- `sol_tau`：0–4，默认 1.0。阈值越大，通常越多局部 K/V 块使用质心近似。0 也不是全精确模式；要关闭 Sol 用 `native`。这是 Sol 路由阈值，和 `cache_dit_threshold` 的 RDT 无关。
+- `sol_dense_steps`：前多少次 DiT 调用沿用原 attention，0–8，默认 1。
+- `sol_dense_layers`：每次 DiT 调用的前多少层沿用原 attention，0–50，默认 2。两项任一达到最大值就不会实际执行 Sol。
+- `isolate_padding` 可与 Sol 同开。原路径的保留层/步用现有 BlockMask，Sol 窗口先排除 padding key 再计算；不通过 score_mod，也不将 Q 补成 K 的长度。排除 padding 会改变物理 K 长度，因此原始 prefix 变化可能产生新的 Sol 形状。
+
+实现固定 NVIDIA [Sol-H3 SM90 源码](https://github.com/NVlabs/Sana/tree/bb60499af0e675095ff67424196d8c18e265f32a/models/minimax_h3/Sol-H3/h3_runtime/third_party/sol_attn)，在其矩形 host 适配层按相同 Q/K 长度批量处理 VDN 窗口。**只近似局部视频 softmax 的一部分 key 块**；保持原窗口可见域，文本、参考、音频及 anchor keys 作为精确 sink（向外对齐 64，最多额外保留 63 个局部 key），全局/anchor query 行精确计算。VDN 线性分支、gate、输出投影、RoPE、权重及 8 NFE 不变。原先 full-cover 层仍用原生 dense 分支。Sol 是近似优化，不能保证画质或数值等同；默认参数是测试起点，不是已验证质量预设。
+
+可继续使用 Cache-DiT RDT 0.25。切换 native→Sol 的那一步会在所有 rank 清空旧残差，避免复用上个计算阶段的残差；其后仍按 RDT 实际判断。首次效果对照建议先保持相同 seed/提示词/参考图和缓存参数，同时记录实际缓存步数；要单独分析 Sol 的误差，再关闭 Cache-DiT 比较。
+
+返回 `metrics.upstream.optimizations.attention`：
+
+- `sol.sparse_executed`、`sparse_kernel_launches_all_ranks`：是否真的调用，以及各 rank 调用总数。调用不等于加速或测得稀疏率；不在热路径额外同步统计每个选中块。
+- `by_rank[].sol`：原 attention 的步/层保留原因、dense/window query 行数、保护 key 数、过渡残差清理、校验结果、源码版本和实际参数。
+- `compilation.sol_compile_misses / sol_preprocess_signatures`：CuTe 首次形状、预处理首次签名。任一非零就把 `runtime_graph_reused` 标为 false，不能混进热态结论。
+- `timings.sol_compile_seconds` 是各 rank 最大 CuTe 编译/加载墙钟时间；`sol_preprocess_cold_seconds` 包括首次预处理的编译、autotune 和执行，不是纯编译时间。两项已包含在去噪耗时里，不可重复相加。首次小张量校验在 `condition_load_seconds` 内，另记 `verification_seconds`。
+
+可选：空闲时运行不加载模型的八卡校验，覆盖 6+2、5+3、4+4 的不等长 head 分片尺寸：
+
+```bash
+.venv-vdn/bin/torchrun --standalone --nproc_per_node=8 scripts/validate_sol_attention.py
+```
+
+部署后用同一份请求跑热态对照（默认 native/Sol 两组，各 1 次冷、3 次热；不重启）：
+
+```bash
+python3 scripts/benchmark_sol_attention.py --server http://43.218.119.131:8188 \
+  --request-file case.json --output-dir work/sol-benchmark --repeat 3
+```
+
+可加 `--layouts 6 5 4 --taus 0.5 1 1.5` 检查软最大值分支加速后的负载平衡。脚本保留输入和 Cache-DiT 参数，保存完整请求/响应、视频链接、分步耗时及缓存步数；拒绝把没有实际 Sol 调用、热态仍编译或跨服务实例的结果当成有效对照。`results.json` 包含冷态开销，`summary.json` 只统计有效热态中位数。本地 CPU 验证不包含 CUDA 内核执行，实际提速需在 H200 实测。

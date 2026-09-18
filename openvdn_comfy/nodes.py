@@ -172,9 +172,12 @@ NODE_DISPLAY_NAME_MAPPINGS = {"OpenVDNReference": "OpenVDN · Reference Image",
 def optimization_inputs():
     return {
         "fast_communication": ("BOOLEAN", {"default": True}),
-        "attention_kernel": (["native", "decomposed"],),
+        "attention_kernel": (["native", "decomposed", "sol"],),
         "linear_stats_chunk_frames": ([16, 8, 32],),
         "isolate_padding": ("BOOLEAN", {"default": False}),
         "streaming_output": ("BOOLEAN", {"default": True}),
         "cleanup_policy": (["adaptive", "always"],),
+        "sol_tau": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.1}),
+        "sol_dense_steps": ("INT", {"default": 1, "min": 0, "max": 8}),
+        "sol_dense_layers": ("INT", {"default": 2, "min": 0, "max": 50}),
     }

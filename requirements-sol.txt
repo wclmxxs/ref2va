@@ -1,0 +1,4 @@
+# Optional Hopper attention only. Preserve the installed CUDA PyTorch/FA4 stack.
+nvidia-cutlass-dsl>=4.6.2,<4.8
+cuda-bindings>=12.9,<14
+apache-tvm-ffi>=0.1.12,<0.2

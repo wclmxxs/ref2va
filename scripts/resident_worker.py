@@ -16,7 +16,7 @@ from openvdn_comfy.config import MODELS, RUNTIME, UPSTREAM, Settings, atomic_jso
 from openvdn_comfy.compile_cache import CompilerMonitor, cache_settings, summarize_compilation
 from openvdn_comfy.fast_output import decode_and_save, measured
 from openvdn_comfy.exact_runtime import ExactRuntime, enabled
-from openvdn_comfy.attention_runtime import AttentionRuntime
+from openvdn_comfy.attention_runtime import AttentionRuntime, summarize_attention
 from openvdn_comfy.communication import CommunicationRuntime
 from openvdn_comfy.request_cleanup import RequestCleanup
 from openvdn_comfy.streaming_output import StreamingMP4
@@ -126,7 +126,7 @@ def main():
                                             "cache_dit": {name: getattr(settings, name) for name in CACHE_FIELDS}},
                         "active_softmax_ranks": runtime.softmax_ranks,
                         "world_size": 8, "video_vae_world_size": 8 if parallel_vae else 1,
-                        "metrics_schema_version": 7, "compile_cache": compile_options,
+                        "metrics_schema_version": 8, "compile_cache": compile_options,
                         "token_bucket_policy": BUCKET_POLICY if compile_options["token_bucket"] and settings.softmax_backend == "flex" else "native",
                         "startup_warmup": startup_report,
                         "exact_runtime_enabled": enabled("REF2VA_EXACT_RUNTIME"),
@@ -225,10 +225,14 @@ def main():
                                  render.video_latent_num_frames(plan.sampling_frames, 17, 5), bucket_stride)
         buckets.prepare(bucket, device)
         attention_runtime.select(current)
+        if attention_runtime.verification_first_run:
+            # All ranks verify once on first opt-in, including linear ranks.
+            # Keep the entire check in condition_load_seconds, outside DiT timing.
+            runtime.barrier()
         if current.fast_communication and communication.parity is None:
             communication.verify(head_dim=dit_runtime.hybrids[0].head_dim)
         communication.select(current.fast_communication)
-        runtime._ref2va_attention_signature = (current.attention_kernel, current.isolate_padding, current.linear_stats_chunk_frames)
+        runtime._ref2va_attention_signature = attention_runtime.signature()
         dit_runtime.select_layout(current.softmax_ranks)
         new_shape = geometries.prepare(runtime, plan, embeds, tags, conditions, bucket=bucket)
         phase = "warming_up" if warmup else "verifying_warm_cache" if startup else "denoising"
@@ -250,9 +254,11 @@ def main():
             dit_report = dit_runtime.report(denoise_seconds)
         compile_records = [None] * runtime.world_size
         dist.all_gather_object(compile_records, {"rank": runtime.rank, **compiler.since(compile_before),
-                                               "exact_runtime": exact_report, "dit_runtime": dit_report})
+                                               "exact_runtime": exact_report, "dit_runtime": dit_report,
+                                               "attention": attention_runtime.report()})
         exact_records = [{"rank": item["rank"], **item.pop("exact_runtime")} for item in compile_records]
         dit_records = [item.pop("dit_runtime") for item in compile_records]
+        attention_report = summarize_attention([{'rank': item['rank'], **item.pop('attention')} for item in compile_records])
         parallel_profile = summarize_profiles([item["profile"] for item in dit_records])
         cache_report = summarize_cache([item["cache_dit"] for item in dit_records])
         if runtime.is_main and warmup:
@@ -264,6 +270,11 @@ def main():
             bucket_report.update(policy="prefix_gap_isolated_v3", padding_attention="excluded_keys")
         compilation = {**summarize_compilation(compile_records), **geometries.last,
                        "token_bucket": bucket_report}
+        sol_compile = attention_report.get('sol', {})
+        compilation['sol_compile_misses'] = sol_compile.get('compile_misses_all_ranks', 0)
+        compilation['sol_preprocess_signatures'] = sol_compile.get('preprocess_signatures_all_ranks', 0)
+        if compilation['sol_compile_misses'] or compilation['sol_preprocess_signatures']:
+            compilation.update(runtime_graph_reused=False, compiled_new_graph=True)
         geometries.commit()
         compilation.update(geometries.last)
         profiles = [item["profile"]["ms_per_nfe"] for item in dit_records]
@@ -316,6 +327,8 @@ def main():
                    "step_timing_method": exact_report["step_timing_method"],
                    "dynamo_compile_seconds": compilation["dynamo_compile_seconds"],
                    "mask_build_seconds": compilation["mask_build_seconds"],
+                   "sol_compile_seconds": sol_compile.get('compile_seconds_max_rank', 0.),
+                   "sol_preprocess_cold_seconds": sol_compile.get('preprocess_cold_seconds_max_rank', 0.),
                    "denoise_wall_seconds": denoise_seconds,
                    "hot_denoise_seconds": denoise_seconds if compilation["runtime_graph_reused"] else None,
                    "decode_and_encode_seconds": time.monotonic() - decode_start,
@@ -343,7 +356,7 @@ def main():
                       "optimizations": {"requested": {name: getattr(current, name) for name in OPTIMIZATION_FIELDS},
                                         "communication": {"enabled": communication.active, "parity": communication.parity,
                                                           "pack_launches_per_layer": 2 if communication.active and runtime.branch_parallel else None},
-                                        "attention": attention_runtime.report(), "cleanup": cleanup_report}, "video_vae_decode": video_decode_details,
+                                        "attention": attention_report, "cleanup": cleanup_report}, "video_vae_decode": video_decode_details,
                       "compilation": compilation,
                       "conditioning": conditioning,
                       "exact_runtime": {"enabled": exact_runtime.active, "by_rank": exact_records},

@@ -1,0 +1,184 @@
+{
+  "repository": "https://github.com/NVlabs/Sana",
+  "revision": "bb60499af0e675095ff67424196d8c18e265f32a",
+  "source_path": "models/minimax_h3/Sol-H3/h3_runtime/third_party/sol_attn",
+  "license_statement": "https://nvlabs.github.io/Sana/Sol-Engine/Sol-H3/ (Apache-2.0 for Sol-H3 code; FlashAttention-derived files retain BSD-3-Clause)",
+  "changes": "Only private-namespace import rewriting; rectangular host adapter is maintained separately in openvdn_comfy/sol_kernel.py. Upstream SM90 CUDA math is unchanged.",
+  "files": [
+    {
+      "path": "_vendor/__init__.py",
+      "upstream_sha256": "eb3ec1ff32f5d2344a839acc90ee48329906532f560596f3ff733d4923553078",
+      "sha256": "eb3ec1ff32f5d2344a839acc90ee48329906532f560596f3ff733d4923553078"
+    },
+    {
+      "path": "_vendor/flash_attn/__init__.py",
+      "upstream_sha256": "42edd3f7a999b03f052836071389179a2edbc0a239221b67a5c8da8d09d127d6",
+      "sha256": "42edd3f7a999b03f052836071389179a2edbc0a239221b67a5c8da8d09d127d6"
+    },
+    {
+      "path": "_vendor/flash_attn/cute/__init__.py",
+      "upstream_sha256": "63631d004ed460922766940b7eeac674cbcd8a43eeb0e5595962845c862ca026",
+      "sha256": "63631d004ed460922766940b7eeac674cbcd8a43eeb0e5595962845c862ca026"
+    },
+    {
+      "path": "_vendor/flash_attn/cute/ampere_helpers.py",
+      "upstream_sha256": "cadac170a7da379e27c36d044360480d710cfa88d082dad2b9decd58e4847111",
+      "sha256": "cadac170a7da379e27c36d044360480d710cfa88d082dad2b9decd58e4847111"
+    },
+    {
+      "path": "_vendor/flash_attn/cute/block_info.py",
+      "upstream_sha256": "d518a31b430b6a4aa6e925eb5171036b9984f77c9dca9840f4b32c1e2d60ccdb",
+      "sha256": "89558759afaed9203db1decb803d365bb5976b17e2a47950cfa4c17818f33669"
+    },
+    {
+      "path": "_vendor/flash_attn/cute/block_sparsity.py",
+      "upstream_sha256": "bb836711cbee9baed9db96987b301709f149fb72b8fb0842c69cabe327f989d0",
+      "sha256": "e348bfa109b5557e702e2a01c8c138ac4d3f8bc7293711efd77266b0cb17920b"
+    },
+    {
+      "path": "_vendor/flash_attn/cute/cute_dsl_utils.py",
+      "upstream_sha256": "162ba9671cb16d20fccf3547e43d606aa83e775329d5287bc9320569afe60137",
+      "sha256": "162ba9671cb16d20fccf3547e43d606aa83e775329d5287bc9320569afe60137"
+    },
+    {
+      "path": "_vendor/flash_attn/cute/fast_math.py",
+      "upstream_sha256": "7e5f822bf4d0ba36967558f3ae9a1408b410cb726c31222cd61703569d1be738",
+      "sha256": "7e5f822bf4d0ba36967558f3ae9a1408b410cb726c31222cd61703569d1be738"
+    },
+    {
+      "path": "_vendor/flash_attn/cute/flash_fwd.py",
+      "upstream_sha256": "840e90f8e5d1fca2f73fbdb44df938027aa4750210af814fa28551f7a723ec27",
+      "sha256": "23aae1663fa9816694ede53d89768c7e5170818086b235e9dc88be6d3bd9cf09"
+    },
+    {
+      "path": "_vendor/flash_attn/cute/mask.py",
+      "upstream_sha256": "f920b98640efc91d737b631bb7ea223f71cd2b086ae3dae2d3db37a28fd390d2",
+      "sha256": "1f227c4bb900030b5ed83e31702ed8ac76e07cbbb5e9c0c6f26cc48263d39bbc"
+    },
+    {
+      "path": "_vendor/flash_attn/cute/named_barrier.py",
+      "upstream_sha256": "98d1cf1f2254203769da8d566f5ddadc755fb1cb3f4e514012da3addb9233c09",
+      "sha256": "98d1cf1f2254203769da8d566f5ddadc755fb1cb3f4e514012da3addb9233c09"
+    },
+    {
+      "path": "_vendor/flash_attn/cute/pack_gqa.py",
+      "upstream_sha256": "e55c56628c37334e4ec672f877018dc1fce89c4c30ede05c7515b08fb5596450",
+      "sha256": "3d7d53ee45ac45898731423a38c238b745dc57a32c8a3a81d731ca7f0d5a78a5"
+    },
+    {
+      "path": "_vendor/flash_attn/cute/pipeline.py",
+      "upstream_sha256": "849bce91c72be0a5c7458979e10c8290f45e05253a83600e30fb9540c61ed56a",
+      "sha256": "849bce91c72be0a5c7458979e10c8290f45e05253a83600e30fb9540c61ed56a"
+    },
+    {
+      "path": "_vendor/flash_attn/cute/seqlen_info.py",
+      "upstream_sha256": "8a922e1217b54b5185d9c8d8f928f8836058a2f4b3bddded4c38460a2e39d60f",
+      "sha256": "1b88e5a8b7e4edca3a7d1f8e22831d2ff77f7b4dd2f3ca87a35123215946ccfe"
+    },
+    {
+      "path": "_vendor/flash_attn/cute/softmax.py",
+      "upstream_sha256": "56ee749e3a388e0bb3f853fea0c236cf89f291d167f269f8b04d3bb2f31cc37a",
+      "sha256": "c7096c23170e81aa7a182a8c646583f9b9ba746a9cdfb7faf329007549896b89"
+    },
+    {
+      "path": "_vendor/flash_attn/cute/tile_scheduler.py",
+      "upstream_sha256": "ac0d1211e34d73c2bbb44b7f62b3a77d1f9aac177653a5a028cb4f5fa1b1ce0e",
+      "sha256": "74091b7d1c3974d556814c63bf5e32dc9a29c7fcdc5e3409b16380c2cdfe6aee"
+    },
+    {
+      "path": "_vendor/flash_attn/cute/utils.py",
+      "upstream_sha256": "26a7577a2fb4f4a21fd27910c229896c687d13bda60481cd196471190b9f1222",
+      "sha256": "7b7ba9e492f072ae6d812bfc492a09ce76b1432c36270d2bdd5beee150e5806d"
+    },
+    {
+      "path": "common/__init__.py",
+      "upstream_sha256": "2d18d24871bacaaeb6417ee37f4e1b57530c6bf3f51e20ca803bad6a6e53c25b",
+      "sha256": "2d18d24871bacaaeb6417ee37f4e1b57530c6bf3f51e20ca803bad6a6e53c25b"
+    },
+    {
+      "path": "common/layout_utils.py",
+      "upstream_sha256": "d8ed2213f8162bf820eb9934ea3ec0b4b3038c7a73fe64d65bcf025639e63c0e",
+      "sha256": "d8ed2213f8162bf820eb9934ea3ec0b4b3038c7a73fe64d65bcf025639e63c0e"
+    },
+    {
+      "path": "common/runtime.py",
+      "upstream_sha256": "b6d19ddc6b0f6f1e4ddd48094133ee56d6c1ab383c57e7d02887318d53c264b4",
+      "sha256": "b6d19ddc6b0f6f1e4ddd48094133ee56d6c1ab383c57e7d02887318d53c264b4"
+    },
+    {
+      "path": "common/selector.py",
+      "upstream_sha256": "b75eab435ec873af383a61ca2f32eb3eb75fd3fec94c30302fbfe8149f9bb0a1",
+      "sha256": "b75eab435ec873af383a61ca2f32eb3eb75fd3fec94c30302fbfe8149f9bb0a1"
+    },
+    {
+      "path": "preprocess.py",
+      "upstream_sha256": "d38c924280e00c34072652cfedf6fd65c85db6a4fe93e7858dd919e28d89d958",
+      "sha256": "d38c924280e00c34072652cfedf6fd65c85db6a4fe93e7858dd919e28d89d958"
+    },
+    {
+      "path": "sm90/__init__.py",
+      "upstream_sha256": "dbb468f6dda2c220593e36cb8e1e753f4586e1ab47b7a6ba1e8f98e47dc3802e",
+      "sha256": "dbb468f6dda2c220593e36cb8e1e753f4586e1ab47b7a6ba1e8f98e47dc3802e"
+    },
+    {
+      "path": "sm90/_compat/__init__.py",
+      "upstream_sha256": "dc9300ddffe0a8acd263d301c56b6c3094f0ddb3279be7917ace8e9cfbaf2586",
+      "sha256": "dc9300ddffe0a8acd263d301c56b6c3094f0ddb3279be7917ace8e9cfbaf2586"
+    },
+    {
+      "path": "sm90/_compat/activation.py",
+      "upstream_sha256": "77b1c16a9970b2fe79de4a945db9930850dcf4f4869ed4639805337c6a40a07d",
+      "sha256": "77b1c16a9970b2fe79de4a945db9930850dcf4f4869ed4639805337c6a40a07d"
+    },
+    {
+      "path": "sm90/_compat/copy_utils.py",
+      "upstream_sha256": "8e5e6fa9a79382995636ff1df391fdc37ed134cb5fa3d8f4db66213f476f5bd2",
+      "sha256": "8e5e6fa9a79382995636ff1df391fdc37ed134cb5fa3d8f4db66213f476f5bd2"
+    },
+    {
+      "path": "sm90/_compat/cute_dsl_utils.py",
+      "upstream_sha256": "afffcb709248851cc14dc91da466e104271de4438dbca73c2ac7c1c6c061bae8",
+      "sha256": "afffcb709248851cc14dc91da466e104271de4438dbca73c2ac7c1c6c061bae8"
+    },
+    {
+      "path": "sm90/_compat/layout_utils.py",
+      "upstream_sha256": "4ad6a7a87adf0bf8dc76c5aa04689d717ca63aeeaba5c754e9a96fb72787fa5a",
+      "sha256": "c781ad114a3432909f2be61b4ec6a73047e6fb8ee301d17059e9ef066785122b"
+    },
+    {
+      "path": "sm90/_compat/sm90_utils.py",
+      "upstream_sha256": "3c4bfd2cc468b372671e7654f6ae06cdf5f3b64b4f7f03cf6d4467c51b4829f2",
+      "sha256": "3c4bfd2cc468b372671e7654f6ae06cdf5f3b64b4f7f03cf6d4467c51b4829f2"
+    },
+    {
+      "path": "sm90/atoms.py",
+      "upstream_sha256": "bdabb2257d5384f901c8a8a4d0b3e9b8697fbe89b2f8d4f0fd3db28d21ba135a",
+      "sha256": "bdabb2257d5384f901c8a8a4d0b3e9b8697fbe89b2f8d4f0fd3db28d21ba135a"
+    },
+    {
+      "path": "sm90/exact.py",
+      "upstream_sha256": "e44e3e72883f50f93d2112721d7d697e6041ba1f9f2079a27da73fd0030eff6e",
+      "sha256": "c831ddb108100a861b740689698e41bfdeee3b0950e2bc3041e47615f9a38b3f"
+    },
+    {
+      "path": "sm90/fwd.py",
+      "upstream_sha256": "87a961541fcf95a8b2bb5ef6d4df7fdf9f2345ca3e1089f99611050ca84e1ad9",
+      "sha256": "87a961541fcf95a8b2bb5ef6d4df7fdf9f2345ca3e1089f99611050ca84e1ad9"
+    },
+    {
+      "path": "sm90/kernel.py",
+      "upstream_sha256": "fcc3980955a60cdbb93cc4d52187d58359fa99d7a9ec9f594fde2e50b5e497f5",
+      "sha256": "fcc3980955a60cdbb93cc4d52187d58359fa99d7a9ec9f594fde2e50b5e497f5"
+    },
+    {
+      "path": "sm90/mainloop.py",
+      "upstream_sha256": "4cec571d97201d76d5f9fccd4a4919d83d82dfdcc77d7c68ad6514567fbe0da7",
+      "sha256": "736ca630d30c87c2967521087a2ebc29e530f321a515855c7652bd98de2447ff"
+    },
+    {
+      "path": "sm90/split_combine.py",
+      "upstream_sha256": "be1f14997ed4bacb8bff1fb0f7979bda6424af1394661e07d692a2f2460101c3",
+      "sha256": "02cdfd9a0a9d1b51e46bcaa4c0321fadb518a691e7f1ac22bf2e9750c16293fe"
+    }
+  ]
+}
