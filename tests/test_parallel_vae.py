@@ -90,6 +90,22 @@ def test_tile_overrides_restore_when_decode_fails():
     assert '_blend' not in vae.__dict__ and '_stitch_tiles' not in vae.__dict__
 
 
+def test_tile_decoder_does_not_reenter_temporal_clip_provider():
+    vae = native_decoder(spatial=True)
+    decode = ClipDecoder(vae)
+    z = torch.randn(1, 24, 7, 6, 7)
+    expected = vae._decode_clip(z)
+
+    def transport(_):
+        raise AssertionError('Tile decoder reentered the temporal clip provider')
+
+    with clip_provider(vae, transport):
+        assert torch.equal(decode(z), expected)
+        assert vae._decode_clip is transport
+        assert '_blend' not in vae.__dict__ and '_stitch_tiles' not in vae.__dict__
+    assert '_decode_clip' not in vae.__dict__
+
+
 @pytest.mark.parametrize('length', [7, 8, 12, 27, 32, 57, 72, 87, 107])
 def test_sharded_clips_preserve_native_padding_blending_and_tail(length):
     vae = native_decoder()
@@ -176,12 +192,26 @@ def distributed_worker():
         # Exercise the real spatial splitting/stitching and temporal assembly
         # together, across real processes, against the unmodified native path.
         spatial_vae = native_decoder(spatial=True)
-        z = torch.arange(24 * 12 * 6 * 7, dtype=torch.float32).reshape(1, 24, 12, 6, 7) / 1000
-        video, info = decode_parallel(spatial_vae, z, rank=rank, world_size=world,
-                                      verify=True, clip_decode=ClipDecoder(spatial_vae))
-        assert info['parity']['exact']
-        if rank == 0:
-            assert torch.equal(video, spatial_vae.decode(z, return_dict=False)[0])
+        decode = ClipDecoder(spatial_vae)
+        # 72 latent frames produce 14 clips: rank zero must decode subsequent
+        # owned clips while its temporal provider is installed. Reuse the same
+        # ClipDecoder across requests, as the resident worker does.
+        for streaming, verify in ((False, True), (True, True), (True, False)):
+            z = torch.arange(24 * 72 * 6 * 7, dtype=torch.float32).reshape(1, 24, 72, 6, 7) / 1000
+            emitted = []
+            video, info = decode_parallel(spatial_vae, z, rank=rank, world_size=world,
+                                          verify=verify, clip_decode=decode, streaming=streaming,
+                                          on_chunk=(lambda x: emitted.append(x.clone()))
+                                          if streaming and rank == 0 else None)
+            assert info['parity']['checked'] is verify
+            if verify:
+                assert info['parity']['exact']
+            if rank == 0:
+                assert torch.equal(video, spatial_vae.decode(z, return_dict=False)[0])
+                if streaming:
+                    assert torch.equal(torch.cat(emitted, dim=2)[:, :, :video.shape[2]], video)
+            assert '_decode_clip' not in spatial_vae.__dict__ and '_decode' not in spatial_vae.__dict__
+            assert '_blend' not in spatial_vae.__dict__ and '_stitch_tiles' not in spatial_vae.__dict__
         # Only one replica drifts. All ranks must drain communication and fail;
         # otherwise the test hangs and the process-group timeout catches it.
         if rank == 1:

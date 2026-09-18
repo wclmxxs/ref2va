@@ -21,6 +21,11 @@ def override_methods(module, **methods):
 class ClipDecoder:
     def __init__(self, vae):
         self.vae = vae
+        # Temporal assembly temporarily replaces vae._decode_clip with its
+        # transport provider. Rank zero still decodes later local clips inside
+        # that scope, so keep the original bound method instead of reentering
+        # the provider. Its tile/blend lookups still use the overrides below.
+        self.decode_clip = vae._decode_clip
         self.weights = OrderedDict()
         self.tile_count = 0
 
@@ -73,4 +78,4 @@ class ClipDecoder:
 
     def __call__(self, z):
         with override_methods(self.vae, _stitch_tiles=self.stitch, _blend=self.blend):
-            return self.vae._decode_clip(z)
+            return self.decode_clip(z)
