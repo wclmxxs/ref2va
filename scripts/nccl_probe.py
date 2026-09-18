@@ -8,7 +8,10 @@ import torch.distributed as dist
 def main():
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
-    dist.init_process_group("nccl", timeout=timedelta(seconds=60))
+    if local_rank == 0:
+        print(f"NCCL_NVLS_ENABLE={os.environ.get('NCCL_NVLS_ENABLE', 'NCCL default')}; "
+              "checking 8-rank all_reduce and all_to_all", flush=True)
+    dist.init_process_group("nccl", device_id=torch.device('cuda', local_rank), timeout=timedelta(seconds=60))
     try:
         value = torch.tensor([float(local_rank)], device=f"cuda:{local_rank}")
         dist.all_reduce(value)

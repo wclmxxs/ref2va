@@ -40,6 +40,11 @@ def worker_environment():
     env.update(PYTHONPATH=str(UPSTREAM), PYTHONUNBUFFERED="1", HF_HUB_OFFLINE="1",
                TRANSFORMERS_OFFLINE="1", TORCH_NCCL_ASYNC_ERROR_HANDLING="1")
     env.setdefault("CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7")
+    # This H200 deployment reports NVLS multicast bind CUDA error 401 with
+    # NCCL 2.29. Use the same workaround for the probe and resident ranks.
+    # This only disables NVLink SHARP offload, not P2P/NVLink transport.
+    # An explicit setting can re-enable it after the host fabric is repaired.
+    env.setdefault("NCCL_NVLS_ENABLE", "0")
     env.setdefault("OMP_NUM_THREADS", "8")
     env.setdefault("TORCHINDUCTOR_CACHE_DIR", str(RUNTIME / "inductor"))
     env.setdefault("TRITON_CACHE_DIR", str(RUNTIME / "triton"))

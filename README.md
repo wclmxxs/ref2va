@@ -98,6 +98,7 @@ bash deploy.sh render \
 | --- | --- | --- |
 | `REF2VA_CLEAR_GPU_APPS` | 1 | 启动时清理所选 GPU 的计算应用；0 仅检查 |
 | `CUDA_VISIBLE_DEVICES` | 0,1,2,3,4,5,6,7 | 恰好 8 张卡，可用 GPU UUID |
+| `NCCL_NVLS_ENABLE` | 0（本部署） | 绕过当前 H200 主机的 NVLS multicast 内存绑定 CUDA 401；通信自检和常驻 worker 使用相同值。仅关闭 NVLink SHARP offload，不设置 P2P/NVLink transport 禁用开关；主机修复后可显式设 1/2 重测。 |
 | `REF2VA_MODELS` | ./models | 下载、启动使用同一权重目录 |
 | `REF2VA_PORT` / `REF2VA_LISTEN` | 8188 / 0.0.0.0 | ComfyUI 地址 |
 | `REF2VA_FP8` | 1 | 官方 FP8 线性层；0 为 BF16 |
@@ -125,6 +126,8 @@ bash deploy.sh render \
 ## 环境、日志与验证
 
 两套环境：`.venv-ui` 为 ComfyUI 0.30.0、CPU torch 2.10；`.venv-vdn` 为官方 torch 2.13.0+cu129、Transformers 5.15、FlashAttention 4。**UI 日志的 `Device: cpu` 是预期行为，CUDA 由常驻 worker 使用。** 精确源码/模型 revision 见 `sources.lock.json`，Diffusers 使用官方指定 base 和补丁；生成时离线读取固定权重。
+
+出现 `Failed to bind NVLink SHARP (NVLS) Multicast memory ... CUDA error 401` 时，失败发生在 NCCL 通信初始化。此部署为该主机默认设置 `NCCL_NVLS_ENABLE=0`，仍必须通过八卡真实 all-reduce 和 all-to-all，不能跳过自检；常驻 worker、取消后的重启沿用同一设置。`/openvdn/health` 的 `nccl.nvls_enable` 和每个结果的 `upstream.parallel.nccl_nvls_enable` 记录实际环境值。它是软件绕行，不代表修复了 Fabric Manager/NVSwitch 状态；性能变化需重新测量。[NVIDIA NVLS 参数说明](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html#nccl-nvls-enable)
 
 - 后端加载/推理日志：`.runtime/backend/worker.log`
 - GPU 清理记录：`.runtime/gpu-cleanup.json`
@@ -360,7 +363,7 @@ python3 scripts/benchmark_attention_pipeline.py --server http://43.218.119.131:8
 可选、不加载模型的八卡 kernel 校验（请在 GPU 空闲时运行，不属于默认启动全量预热）：
 
 ```bash
-.venv-vdn/bin/torchrun --standalone --nproc_per_node=8 scripts/validate_optimization_kernels.py
+NCCL_NVLS_ENABLE=0 .venv-vdn/bin/torchrun --standalone --nproc_per_node=8 scripts/validate_optimization_kernels.py
 ```
 
 覆盖 1+7 至 7+1 的 pack/unpack/NCCL，以及 FA4 隔离窗口/full-cover 和 decomposed 对 fp32 dense 参考的容差校验。**本地 CPU 回归通过不等于 H200 新路径已通过；只有服务器校验与热态对照完成后才能报告实际加速。**
@@ -409,7 +412,7 @@ cd /root/ref2va && git pull --ff-only && bash deploy.sh install-sol && bash depl
 可选：空闲时运行不加载模型的八卡校验，覆盖 6+2、5+3、4+4 的不等长 head 分片尺寸：
 
 ```bash
-.venv-vdn/bin/torchrun --standalone --nproc_per_node=8 scripts/validate_sol_attention.py
+NCCL_NVLS_ENABLE=0 .venv-vdn/bin/torchrun --standalone --nproc_per_node=8 scripts/validate_sol_attention.py
 ```
 
 部署后用同一份请求跑热态对照（默认 native/Sol 两组，各 1 次冷、3 次热；不重启）：

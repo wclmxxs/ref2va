@@ -131,6 +131,28 @@ def test_nonzero_subprocess_reports_log(runtime):
     assert "worker diagnostic: 测试错误" in str(exc.value)
 
 
+def test_probe_and_worker_environment_disable_only_nvls_by_default(runtime, monkeypatch):
+    for key in ('NCCL_NVLS_ENABLE', 'NCCL_P2P_DISABLE', 'NCCL_P2P_LEVEL', 'NCCL_SHM_DISABLE'):
+        monkeypatch.delenv(key, raising=False)
+    env = runner.worker_environment()
+    assert env['NCCL_NVLS_ENABLE'] == '0'
+    assert not any(key in env for key in ('NCCL_P2P_DISABLE', 'NCCL_P2P_LEVEL', 'NCCL_SHM_DISABLE'))
+    assert 'NCCL_NVLS_ENABLE' not in os.environ  # Do not mutate the user's shell.
+    log = runtime/'probe-env.log'
+    # Exercise the actual child-launch path used by doctor.py's NCCL probe.
+    runner.run_process([sys.executable, '-c', 'import os; print(os.environ["NCCL_NVLS_ENABLE"])'], log)
+    assert log.read_text().strip() == '0'
+
+
+@pytest.mark.parametrize('value', ['0', '1', '2'])
+def test_explicit_nvls_setting_survives_worker_restarts(monkeypatch, value):
+    monkeypatch.setenv('NCCL_NVLS_ENABLE', value)
+    monkeypatch.setenv('NCCL_DEBUG', 'INFO')
+    first, restarted = runner.worker_environment(), runner.worker_environment()
+    assert first['NCCL_NVLS_ENABLE'] == restarted['NCCL_NVLS_ENABLE'] == value
+    assert restarted['NCCL_DEBUG'] == 'INFO'
+
+
 def test_log_tail_is_bounded_and_handles_missing_logs(runtime):
     log = runtime / "large.log"
     log.write_text("old-output\n" * 200000 + "last diagnostic\n")

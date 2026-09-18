@@ -63,6 +63,7 @@ def main():
     subprocess.run(["nvidia-smi", "topo", "-m"], check=True)
     if args.nccl:
         log = RUNTIME / "nccl-probe.log"
+        print(f"8-rank NCCL probe: NCCL_NVLS_ENABLE={worker_environment()['NCCL_NVLS_ENABLE']}", flush=True)
         with gpu_lock(lambda: None):
             run_process([sys.executable, "-m", "torch.distributed.run", "--standalone", "--nproc_per_node=8",
                          str(ROOT / "scripts/nccl_probe.py")], log, timeout=180)
