@@ -75,31 +75,33 @@ def window_mask(prefix, frames, spatial, full):
 
 
 @pytest.mark.parametrize('full', [False, True])
-def test_real_flex_excludes_gap_even_inside_full_blocks_and_reuses_graph(full):
+def test_unmasked_flex_matches_padded_attention_and_reuses_graph(full):
     torch.manual_seed(7)
     torch._dynamo.reset()
     from torch._dynamo import utils
-    state = TokenBuckets(32)
     compiled = torch.compile(flex_attention, backend='eager', dynamic=False)
     # Superset block mask is identical for both valid prefix lengths.
     mask = create_block_mask(window_mask(32, 4, 8, full), None, None, 64, 64,
                              device='cpu', BLOCK_SIZE=128)
     graph_count = None
     for length in (19, 27, 19):
-        state.prepare(PrefixBucket(length - 8, 4, 4, 32, 32), 'cpu')
         native = [torch.randn(1, 2, length + 32, 8) for _ in range(3)]
-        # Large finite padding values detect leakage; zero padding alone can
-        # obscure bugs in masking and softmax denominators.
+        # Sentinel padding must now contribute to attention, including full
+        # blocks. Compare to dense SDPA over the same padded window geometry.
         padded = [torch.cat((t[:, :, :length], t.new_full((1, 2, 32 - length, 8), 99.),
                              t[:, :, length:]), dim=2) for t in native]
-        native_mask = window_mask(length, 4, 8, full)
-        positions = torch.arange(length + 32)
-        allowed = native_mask(None, None, positions[:, None], positions[None, :])
-        expected = torch.nn.functional.scaled_dot_product_attention(*native, attn_mask=allowed)
-        actual = compiled(*padded, block_mask=mask, score_mod=state.score_mod)
-        actual = torch.cat((actual[:, :, :length], actual[:, :, 32:]), dim=2)
+        positions = torch.arange(64)
+        allowed = window_mask(32, 4, 8, full)(None, None, positions[:, None], positions[None, :])
+        expected = torch.nn.functional.scaled_dot_product_attention(*padded, attn_mask=allowed)
+        actual = compiled(*padded, block_mask=mask)
         torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
         assert actual.isfinite().all()
+        real_positions = torch.arange(length + 32)
+        native_allowed = window_mask(length, 4, 8, full)(
+            None, None, real_positions[:, None], real_positions[None, :])
+        unpadded = torch.nn.functional.scaled_dot_product_attention(*native, attn_mask=native_allowed)
+        real_output = torch.cat((actual[:, :, :length], actual[:, :, 32:]), dim=2)
+        assert not torch.allclose(real_output, unpadded)
         count = utils.counters['stats']['unique_graphs']
         if graph_count is not None:
             assert count == graph_count  # changing tensor values cannot recompile
@@ -134,8 +136,10 @@ def test_bucket_geometry_reuses_capacity_not_caption_or_reference_aspect():
     for index, (length, shape) in enumerate([(117, (1, 24, 1, 48, 32)), (165, (1, 24, 1, 32, 48))]):
         embeds = torch.zeros(length, 3)
         conditions = (('ref',), [torch.zeros(shape)])
-        bucket = describe_bucket(embeds, conditions, plan, (1, 2, 2), 810, 72, 1024)
+        bucket = describe_bucket(embeds, conditions, plan, (1, 2, 2), 810, 72, 2048)
         assert bucket.video_tokens == 72 * 24 * 43
+        assert bucket.metadata()['policy'] == 'prefix_gap_unmasked_v2'
+        assert bucket.metadata()['padding_attention'] == 'unmasked'
         assert cache.prepare(runtime, plan, embeds, torch.ones(length), conditions, bucket) == (index == 0)
         cache.commit()
     runtime.softmax_ranks = 4
@@ -173,7 +177,7 @@ def test_conditioning_metadata_works_with_new_and_old_cache(tmp_path):
     assert load_conditioning(path, 'cpu')[3]['references'][0]['qwen_grid_thw'] == [1, 64, 48]
 
 
-@pytest.mark.parametrize('stride', [0, 1024])
+@pytest.mark.parametrize('stride', [0, 2048])
 def test_pinned_forward_rewrites_install_with_and_without_exact_runtime(stride):
     from tests.test_exact_runtime import sources, DummyTransformer
     from openvdn_comfy.exact_runtime import ExactRuntime
@@ -187,8 +191,9 @@ def test_pinned_forward_rewrites_install_with_and_without_exact_runtime(stride):
         blocks = types.SimpleNamespace(install_attention=lambda forwards: None)
         ExactRuntime(model, ulysses, render, active=active, token_buckets=state, block_runtime=blocks)
         assert model.attn._ref2va_buckets is state
-        if not stride:
-            assert model.attn.forward.__func__.__globals__['_window_softmax_branch'] is ulysses._window_softmax_branch
+        # Bucketing only adjusts the sampler layout: native attention dispatch
+        # must remain installed with either exact-runtime setting.
+        assert model.attn.forward.__func__.__globals__['_window_softmax_branch'] is ulysses._window_softmax_branch
 
 
 def test_native_linear_branch_receives_only_real_text_and_video_rows():
@@ -228,7 +233,20 @@ def test_actual_fa4_bucket_padding_on_cuda():
         pytest.skip('Install pinned OpenVDN dependencies')
     sys.path.insert(0, str(upstream))
     from src.inference.utils.ulysses import _window_softmax_branch
-    from openvdn_comfy.token_buckets import verify_cuda_padding
-    state = TokenBuckets()
-    state.native_window_attention = _window_softmax_branch
-    assert verify_cuda_padding(state, torch.device('cuda'))['passed']
+    from src.models.sequence_layout import SequenceLayout
+    attn = types.SimpleNamespace(anchor_frames='none', inference_mode=True,
+                                 _window_kernel=lambda *args: 'flex')
+    # A small real FA4 check against padded SDPA, not parity with unpadded output.
+    for full in (False, True):
+        layout = SequenceLayout(192, 64, 4, 32)
+        bounds = [(0, 3)] * 4 if full else [(max(0, i - 1), min(3, i + 1)) for i in range(4)]
+        tensors = [torch.randn(192, 2, 128, dtype=torch.bfloat16, device='cuda') * .5 for _ in range(3)]
+        for t in tensors:
+            t[35:64] = 2.
+        positions = torch.arange(192, device='cuda')
+        allowed = window_mask(64, 4, 32, full)(None, None, positions[:, None], positions[None, :])
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            *(t.transpose(0, 1)[None] for t in tensors), attn_mask=allowed)[0].transpose(0, 1)
+        actual = _window_softmax_branch(attn, *tensors, layout, bounds, 128**-.5)
+        assert actual.isfinite().all()
+        torch.testing.assert_close(actual, expected, rtol=.02, atol=.002)

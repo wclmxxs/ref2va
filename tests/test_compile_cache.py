@@ -100,9 +100,11 @@ def test_cache_options_validate_before_launch(monkeypatch):
     monkeypatch.delenv("REF2VA_WARMUP_DURATIONS", raising=False)
     monkeypatch.delenv("REF2VA_WARMUP_VERIFY", raising=False)
     assert cache_settings() == {"max_shapes": 32, "recompile_limit": 256, "warmup_recent": 0,
-                                "token_bucket": 0, "warmup_durations": [], "warmup_verify": False}
+                                "token_bucket": 2048, "warmup_durations": [], "warmup_verify": False}
     monkeypatch.setenv("REF2VA_TOKEN_BUCKET", "1024")
     assert cache_settings()['token_bucket'] == 1024
+    monkeypatch.setenv("REF2VA_TOKEN_BUCKET", "0")
+    assert cache_settings()['token_bucket'] == 0
     monkeypatch.setenv("REF2VA_WARMUP_DURATIONS", "5, 8,10,15,5")
     monkeypatch.setenv("REF2VA_WARMUP_VERIFY", "1")
     assert cache_settings()['warmup_durations'] == [5, 8, 10, 15]

@@ -9,10 +9,12 @@
 已部署的服务器更新：
 
 ```bash
-cd /root/ref2va && git pull --ff-only && bash deploy.sh start
+cd /root/ref2va && git pull --ff-only && REF2VA_TOKEN_BUCKET=2048 bash deploy.sh start
 ```
 
 首次部署，在克隆的仓库目录执行 `bash deploy.sh`，自动安装固定版本源码、下载模型并启动。需要 Linux x86_64、8 张完整 H200、支持 CUDA 12.9 的驱动、NVLink/NCCL，约 250 GB 磁盘空间。命令在前台运行，可放入 tmux。
+
+当前默认测试 **2048 间隔的无屏蔽前缀分桶**：补齐 token 参与 attention，可能改变生成结果；尚无这版的 H200 耗时/效果实测。上面的更新命令显式覆盖旧环境中的 0/1024 设置；`REF2VA_TOKEN_BUCKET=0 bash deploy.sh start` 可回到不补齐的原生布局。
 
 启动依次执行：
 
@@ -108,7 +110,7 @@ bash deploy.sh render \
 | `REF2VA_WARMUP_RECENT` | 0 | 默认不回放历史；可手动增加，最大为编译形状容量减 1 再减额外时长数 |
 | `REF2VA_WARMUP_DURATIONS` | 空 | 默认不额外预热时长；可设 `5,8,10,15`，最多四个 4–15 秒的值 |
 | `REF2VA_WARMUP_VERIFY` | 0 | 默认不复跑预热集验证热命中；1 开启该诊断检查，会增加启动时间 |
-| `REF2VA_TOKEN_BUCKET` | 0 | 默认使用原生 FA4 路径，不补齐 token；256/512/1024/2048 显式开启实验性分桶，实测会增加 H200 热态耗时 |
+| `REF2VA_TOKEN_BUCKET` | 2048 | 无屏蔽前缀分桶间隔，可设 256/512/1024/2048；padding 参与 attention，可能影响效果；0 恢复不补齐的原生布局 |
 | `REF2VA_WARMUP_DURATION` | 10 | 启动预热时长 |
 | `REF2VA_WARMUP_RATIO` | 9:16 | 启动预热画幅 |
 | `REF2VA_WARMUP_RESOLUTION` | 768 | 启动预热短边 |
@@ -160,17 +162,17 @@ cd /root/ref2va && git pull --ff-only && bash deploy.sh start
 
 原先每 8 种几何配置就重置全部编译记录，现默认允许 32 种成功配置，并给每个静态 helper 预留多版本编译预算。超过容量才轮换 Dynamo 图，mask 的原有 64 项 LRU 不随之清空。保留超出编译预算直接报错的行为，避免 Flex 静默进入高显存 eager 路径。`geometry_seen` 仅表示进程执行过该输入布局，实际新图编译与磁盘缓存命中另由 PyTorch 计数返回，不能混为一谈。
 
-默认启动完成一次完整 8 NFE、视频/音频 VAE、输出编码和原有数值校验。仅显式开启 token 分桶时，额外用实际 FA4 校验补齐位置不会泄漏到有效输出；补齐检查覆盖不同有效长度和完整/局部窗口，失败则不开放服务，记录在 `.runtime/backend/token-bucket-parity.json`。它是注意力组件检查，不是全模型质量证明。
+默认启动完成一次完整 8 NFE、视频/音频 VAE、输出编码和原有数值校验。当前实验允许 padding 参与 attention，因此已移除旧版“补齐位置不影响有效输出”的校验，不再生成 `padding_attention_verified` 或 `token-bucket-parity.json`；旧实例留下的该文件不代表当前版本通过画质验证。VAE、输出传输及常量复用的原有组件校验继续执行。
 
-默认仅完成上述一次基础预热和正确性检查就开放服务，不预热全部时长、不回放历史 case、不再复跑整个集合。模型保持 GPU 常驻；进程内图缓存、磁盘编译缓存和条件缓存继续保留。默认使用真实 token 长度，新计算规格在第一次实际请求时可能编译，后续兼容请求复用；运行时命中率和耗时仍逐次返回。
+默认仅完成上述一次基础预热和组件检查就开放服务，不预热全部时长、不回放历史 case、不再复跑整个集合。模型保持 GPU 常驻；进程内图缓存、磁盘编译缓存和条件缓存继续保留。默认将非视频前缀补齐到 2048 的倍数，新计算规格在第一次实际请求时可能编译，后续兼容请求复用；运行时命中率和耗时仍逐次返回。
 
 额外预热可显式开启：`REF2VA_WARMUP_DURATIONS=5,8,10,15` 预热指定时长，`REF2VA_WARMUP_RECENT=27` 回放最近成功请求。历史从本地 `.runtime/backend/warmup-history.json` 和相同源码/模型版本最近 200 个成功 jobs 补齐，直接复用 `.pt`，不重新下载或编码，不输出重复视频。二者默认均关闭。
 
 `REF2VA_WARMUP_VERIFY=1` 可额外复跑所选集合，要求所有 rank 无新图编译才完成启动；默认关闭。健康接口 `startup_warmup.complete` 表示配置要求的启动检查完成；未执行热态复跑时 `verification_requested=false, verified_requests=0, all_runtime_graphs_reused=null`，不会把未检测伪装成全部命中。报告仍写入 `.runtime/backend/warmup-report.json`。
 
-Token 分桶作为实验选项保留：例如 `REF2VA_TOKEN_BUCKET=1024` 把 `[文本/视觉条件 | 参考图 latent | 音频 | 视频]` 的非视频前缀补到 1024 token 的倍数，最多增加 1023 行。补齐放在音频与生成视频之间，真实 position_ids、参考图几何、文本行、噪声生成顺序均保留。窗口 BlockMask 使用容量形状，score modifier 用设备上的有效长度排除补齐 key（含 full blocks）；同档不同有效长度不改变 Python 标量 guard。线性注意力的文本状态只读取真实文本行，保留真实长度的归一化尺度；DBCache 的误差分组也排除补齐行。RDT 开关/阈值保持原请求值。
+当前实验默认 `REF2VA_TOKEN_BUCKET=2048`，把 `[文本/视觉条件 | 参考图 latent | 音频 | 视频]` 的非视频前缀补到 2048 token 的倍数，最多增加 2047 行。补齐放在音频与生成视频之间，真实 position_ids、参考图几何、文本行、噪声生成顺序均保留。删除 padding `score_mod` 和 attention 包装，恢复上游完整窗口的原生 dispatch 与局部窗口的原生 Flex/FA4 路径；局部窗口 BlockMask 仍限制视频间的注意力范围，但将 gap 视为全局前缀，**不排除补齐 key**。这会改变 softmax 归一化及后续特征，不承诺生成效果与不补齐相同。线性注意力的文本状态仍只读取真实文本行，DBCache 的误差分组也仍排除补齐行；RDT 开关/阈值保持原请求值，但实际缓存决定可能随特征变化。
 
-只对 Flex 路径分桶；decomposed/ref 自动使用原始布局。保持 FA4 静态编译，不直接改 `dynamic=True`。2026-09-18 的同一「走廊功夫」10 秒案例，参考图短边 768、RDT 0.25、两次均无新编译且缓存步骤均为 4/6，分桶前后去噪为 11.80 / 15.08 秒，视频 VAE 均约 2.15 秒。因此默认关闭分桶；不能只用命中率判断收益。可用 `REF2VA_TOKEN_BUCKET=0 bash deploy.sh start` 显式覆盖旧环境变量。原生路径不安装分桶 attention 包装；参考图短边参数、编译磁盘缓存和耗时统计仍可使用。本次仅恢复默认执行路径，缓存键及容量策略未变，恢复后的 H200 耗时需部署后复测。
+只对 Flex 配置启用分桶；decomposed/ref 自动使用原始布局。保持 FA4 静态编译，不直接改 `dynamic=True`。旧版带 `score_mod`、1024 桶的同一「走廊功夫」10 秒案例，参考图短边 768、RDT 0.25、两次均无新编译且缓存步骤均为 4/6，分桶前后去噪为 11.80 / 15.08 秒，视频 VAE 均约 2.15 秒；这些不是当前无屏蔽 2048 桶的测量。新策略名为 `prefix_gap_unmasked_v2`，健康接口 `token_bucket_policy` 和每次结果的 `compilation.token_bucket.policy` 可核对部署，后者另返回 `padding_attention=unmasked`。本次没有修改编译形状容量/淘汰策略，仍需部署后复测热态耗时、DBCache 命中和画质。
 
 ### 原生路径的缓存命中条件
 

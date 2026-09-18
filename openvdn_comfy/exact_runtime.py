@@ -114,19 +114,11 @@ class ExactRuntime:
         if not active and block_runtime is None and token_buckets is None:
             return
         forwards = {}
-        if token_buckets is not None:
-            from .token_buckets import attention_replacements, bucket_window_attention
-            token_buckets.native_window_attention = ulysses._window_softmax_branch
         for name in ("_ulysses_attention_forward", "_branch_parallel_attention_forward"):
             edits = [(PROJECTION_OLD, PROJECTION_NEW)] if active else []
             extra = {"_ref2va_project": project_video_rows}
-            if token_buckets is not None:
-                edits += attention_replacements()
-                if name == "_ulysses_attention_forward":
-                    # Only the Flex branch gains a full-cover case with padding.
-                    edits.append(("        linear_active = True\n    else:",
-                                  "        linear_active = not full_cover\n    else:"))
-                extra["_window_softmax_branch"] = bucket_window_attention
+            # Bucket gaps now participate in native attention. Keep its full-cover
+            # dispatch and window kernel instead of wrapping them in score_mod.
             forwards[name] = rewrite(getattr(ulysses, name), edits, extra) if edits else getattr(ulysses, name)
         replacements = [
             ('rotary_emb = self.rope(position_ids)',

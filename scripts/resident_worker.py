@@ -24,7 +24,7 @@ from openvdn_comfy.runner import conditioning_key
 from openvdn_comfy.vae_tiles import ClipDecoder
 from openvdn_comfy.warmup_history import WarmupHistory
 from openvdn_comfy.conditioning import load_conditioning
-from openvdn_comfy.token_buckets import TokenBuckets, describe_bucket, verify_cuda_padding
+from openvdn_comfy.token_buckets import BUCKET_POLICY, TokenBuckets, describe_bucket
 sys.path.insert(0, str(UPSTREAM))
 
 
@@ -121,6 +121,7 @@ def main():
                         "active_softmax_ranks": runtime.softmax_ranks,
                         "world_size": 8, "video_vae_world_size": 8 if parallel_vae else 1,
                         "metrics_schema_version": 6, "compile_cache": compile_options,
+                        "token_bucket_policy": BUCKET_POLICY if compile_options["token_bucket"] and settings.softmax_backend == "flex" else "native",
                         "startup_warmup": startup_report,
                         "exact_runtime_enabled": enabled("REF2VA_EXACT_RUNTIME"),
                         "sampler_geometry": "request_bound_v1",
@@ -159,13 +160,6 @@ def main():
     base_record = render_record(cfg, model) if runtime.is_main else None
     from src.models.softmax_attention import flex_attention as flex_module
     compiler = CompilerMonitor(flex_module, device)
-    if bucket_stride:
-        state("loading", "validating_bucket_attention")
-        if runtime.is_main:
-            bucket_parity = verify_cuda_padding(buckets, device)
-            atomic_json(BACKEND / "token-bucket-parity.json", {"instance": instance, **bucket_parity})
-            startup_report["padding_attention_verified"] = True
-        runtime.barrier()
     clip_decoder = ClipDecoder(model.vae) if parallel_vae else None
     history = WarmupHistory(BACKEND / "warmup-history.json", source_lock(), profile,
                             capacity=compile_options["max_shapes"]) if runtime.is_main else None

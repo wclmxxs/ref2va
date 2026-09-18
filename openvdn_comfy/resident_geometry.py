@@ -1,6 +1,7 @@
 """Bound static graph specializations without discarding the working set every 8 jobs."""
 import hashlib
 import json
+from .token_buckets import BUCKET_POLICY
 
 
 class GeometryCache:
@@ -24,7 +25,7 @@ class GeometryCache:
         if bucket is not None and bucket.stride:
             # The compiled attention/pointwise helpers see the capacity, not the
             # actual prefix length. Text state remains eager over the real text.
-            signature = ("prefix_gap_v1", getattr(runtime, "softmax_ranks", 6),
+            signature = (BUCKET_POLICY, getattr(runtime, "softmax_ranks", 6),
                          plan.generation_width, plan.generation_height, plan.sampling_frames,
                          bucket.capacity, bucket.video_tokens, str(embeds.dtype),
                          bool(conditions))

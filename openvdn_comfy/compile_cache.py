@@ -3,6 +3,7 @@ from collections import OrderedDict
 import math
 import os
 import time
+from .token_buckets import DEFAULT_BUCKET_STRIDE
 
 
 def cache_settings():
@@ -16,9 +17,8 @@ def cache_settings():
             raise ValueError(f"{name} must be in [{low}, {high}]")
         return value
     capacity = integer("REF2VA_COMPILE_SHAPES", 32, 8, 64)
-    # Padding/score_mod improved reuse but regressed H200 hot denoising latency.
-    # Keep native FA4 as the default; bucketing remains an explicit experiment.
-    stride = integer("REF2VA_TOKEN_BUCKET", 0, 0, 2048)
+    # Unmasked padding experiment; 0 retains native unpadded attention semantics.
+    stride = integer("REF2VA_TOKEN_BUCKET", DEFAULT_BUCKET_STRIDE, 0, 2048)
     if stride not in (0, 256, 512, 1024, 2048):
         raise ValueError("REF2VA_TOKEN_BUCKET must be 0, 256, 512, 1024 or 2048")
     raw_durations = os.environ.get("REF2VA_WARMUP_DURATIONS", "").strip()
