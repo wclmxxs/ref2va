@@ -44,6 +44,7 @@ def validate_start():
     cache_settings()
     enabled('REF2VA_EXACT_RUNTIME')
     enabled('REF2VA_ASYNC_OUTPUT')
+    enabled('REF2VA_PIPELINE_OUTPUT')
 
 
 def stop():
@@ -99,8 +100,11 @@ def start(args):
 
 def main():
     action = sys.argv[1] if len(sys.argv) > 1 else 'status'
-    if action not in ('up', 'restart', 'stop', 'status', 'logs'):
+    if action not in ('up', 'restart', 'stop', 'status', 'logs', 'validate'):
         raise ValueError('Expected up, restart, stop, status or logs')
+    if action == 'validate':
+        validate_start()
+        return
     BACKEND.mkdir(parents=True, exist_ok=True)
     if action == 'logs':
         LOG.touch(exist_ok=True)

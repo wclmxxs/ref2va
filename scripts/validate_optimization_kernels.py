@@ -26,7 +26,7 @@ def main():
     dist.init_process_group('nccl',device_id=device,timeout=timedelta(minutes=10))
     runtime = init_ulysses()
     try:
-        CommunicationRuntime(runtime).verify(layouts=tuple(range(1,8)))
+        CommunicationRuntime(runtime).verify(layouts=tuple(range(1, runtime.world_size)))
         torch.manual_seed(7)
         layout = SequenceLayout(seq_len=1280, video_start=256,num_frames=4,tokens_per_frame=256)
         prefix = 193  # crosses a partial 128-token block; padding lies in the middle
@@ -55,7 +55,7 @@ def main():
                 torch.testing.assert_close(got.float(),reference,rtol=.03,atol=.015)
         dist.barrier()
         if runtime.rank==0:
-            print('PASS: 7 communication layouts, uneven NCCL, FA4 isolated/full-cover masks, decomposed vs fp32')
+            print(f'PASS: {runtime.world_size - 1} communication layouts, uneven NCCL, FA4 isolated/full-cover masks, decomposed vs fp32')
     finally:
         dist.destroy_process_group()
 

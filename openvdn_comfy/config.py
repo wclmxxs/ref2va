@@ -3,15 +3,16 @@ from __future__ import annotations
 import json
 import os
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from .render_plan import make_plan
+from .hardware import Hardware, runtime_directory
 
 ROOT = Path(__file__).resolve().parents[1]
 DEPS = ROOT / ".deps"
 UPSTREAM = DEPS / "openvdn"
 MODELS = Path(os.environ.get("REF2VA_MODELS", ROOT / "models")).resolve()
-RUNTIME = ROOT / ".runtime"
+RUNTIME = runtime_directory(ROOT)
 WORKER_PYTHON = ROOT / ".venv-vdn/bin/python"
 CONFIG = "configs/inference/8nfe_tuned_fp8_ulysses_h200.yaml"
 
@@ -38,8 +39,8 @@ class Settings:
     reference_short_edge: int = 768
     fp8: bool = True
     inference_kernels: bool = True
-    softmax_backend: str = "flex"
-    softmax_ranks: int = 6
+    softmax_backend: str = field(default_factory=lambda: Hardware.from_env().softmax_backend)
+    softmax_ranks: int = field(default_factory=lambda: Hardware.from_env().softmax_ranks)
     warmup_steps: int = 2
     profile: bool = False
     duration: float | None = None
@@ -62,7 +63,7 @@ class Settings:
 
     def validate(self):
         for name, low, high in (("num_frames", 107, 345), ("seed", 0, 2**63 - 1),
-                                ("reference_short_edge", 128, 2048), ("softmax_ranks", 0, 7),
+                                ("reference_short_edge", 128, 2048), ("softmax_ranks", 0, Hardware.from_env().world_size - 1),
                                 ("warmup_steps", 0, 8)):
             value = getattr(self, name)
             if type(value) is not int or not low <= value <= high:

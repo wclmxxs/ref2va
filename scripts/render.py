@@ -7,6 +7,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from openvdn_comfy.config import Settings
+from openvdn_comfy.hardware import Hardware
 from openvdn_comfy.runner import generate
 
 
@@ -25,8 +26,8 @@ def main():
                         help="Reference image short edge, 128–2048 in multiples of 32; independent of output resolution")
     parser.add_argument("--fp8", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--inference-kernels", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--softmax-backend", choices=["flex", "decomposed", "ref"], default="flex")
-    parser.add_argument("--softmax-ranks", type=int, default=6)
+    parser.add_argument("--softmax-backend", choices=["flex", "decomposed", "ref"], default=Hardware.from_env().softmax_backend)
+    parser.add_argument("--softmax-ranks", type=int, default=Hardware.from_env().softmax_ranks)
     parser.add_argument("--warmup-steps", type=int, default=2)
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--fast-communication", action=argparse.BooleanOptionalAction, default=True)

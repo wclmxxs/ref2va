@@ -108,6 +108,9 @@ def test_gpu_conflict_fails_before_loading(monkeypatch):
 
 
 def test_rest_submission_status_validation_and_restart(monkeypatch, tmp_path):
+    async def prepare(urls):
+        return [str(tmp_path / 'prepared.png') for _ in urls]
+    monkeypatch.setattr(api, 'download_references', prepare)
     monkeypatch.setattr(jobs, "RUNTIME", tmp_path)
     state = {"ready": True, "profile": {key: getattr(Settings(), key) for key in api.PROFILE_FIELDS}}
     monkeypatch.setattr(api, "health", lambda: state)
@@ -121,7 +124,7 @@ def test_rest_submission_status_validation_and_restart(monkeypatch, tmp_path):
         def get_current_queue_volatile(self):
             return [], self.pending
     async def validate(job_id, graph, target):
-        assert graph["1"]["class_type"] == "OpenVDNH200Request"
+        assert graph["1"]["class_type"] == "OpenVDNH200BusinessRequest"
         return True, None, ["1"], {}
     monkeypatch.setitem(sys.modules, "execution", types.SimpleNamespace(validate_prompt=validate))
     server = types.SimpleNamespace(routes=web.RouteTableDef(), number=0, prompt_queue=Queue())
@@ -147,7 +150,7 @@ def test_rest_submission_status_validation_and_restart(monkeypatch, tmp_path):
             response = await client.post("/openvdn/jobs", json=request_body(
                 profile=True, softmax_ranks=4, cache_dit=True, cache_dit_threshold=.04))
             assert response.status == 202
-            inputs = server.prompt_queue.pending[-1][2]["1"]["inputs"]
+            inputs = jobs.read_job(server.prompt_queue.pending[-1][1])["settings"]
             assert inputs["cache_dit"] is True and inputs["cache_dit_threshold"] == .04
             assert inputs["softmax_ranks"] == 4 and inputs["profile"] is True
             assert (await client.get("/openvdn/jobs/not-a-uuid")).status == 400

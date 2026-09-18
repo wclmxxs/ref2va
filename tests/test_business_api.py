@@ -319,8 +319,10 @@ def test_prepared_node_reaches_existing_worker_and_separates_input_time_from_que
         kwargs['progress']('denoising')
         output = kwargs['output'];output.parent.mkdir(parents=True, exist_ok=True);output.write_bytes(b'mp4')
         log = environment.root/'logs';log.mkdir()
-        return {'metrics_schema_version': 9, 'output': str(output), 'log_directory': str(log),
+        value = {'metrics_schema_version': 9, 'output': str(output), 'log_directory': str(log),
                 'timings': {'denoise_seconds': 11., 'worker_wall_seconds': 14.}, 'upstream': {}}
+        assert kwargs['defer_output'] is True
+        return types.SimpleNamespace(finish=lambda: value)
     monkeypatch.setattr(nodes, 'generate', generate)
     async def exercise():
         async with environment.client() as client:
@@ -330,14 +332,18 @@ def test_prepared_node_reaches_existing_worker_and_separates_input_time_from_que
             current.prompt_id = internal
             jobs.update_job(internal, created_at=time.time()-10, queued_at=time.time()-1, reference_prepare_seconds=9.)
             result = await nodes.OpenVDNH200BusinessRequest().generate(internal)
-            record = jobs.read_job(internal)
+            for _ in range(100):
+                record = jobs.read_job(internal)
+                if record['status'] != 'running':
+                    break
+                await asyncio.sleep(.01)
             assert record['status'] == 'succeeded'
             assert len(captured) == 1
             timings = record['metrics']['timings']
             assert .9 < timings['api_queue_seconds'] < 2
             assert timings['input_prepare_seconds'] == 9 and timings['processing_wall_seconds'] >= 9
             assert timings['api_wall_seconds'] >= 10
-            assert result['result'][0].endswith('.mp4')
+            assert result['result'][0] == internal
             with pytest.raises(ValueError, match='already executed'):
                 await nodes.OpenVDNH200BusinessRequest().generate(internal)
             current.prompt_id = str(uuid.uuid4())
@@ -365,4 +371,56 @@ def test_inline_format_limit_and_exif_adaptive_orientation(environment, monkeypa
         paths, metadata = await media.prepare_sources(sources)
         assert Image.open(paths[0]).size == (48, 80)
         assert contract.resolve_geometry(req, settings, metadata).ratio == '3:5'
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize('encoder_fails', [False, True])
+def test_api_starts_next_gpu_job_while_previous_cpu_output_is_pending(environment, monkeypatch, encoder_fails):
+    import threading
+    current = types.SimpleNamespace(prompt_id=None)
+    monkeypatch.setitem(sys.modules, 'comfy_execution.utils', types.SimpleNamespace(get_executing_context=lambda: current))
+    mm = types.SimpleNamespace(throw_exception_if_processing_interrupted=lambda: None)
+    monkeypatch.setitem(sys.modules, 'comfy', types.SimpleNamespace(model_management=mm))
+    monkeypatch.setitem(sys.modules, 'comfy.model_management', mm)
+    monkeypatch.setitem(sys.modules, 'comfy_api.input_impl', types.SimpleNamespace(VideoFromFile=lambda path: path))
+    release, waiting = threading.Event(), threading.Event()
+    gpu_calls = []
+    def generate(**kwargs):
+        index = len(gpu_calls)
+        gpu_calls.append(kwargs)
+        def finish():
+            if index == 0:
+                waiting.set()
+                assert release.wait(5)
+                if encoder_fails:
+                    raise RuntimeError('CPU output failed: encoder test')
+            output = kwargs['output']; output.parent.mkdir(parents=True, exist_ok=True); output.write_bytes(b'mp4')
+            log = environment.root/f'logs-{index}'; log.mkdir()
+            return {'output': str(output), 'log_directory': str(log), 'timings': {'worker_wall_seconds': 1.}, 'upstream': {}}
+        return types.SimpleNamespace(finish=finish)
+    monkeypatch.setattr(nodes, 'generate', generate)
+    async def exercise():
+        async with environment.client() as client:
+            ids = [(await (await client.post(contract.PREFIX+'/video_generation', json=body())).json())['task_id']
+                   for _ in range(2)]
+            internal = [contract.job_id(t) for t in ids]
+            try:
+                for job in internal:
+                    current.prompt_id = job
+                    result = await asyncio.wait_for(nodes.OpenVDNH200BusinessRequest().generate(job), timeout=2)
+                    assert result['result'] == (job,)
+                    environment.server.prompt_queue.pending[:] = [p for p in environment.server.prompt_queue.pending if p[1] != job]
+                assert len(gpu_calls) == 2 and waiting.wait(1) and not release.is_set()
+                response = await client.post(contract.PREFIX+'/query/video_generation', json={'model': 'MiniMax-H3', 'task_id': ids[0]})
+                task = (await response.json())['task']
+                assert task['status'] == 'running' and task['phase'] == 'encoding_output' and 'content' not in task
+                assert (await client.get(contract.PREFIX+f'/video_generation/{ids[0]}/content')).status == 409
+            finally:
+                release.set()
+            for _ in range(100):
+                records = [jobs.read_job(job) for job in internal]
+                if all(r['status'] in ('succeeded', 'failed') for r in records): break
+                await asyncio.sleep(.01)
+            assert records[0]['status'] == ('failed' if encoder_fails else 'succeeded')
+            assert records[1]['status'] == 'succeeded' and environment.state['ready']
     asyncio.run(exercise())

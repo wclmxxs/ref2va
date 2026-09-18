@@ -1,6 +1,6 @@
 # 8b200 格式的 Ref2VA 业务接口
 
-业务 JSON 的字段和路由沿用同目录 `8b200` 的网关接口，底层使用当前 ComfyUI 队列和常驻 OpenVDN 8-NFE 八卡 worker。此服务支持 1–9 张 `reference_image`，不接受首尾帧、参考视频或参考音频。未新增 SGLang 代理或 TOS 上传依赖；成功结果通过本服务的 MP4 路由下载。
+业务 JSON 的字段和路由沿用同目录 `8b200` 的网关接口，底层使用当前 ComfyUI 队列和常驻 OpenVDN 8-NFE worker（部署可选八卡或两套四卡）。此服务支持 1–9 张 `reference_image`，不接受首尾帧、参考视频或参考音频。未新增 SGLang 代理或 TOS 上传依赖；成功结果通过本服务的 MP4 路由下载。
 
 ## 路由
 
@@ -14,7 +14,7 @@
 
 与 8b200 的业务路由一样，这些路由不要求 API Key。现有 `/openvdn/jobs`、ComfyUI、CLI 保持原格式和原默认 seed，不自动迁移历史 job ID。
 
-同步等待默认 1800 秒，可通过启动环境变量 `REF2VA_SYNC_TIMEOUT_SECONDS` 修改（大于 0、最多 86400）。超时返回 HTTP 504 和原 `task_id`；任务继续执行，应查询该 ID，不要重新提交。业务任务与其他入口共享同一生成队列。
+同步等待默认 1800 秒，可通过启动环境变量 `REF2VA_SYNC_TIMEOUT_SECONDS` 修改（大于 0、最多 86400）。超时返回 HTTP 504 和原 `task_id`；任务继续执行，应查询该 ID，不要重新提交。业务任务与其他入口共享同一实例的生成队列。四卡部署的两个端口各有独立队列，查询和下载必须使用接受该任务的端口。
 
 ## 全参数示例
 
@@ -26,7 +26,7 @@ curl -sS http://43.218.119.131:8188/ic/capcut/edit_gateway/v2/video_generation \
   --data-binary @examples/business-request.json
 ```
 
-相同请求发送到 `/sync_infer` 即为同步模式。示例显式启用 RDT 0.25；只将 `reference_short_edge` 改为 `512` 就是 512 参考图组，输出短边仍为 768。
+全参数示例中的 `optimization.softmax_ranks=6` 对应默认八卡 H200；四卡 H200 改为 3、四卡 B200 改为 2，或省略/null 以继承部署默认。相同请求发送到 `/sync_infer` 即为同步模式。示例显式启用 RDT 0.25；只将 `reference_short_edge` 改为 `512` 就是 512 参考图组，输出短边仍为 768。
 
 | 顶层字段 | 含义与约束 |
 | --- | --- |
@@ -71,7 +71,7 @@ curl -sS http://43.218.119.131:8188/ic/capcut/edit_gateway/v2/video_generation \
 | `attention_kernel` | native | `native` / `decomposed`；不支持 Sol |
 | `isolate_padding` | false | 是否隔离补齐 token；只能用于当前 Flex 部署＋native kernel |
 | `linear_stats_chunk_frames` | 16 | 8 / 16 / 32 |
-| `softmax_ranks` | 6 | 0–7；6 表示 softmax/linear 分支 6+2 分配 |
+| `softmax_ranks` | H200 八卡 6、四卡 3；B200 八卡 5、四卡 2 | 0 到单 worker 卡数减 1；0 为标准 Ulysses；省略/null 继承部署默认 |
 | `fast_communication` | true | 已验证的通信优化 |
 | `streaming_output` | true | 视频流式输出优化 |
 | `cleanup_policy` | adaptive | `adaptive` / `always` |
@@ -90,12 +90,14 @@ curl -sS http://43.218.119.131:8188/ic/capcut/edit_gateway/v2/query/video_genera
 响应 `task` 的基础字段沿用 8b200：`id`、`model`、`status`、`created_at`、`updated_at`（Unix 秒）、`inference_time_s`、`resolution`、`duration`、`ratio`、`seed`、`task_type=generation`、`modality=video`。另外返回 `num_inference_steps`、`reference_short_edge`、`phase` 和 `render_plan`。
 
 - 状态为 `queued / running / succeeded / failed / cancelled`。服务重启导致未完成任务中断时映射为 cancelled，不自动补交任务。
+- GPU 完成但 CPU 输出尚未完成时保持 `running`、`phase=encoding_output`，此时下一条任务可开始 GPU 推理；只有完整输出落盘后才成功。
 - 成功后 `task.content.url` 可直接播放/下载；失败在 `task.error` 中给出原因。
 - `inference_time_s` 对应 `timings.worker_wall_seconds`，是常驻 worker 的整体处理墙钟耗时，不是纯 DiT 或 GPU kernel 计时。未完成时为 null。
 - `task.timings` 保留完整原始耗时：DiT、条件编码/装载、视频/音频 VAE、GPU→CPU、像素准备、H.264、封装、输出整体、清理、排队和总处理等。看约 11 秒的 DiT 指标应使用 `denoise_seconds`。
 - `input_prepare_seconds` 为提交阶段的请求读取、校验、图片解析/下载及准备耗时；`api_queue_seconds` 从图片准备完入队算起；`processing_wall_seconds` 包含输入准备和节点执行，排除队列等待。`reference_download_seconds` 为兼容字段，对 Base64 请求也包含输入准备。
+- schema 10 新增 `gpu_worker_seconds`（条件编码到 GPU 回传/清理的阶段墙钟）、`cpu_output_tail_seconds`（其后的 CPU 尾段）、`output_backpressure_seconds`（等待输出槽）、`cross_request_output`（跨请求重叠是否启用）。这些时间可能与其他任务重叠；GPU 阶段墙钟也包含 CPU 调度，不是纯 kernel 时间。
 - `task.compilation` 保留编译耗时、图复用、分桶布局；`task.cache_dit` 保留实际复用步；`task.optimizations` 返回实际执行的优化和校验结果。编译及输出细分项可能相互包含/重叠，不要机械相加。
 
-反向代理部署时设置 `PUBLIC_BASE_URL=https://你的服务地址`；未设置时根据当前请求的 origin 生成视频 URL。不自动信任 Forwarded 头。
+反向代理部署时设置 `PUBLIC_BASE_URL=https://你的服务地址`；未设置时根据当前请求的 origin 生成视频 URL。不自动信任 Forwarded 头。双 API 模式若使用反向代理，分别设置 `REF2VA_PUBLIC_BASE_URL_0` 和 `REF2VA_PUBLIC_BASE_URL_1`；否则不要设置全局 `PUBLIC_BASE_URL`，以各请求 origin 生成对应端口的链接。
 
-错误格式为 `{"error":{"type":"invalid_request_error","message":"...","http_code":400}}`。同步超时另含顶层 `task_id`，可以继续查询。任务请求和结果仍保存在 `.runtime/api/jobs`，可用原内部 UUID 通过旧管理接口排障。
+错误格式为 `{"error":{"type":"invalid_request_error","message":"...","http_code":400}}`。同步超时另含顶层 `task_id`，可以继续查询。任务请求和结果保存在 `.runtime/api/jobs`；四卡实例分别保存在 `.runtime/instances/worker-{0,1}/api/jobs`，可用原内部 UUID 通过旧管理接口排障。

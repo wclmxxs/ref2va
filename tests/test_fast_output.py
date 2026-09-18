@@ -210,3 +210,37 @@ def test_streaming_writer_propagates_encoder_error_without_queue_deadlock(tmp_pa
         writer.submit(torch.zeros(1,3,17,48,32))
     writer.abort(RuntimeError('abort'))
     assert writer.writer.done() and not list(tmp_path.iterdir())
+
+
+def test_deferred_mp4_is_pixel_equivalent_and_encoding_finishes_after_seal(tmp_path,native_audio,monkeypatch):
+    import threading
+    from openvdn_comfy import streaming_output
+    plan=make_plan(duration=4,ratio='9:16',resolution=256)
+    torch.manual_seed(31)
+    video=torch.randn(1,3,107,48,32)
+    audio=torch.randn(2,192000)*.01
+    original=streaming_output.write_mp4
+    held,done=threading.Event(),threading.Event()
+    def held_writer(*args,**kwargs):
+        # Consume the bounded pixel queue normally, then hold just the CPU tail.
+        result=original(*args,**kwargs)
+        held.set()
+        assert done.wait(3)
+        return result
+    monkeypatch.setattr(streaming_output,'write_mp4',held_writer)
+    writer=streaming_output.StreamingMP4(plan,tmp_path/'deferred.mp4',48000,(.5,)*3,(.5,)*3)
+    writer.submit(video)
+    pending=writer.seal(audio,video)
+    assert held.wait(2)
+    assert not writer.writer.done()
+    assert writer.audio.result().device.type=='cpu'
+    done.set();timings,encoding=pending.finish()
+    fast_output.write_mp4(video,audio,48000,plan,tmp_path/'reference.mp4',(.5,)*3,(.5,)*3,{})
+    def frames(path):
+        with av.open(str(path)) as container:
+            assert container.streams.video[0].frames==96
+            assert float(container.streams.audio[0].duration*container.streams.audio[0].time_base)==4
+            return [f.to_ndarray() for f in container.decode(video=0)]
+    import numpy as np
+    assert all(np.array_equal(a,b) for a,b in zip(frames(tmp_path/'deferred.mp4'),frames(tmp_path/'reference.mp4')))
+    assert encoding['streaming_vae_output'] and timings['output_pipeline_wall_seconds']>0

@@ -206,7 +206,7 @@ def write_mp4(video, audio, sample_rate, plan, output, pixel_mean, pixel_std, ti
 
 
 def decode_and_save(latents, audio_latents, vae, audio_vae, output, device, plan, pixel_mean, pixel_std,
-                    phase=lambda _: None, decoded_video=None, video_decode_seconds=None, verify_output=False, stream_writer=None):
+                    phase=lambda _: None, decoded_video=None, video_decode_seconds=None, verify_output=False, stream_writer=None, defer_output=False):
     import torch
     timings = {}
     started = time.perf_counter()
@@ -231,6 +231,20 @@ def decode_and_save(latents, audio_latents, vae, audio_vae, output, device, plan
             std = torch.tensor(audio_vae.config.latents_std, device=device).view(1, -1, 1)
             audio = audio_vae.decode(audio_latents * std + mean, return_dict=False)[0]
             audio = audio.float().permute(1, 0, 2)[0]
+        if defer_output:
+            try:
+                if stream_writer is None:
+                    from .streaming_output import StreamingMP4
+                    stream_writer = StreamingMP4(plan, output, audio_vae.config.sampling_rate,
+                                                 pixel_mean, pixel_std, verify=verify_output)
+                    stream_writer.submit(video)
+                pending = stream_writer.seal(audio, video)
+                pending.decode_started = started - (video_decode_seconds or 0.)
+                return timings, pending
+            except BaseException as error:
+                if stream_writer is not None:
+                    stream_writer.abort(error)
+                raise
         if stream_writer is None:
             encoding = write_mp4(video, audio, audio_vae.config.sampling_rate, plan, output,
                                  pixel_mean, pixel_std, timings, phase, verify=verify_output)

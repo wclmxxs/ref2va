@@ -4,6 +4,8 @@ import json
 import sys
 import time
 import uuid
+import asyncio
+import aiohttp
 
 from aiohttp import web
 
@@ -11,8 +13,8 @@ from .config import Settings
 from .optimization_options import FIELDS as OPTIMIZATION_FIELDS
 from .cache_dit import FIELDS as CACHE_FIELDS
 from .jobs import create_job, read_job, update_job
-from .references import parse_urls
-from .backend import health, validate_profile, PROFILE_FIELDS
+from .references import parse_urls, download_references
+from .backend import same_process, health, validate_profile, PROFILE_FIELDS
 
 OPTIONS = ("seed", "reference_short_edge", "fp8", "inference_kernels", "softmax_backend",
            "softmax_ranks", "warmup_steps", "profile", *CACHE_FIELDS, *OPTIMIZATION_FIELDS)
@@ -48,6 +50,11 @@ def prompt_graph(request):
 
 def current_job(server, job_id):
     record = read_job(job_id)
+    if record is not None and record.get("phase") == "encoding_output" and record["status"] == "running":
+        if not same_process(record.get("output_owner", {})):
+            update_job(job_id, status="interrupted", error="API restarted before output completion")
+            return read_job(job_id)
+        return record
     if record is not None and record["status"] not in ("succeeded", "failed", "interrupted"):
         history = server.prompt_queue.get_history(job_id).get(job_id)
         running, pending = server.prompt_queue.get_current_queue_volatile()
@@ -70,6 +77,7 @@ def register_routes(server=None):
 
     @server.routes.post("/openvdn/jobs")
     async def submit(request):
+        started, created_at = time.monotonic(), time.time()
         backend = health()
         if not backend["ready"]:
             return web.json_response({"error": "OpenVDN backend is not ready", "backend": backend}, status=503)
@@ -86,15 +94,27 @@ def register_routes(server=None):
             validate_profile(settings, backend)
         except (ValueError, TypeError) as error:
             return web.json_response({"error": str(error)}, status=400)
+        try:
+            refs = await download_references(normalized['reference_image_urls'])
+        except asyncio.TimeoutError:
+            return web.json_response({'error': 'Reference download timed out'}, status=504)
+        except aiohttp.ClientError:
+            return web.json_response({'error': 'Reference download failed'}, status=502)
+        except (ValueError, OSError) as error:
+            return web.json_response({'error': str(error)}, status=400)
+        current = health()
+        if not current['ready'] or current.get('instance') != backend.get('instance'):
+            return web.json_response({'error': 'Backend changed during input preparation'}, status=503)
         import execution
         job_id = str(uuid.uuid4())
-        graph = prompt_graph(normalized)
+        graph = {'1': {'class_type': 'OpenVDNH200BusinessRequest', 'inputs': {'job_id': job_id}}}
         valid = await execution.validate_prompt(job_id, graph, None)
         if not valid[0]:
             return web.json_response({"error": valid[1], "node_errors": valid[3]}, status=400)
         number = server.number
         server.number += 1
-        create_job(job_id, normalized, settings.render_plan())
+        create_job(job_id, normalized, settings.render_plan(), settings=asdict(settings), resolved_references=refs,
+                   created_at=created_at, queued_at=time.time(), reference_prepare_seconds=time.monotonic()-started)
         server.prompt_queue.put((number, job_id, graph, {"create_time": int(time.time() * 1000)}, valid[2], {}))
         return web.json_response({"job_id": job_id, "status": "queued", "status_url": f"/openvdn/jobs/{job_id}",
                                   "render_plan": settings.render_plan().metadata()}, status=202)

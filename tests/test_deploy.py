@@ -73,4 +73,4 @@ def test_background_controls_forward_to_service_without_loading_models(deploymen
     subprocess.run(["bash", str(root / "deploy.sh"), action], env=env, check=True, capture_output=True)
     calls = (root / "calls.log").read_text().splitlines()
     assert len(calls) == 1
-    assert calls[0].endswith(str(root / "scripts/service.py") + " " + action)
+    assert calls[0].endswith(str(root / "scripts/fleet.py") + " " + action)

@@ -9,6 +9,7 @@ import uuid
 import psutil
 
 from .config import RUNTIME, Settings, atomic_json
+from .hardware import Hardware
 
 BACKEND = RUNTIME / "backend"
 PROFILE_FIELDS = ("fp8", "inference_kernels", "softmax_backend")
@@ -40,8 +41,8 @@ def startup_settings():
         isolate_padding=boolean("REF2VA_ISOLATE_PADDING", False),
         streaming_output=boolean("REF2VA_STREAMING_OUTPUT", True),
         cleanup_policy=os.environ.get("REF2VA_CLEANUP_POLICY", "adaptive"),
-        softmax_backend=os.environ.get("REF2VA_SOFTMAX_BACKEND", "flex"),
-        softmax_ranks=int(os.environ.get("REF2VA_SOFTMAX_RANKS", "6")),
+        softmax_backend=os.environ.get("REF2VA_SOFTMAX_BACKEND", Hardware.from_env().softmax_backend),
+        softmax_ranks=int(os.environ.get("REF2VA_SOFTMAX_RANKS", str(Hardware.from_env().softmax_ranks))),
         profile=boolean("REF2VA_PROFILE", False), warmup_steps=8).validate()
 
 
@@ -81,7 +82,7 @@ def health():
 def failure_detail(instance):
     from .runner import log_tail
     errors = []
-    for rank in range(8):
+    for rank in range(Hardware.from_env().world_size):
         error = read_json(BACKEND / "errors" / f"{instance}-{rank}.json")
         if error:
             errors.append(f"rank {rank}: {error['traceback'][-8000:]}")
@@ -125,6 +126,9 @@ def call_worker(request, interrupt=lambda: None, progress=lambda phase: None, ti
                 if not result.get("ok"):
                     raise RuntimeError(result["error"])
                 return result["metrics"]
+            receipt = read_json(BACKEND / "gpu_results" / f"{token}.json") if request.get("defer_output") else None
+            if receipt and receipt.get("instance") == state["instance"]:
+                return {"_output_ticket": {"token": token, "instance": state["instance"]}}
             current = health()
             if not current["ready"] or current.get("instance") != state["instance"]:
                 raise RuntimeError("Resident OpenVDN worker exited. " + current.get("error", "") +
@@ -143,3 +147,21 @@ def call_worker(request, interrupt=lambda: None, progress=lambda phase: None, ti
         if cancel_needed and not result_path.exists() and health().get("instance") == state["instance"]:
             atomic_json(BACKEND / "cancel.json", {"instance": state["instance"], "token": token, "reason": cancel_reason})
         raise
+
+
+def wait_output(ticket, interrupt=lambda: None, timeout=300):
+    """Wait without holding gpu.lock. Cancellation must not kill the next job."""
+    started = time.monotonic()
+    while True:
+        interrupt()
+        result = read_json(BACKEND / 'results' / f"{ticket['token']}.json")
+        if result is not None:
+            if not result.get('ok'):
+                raise RuntimeError(result['error'])
+            return result['metrics']
+        current = health()
+        if current.get('instance') != ticket['instance'] or not current['ready']:
+            raise RuntimeError('Worker restarted before CPU output completed')
+        if time.monotonic() - started > timeout:
+            raise TimeoutError(f'CPU output exceeded {timeout}s; GPU group was not cancelled')
+        time.sleep(.1)

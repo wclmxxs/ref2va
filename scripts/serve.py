@@ -20,6 +20,7 @@ from openvdn_comfy.exact_runtime import enabled
 from openvdn_comfy.gpu_cleanup import clear_gpu_applications, stop_tree
 from openvdn_comfy.gpu_check import ensure_free_gpus
 from openvdn_comfy.runner import stop_group, worker_environment
+from openvdn_comfy.hardware import Hardware, install_workflows
 from openvdn_comfy.supervision import Policy, WorkerWatchdog, fail_pending
 
 
@@ -44,7 +45,7 @@ def retire_previous_server():
         try:
             args = process.info["cmdline"] or []
             if (process.pid != os.getpid() and any(arg.endswith("ComfyUI/main.py") for arg in args)
-                    and "--user-directory" in args and str(ROOT / ".runtime/comfy-user") in args
+                    and "--user-directory" in args and str(RUNTIME / "comfy-user") in args
                     and process.info["cwd"] == str(ROOT)):
                 print(f"Stopping previous ComfyUI from this checkout: {process.pid}", flush=True)
                 stop_tree(process)
@@ -60,7 +61,7 @@ def launch_worker():
     atomic_json(BACKEND / "inference.json", settings.inference_config(BACKEND / "warmup.pt", BACKEND / "warmup.mp4"))
     atomic_json(BACKEND / "state.json", {"instance": instance, "status": "loading", "phase": "starting_ranks"})
     command = [str(WORKER_PYTHON), "-m", "torch.distributed.run", "--standalone", "--nnodes=1",
-               "--nproc_per_node=8", str(ROOT / "scripts/resident_worker.py")]
+               f"--nproc_per_node={Hardware.from_env().world_size}", str(ROOT / "scripts/resident_worker.py")]
     with (BACKEND / "worker.log").open("a") as log:
         log.write(f"\n=== Starting resident worker {instance} ===\n")
         log.flush()
@@ -77,6 +78,7 @@ def main():
     cache_settings()
     enabled("REF2VA_EXACT_RUNTIME")
     enabled("REF2VA_ASYNC_OUTPUT")
+    enabled("REF2VA_PIPELINE_OUTPUT")
     BACKEND.mkdir(parents=True, exist_ok=True)
     retire_previous_server()
     lock = (BACKEND / "serve.lock").open("a")
@@ -170,10 +172,12 @@ def main():
                     consecutive = 0
                     report("ready")
                 if ui is None:
+                    install_workflows(ROOT, RUNTIME / 'comfy-user', startup_settings())
                     command = [str(ROOT / ".venv-ui/bin/python"), str(ROOT / ".deps/ComfyUI/main.py"), "--cpu", "--disable-dynamic-vram",
                                "--listen", os.environ.get("REF2VA_LISTEN", "0.0.0.0"), "--port", os.environ.get("REF2VA_PORT", "8188"),
                                "--output-directory", str(ROOT / "output"), "--input-directory", str(ROOT / "input"),
                                "--user-directory", str(RUNTIME / "comfy-user"),
+                               "--temp-directory", str(RUNTIME / "comfy-temp"),
                                "--database-url", f"sqlite:///{RUNTIME / 'comfy-user/comfyui.db'}", *sys.argv[1:]]
                     ui = subprocess.Popen(command, cwd=ROOT, start_new_session=True)
                     atomic_json(BACKEND / "ui.json", process_record(ui, instance))

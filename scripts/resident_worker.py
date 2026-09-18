@@ -1,4 +1,4 @@
-"""Resident eight-rank OpenVDN; native weights, attention, sampler and decoders."""
+"""Resident four/eight-rank OpenVDN; native weights, attention, sampler and decoders."""
 from dataclasses import asdict, replace
 from datetime import timedelta
 import json
@@ -11,9 +11,11 @@ import traceback
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from openvdn_comfy.hardware import Hardware
 from openvdn_comfy.backend import BACKEND, PROFILE_FIELDS, REQUEST_DEFAULT_FIELDS, read_json
 from openvdn_comfy.config import MODELS, RUNTIME, UPSTREAM, Settings, atomic_json, source_lock
 from openvdn_comfy.compile_cache import CompilerMonitor, cache_settings, summarize_compilation
+from openvdn_comfy.output_completion import OutputCompletions
 from openvdn_comfy.fast_output import decode_and_save, measured
 from openvdn_comfy.exact_runtime import ExactRuntime, enabled
 from openvdn_comfy.attention_runtime import AttentionRuntime, summarize_attention
@@ -43,7 +45,7 @@ class Conditioner:
         # Limit each card's conditioner share so DiT/activations retain headroom.
         self.encoder = Qwen3VLForConditionalGeneration.from_pretrained(
             str(MODELS / "conditioner"), subfolder="text_encoder", dtype=torch.bfloat16,
-            device_map="balanced", max_memory={i: "12GiB" for i in range(8)})
+            device_map="balanced", max_memory={i: f"{96 // Hardware.from_env().world_size}GiB" for i in range(Hardware.from_env().world_size)})
         if any(str(value) in ("cpu", "disk") for value in self.encoder.hf_device_map.values()):
             raise RuntimeError("Conditioner did not fit the GPU budget; CPU/disk offload is disabled")
         self.encoder.eval().requires_grad_(False)
@@ -109,24 +111,27 @@ def main():
     # Idle workers poll local files; this timeout covers startup/long compilation only.
     dist.init_process_group("nccl", device_id=device, timeout=timedelta(minutes=60))
     runtime = init_ulysses(profile_enabled=settings.profile)
-    if runtime.world_size != 8:
-        raise RuntimeError("Resident worker requires exactly eight ranks")
+    if runtime.world_size != Hardware.from_env().world_size:
+        raise RuntimeError("Resident worker rank count does not match deployment")
     torch.set_grad_enabled(False)
     profile = {name: getattr(settings, name) for name in PROFILE_FIELDS}
     setup_start = time.monotonic()
 
     startup_report = {}
+    completions = OutputCompletions(BACKEND, instance) if runtime.is_main else None
 
     def state(status, phase, **extra):
         if runtime.is_main:
             atomic_json(BACKEND / "state.json", {"instance": instance, "status": status, "phase": phase,
                         "profile": {**profile, **{name: getattr(settings, name) for name in REQUEST_DEFAULT_FIELDS}},
-                        "request_options": {"softmax_ranks": list(range(8)), "profile": True,
+                        "request_options": {"softmax_ranks": list(range(runtime.world_size)), "profile": True,
                                             "optimizations": {name: getattr(settings, name) for name in OPTIMIZATION_FIELDS},
                                             "cache_dit": {name: getattr(settings, name) for name in CACHE_FIELDS}},
                         "active_softmax_ranks": runtime.softmax_ranks,
-                        "world_size": 8, "video_vae_world_size": 8 if parallel_vae else 1,
-                        "metrics_schema_version": 9, "compile_cache": compile_options,
+                        "world_size": runtime.world_size, "hardware": Hardware.from_env().metadata(),
+                        "video_vae_world_size": runtime.world_size if parallel_vae else 1,
+                        "metrics_schema_version": 10, "compile_cache": compile_options,
+                        "pipeline_output": enabled('REF2VA_PIPELINE_OUTPUT'), "output_buffer_capacity": 2,
                         "nccl": {"nvls_enable": os.environ.get("NCCL_NVLS_ENABLE", "NCCL default")},
                         "token_bucket_policy": BUCKET_POLICY if compile_options["token_bucket"] and settings.softmax_backend == "flex" else "native",
                         "startup_warmup": startup_report,
@@ -186,6 +191,7 @@ def main():
     geometries = GeometryCache(reset_compiler, max_shapes=compile_options["max_shapes"])
 
     def run(request, warmup=False, denoise_only=False, startup=False):
+        defer_output = bool(request.get("defer_output") and not warmup and not startup and not denoise_only)
         run_status = "loading" if warmup or startup else "busy"
         current = Settings(**request["settings"]).validate()
         if any(getattr(current, name) != profile[name] for name in PROFILE_FIELDS):
@@ -199,7 +205,7 @@ def main():
         if request.get("require_cached_prompt") and not cache_hit:
             raise RuntimeError(f"Warmup conditioning cache disappeared: {cache}")
         if not cache_hit:
-            # Qwen on rank zero temporarily allocates on all eight GPUs. Return
+            # Qwen on rank zero temporarily allocates on all instance GPUs. Return
             # each diffusion process's retained allocator blocks before encoding
             # a new prompt/reference, then keep hot inference requests fast.
             gc.collect()
@@ -272,6 +278,7 @@ def main():
         profiles = [item["profile"]["ms_per_nfe"] for item in dit_records]
         decode_start = time.monotonic()
         decoded_video = None
+        pending_output = None
         video_decode_seconds = None
         video_decode_details = {"world_size": 1, "native_temporal_assembly": True}
         output_timings, encoding = {}, {}
@@ -308,7 +315,9 @@ def main():
                     render.PIXEL_MEAN, render.PIXEL_STD,
                     phase=lambda phase: state(run_status, phase, token=request.get("token")),
                     decoded_video=decoded_video, video_decode_seconds=video_decode_seconds, verify_output=warmup,
-                    stream_writer=stream_writer)
+                    stream_writer=stream_writer, defer_output=defer_output)
+                if defer_output:
+                    pending_output, encoding = encoding, {'pending': True}
             runtime.barrier()
         except BaseException as error:
             if stream_writer is not None:
@@ -334,13 +343,14 @@ def main():
             if video_decode_details.get('streaming'):
                 timings['video_vae_compute_max_rank_seconds'] = max(r['compute_seconds'] for r in video_decode_details['by_rank'])
             timings.update(conditioning_seconds=encode_seconds, condition_load_seconds=condition_load_seconds,
-                           cleanup_seconds=cleanup_seconds, worker_wall_seconds=time.monotonic() - worker_start)
+                           cleanup_seconds=cleanup_seconds, worker_wall_seconds=time.monotonic() - worker_start,
+                           gpu_worker_seconds=time.monotonic() - worker_start, cross_request_output=defer_output)
             from src.inference.utils.assemble import flex_latch_state
             actual_config = current.inference_config(cache, request["output"])
             actual_config["render"]["warmup_steps"] = 8 if warmup else 0
             record = {**base_record, "overlay": actual_config,
                       "parallel": {"kind": "ulysses_branch_parallel" if runtime.branch_parallel else "ulysses",
-                                   "world_size": 8, "softmax_ranks": runtime.softmax_ranks,
+                                   "world_size": runtime.world_size, "softmax_ranks": runtime.softmax_ranks,
                                    "nccl_nvls_enable": os.environ.get("NCCL_NVLS_ENABLE", "NCCL default"),
                                    "warmup_steps": 8 if warmup else 0}, "timings": timings,
                       "resident": True, "output_encoding": encoding,
@@ -354,13 +364,13 @@ def main():
                       "parallel_profile": parallel_profile, "cache_dit": cache_report,
                       "new_geometry": new_shape, "flex_backend": flex_latch_state(),
                       "render_plan": plan.metadata(), "actual_geometry": actual_geometry}
-            if not denoise_only:
+            if not denoise_only and not defer_output:
                 atomic_json(request["output"] + ".inference.json", record)
             if not warmup or denoise_only:
                 history.remember(compilation["geometry_id"], request)
             return {"conditioning_cache_hit": cache_hit, "encode_seconds": encode_seconds,
                     "inference_process_seconds": denoise_seconds + timings["decode_and_encode_seconds"],
-                    "upstream": record}
+                    "upstream": record, "_pending_output": pending_output}
 
     # Warm up all eight diffusion steps, conditioner, video/audio VAE and MP4 encoding.
     warm_ref = BACKEND / "warmup-reference.png"
@@ -435,10 +445,20 @@ def main():
         last_token = request["token"]
         try:
             state("busy", "preparing_request", token=last_token)
+            waiting = time.monotonic()
+            if runtime.is_main and request.get("defer_output"):
+                state("busy", "waiting_for_output_slot", token=last_token)
+                completions.reserve()
+            output_backpressure = time.monotonic() - waiting
             metrics = run(request)
             if runtime.is_main:
+                metrics['upstream']['timings']['output_backpressure_seconds'] = output_backpressure
+                pending = metrics.pop('_pending_output', None)
                 state("ready", "idle")
-                atomic_json(BACKEND / "results" / f"{last_token}.json", {"ok": True, "metrics": metrics})
+                if pending is not None:
+                    completions.submit(request, metrics, pending)
+                else:
+                    atomic_json(BACKEND / "results" / f"{last_token}.json", {"ok": True, "metrics": metrics})
         except BaseException as error:
             # A rank error invalidates the whole NCCL group. torchrun/supervisor reaps it.
             if runtime.is_main:

@@ -8,6 +8,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from openvdn_comfy.config import DEPS, MODELS, RUNTIME, UPSTREAM, Settings, atomic_json, source_lock
+from openvdn_comfy.hardware import Hardware
 from openvdn_comfy.runner import gpu_lock, run_process, worker_environment
 
 
@@ -40,12 +41,13 @@ def main():
         raise RuntimeError("CUDA unavailable in the VDN environment")
     if torch.__version__ != "2.13.0+cu129":
         raise RuntimeError(f"Expected torch 2.13.0+cu129, got {torch.__version__}")
-    if torch.cuda.device_count() != 8:
-        raise RuntimeError(f"Expose exactly 8 H200 GPUs; found {torch.cuda.device_count()}")
-    for i in range(8):
+    hardware = Hardware.from_env()
+    hardware.visible_devices()
+    if torch.cuda.device_count() != hardware.world_size:
+        raise RuntimeError(f"Expose exactly {hardware.world_size} GPUs; found {torch.cuda.device_count()}")
+    for i in range(hardware.world_size):
         gpu = torch.cuda.get_device_properties(i)
-        if "H200" not in gpu.name or gpu.total_memory < 130 * 1024**3:
-            raise RuntimeError(f"GPU {i} is not a full H200: {gpu}")
+        hardware.validate_device(gpu.name, gpu.total_memory, torch.cuda.get_device_capability(i))
         print(f"GPU {i}: {gpu.name}, {gpu.total_memory / 1024**3:.1f} GiB")
     for package in ("torch", "transformers", "flash-attn-4", "triton", "diffusers"):
         print(f"{package}: {importlib.metadata.version(package)}")
@@ -63,9 +65,9 @@ def main():
     subprocess.run(["nvidia-smi", "topo", "-m"], check=True)
     if args.nccl:
         log = RUNTIME / "nccl-probe.log"
-        print(f"8-rank NCCL probe: NCCL_NVLS_ENABLE={worker_environment()['NCCL_NVLS_ENABLE']}", flush=True)
+        print(f"{hardware.world_size}-rank NCCL probe: NCCL_NVLS_ENABLE={worker_environment().get('NCCL_NVLS_ENABLE', 'NCCL default')}", flush=True)
         with gpu_lock(lambda: None):
-            run_process([sys.executable, "-m", "torch.distributed.run", "--standalone", "--nproc_per_node=8",
+            run_process([sys.executable, "-m", "torch.distributed.run", "--standalone", f"--nproc_per_node={hardware.world_size}",
                          str(ROOT / "scripts/nccl_probe.py")], log, timeout=180)
         print(log.read_text())
     print("READY: ./deploy.sh start — upload an image and import workflows/openvdn_ref2va_like.json")

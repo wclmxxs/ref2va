@@ -42,13 +42,18 @@ check_runtime() {
 
 start_ui() {
     [[ -x .venv-ui/bin/python ]] || { echo 'Run ./deploy.sh install first'; exit 1; }
-    mkdir -p output input .runtime/comfy-user/default/workflows
-    # Install the starter workflow once; keep any edits saved from the UI.
-    if [[ ! -e .runtime/comfy-user/default/workflows/openvdn_ref2va_like.json ]]; then
-      cp workflows/openvdn_ref2va_like.json .runtime/comfy-user/default/workflows/
+    runtime_dir=.runtime
+    if [[ -n "${REF2VA_INSTANCE:-}" ]]; then
+      [[ "$REF2VA_INSTANCE" == worker-0 || "$REF2VA_INSTANCE" == worker-1 ]] || { echo 'Invalid REF2VA_INSTANCE'; exit 1; }
+      runtime_dir=".runtime/instances/$REF2VA_INSTANCE"
     fi
-    if [[ ! -e .runtime/comfy-user/default/workflows/openvdn_url_request.json ]]; then
-      cp workflows/openvdn_url_request.json .runtime/comfy-user/default/workflows/
+    mkdir -p output input "$runtime_dir/comfy-user/default/workflows"
+    # Install the starter workflow once; keep any edits saved from the UI.
+    if [[ ! -e "$runtime_dir/comfy-user/default/workflows/openvdn_ref2va_like.json" ]]; then
+      cp workflows/openvdn_ref2va_like.json "$runtime_dir/comfy-user/default/workflows/"
+    fi
+    if [[ ! -e "$runtime_dir/comfy-user/default/workflows/openvdn_url_request.json" ]]; then
+      cp workflows/openvdn_url_request.json "$runtime_dir/comfy-user/default/workflows/"
     fi
     exec .venv-ui/bin/python "$ROOT/scripts/serve.py" "$@"
 }
@@ -59,7 +64,10 @@ case "$action" in
     install_environment
     echo '[2/4] Downloading pinned model weights'
     download_models
-    echo '[3/4] Checking H200 environment'
+    if [[ $# -gt 0 || "${REF2VA_GPUS:-8}" == 4 ]]; then
+      exec .venv-ui/bin/python "$ROOT/scripts/fleet.py" foreground "$@"
+    fi
+    echo '[3/4] Checking GPU environment'
     check_runtime
     echo "[4/4] Releasing GPUs, preloading models, warming up, then starting ComfyUI on ${REF2VA_PORT:-8188}"
     start_ui "$@"
@@ -68,12 +76,15 @@ case "$action" in
   download) download_models "$@" ;;
   check) check_runtime "$@" ;;
   start)
+    if [[ "${REF2VA_MANAGED_INSTANCE:-0}" != 1 ]]; then
+      exec .venv-ui/bin/python "$ROOT/scripts/fleet.py" foreground "$@"
+    fi
     check_runtime
     start_ui "$@"
     ;;
   up|restart|stop|status|logs)
     [[ -x .venv-ui/bin/python ]] || { echo 'Run ./deploy.sh install first'; exit 1; }
-    exec .venv-ui/bin/python "$ROOT/scripts/service.py" "$action" "$@"
+    exec .venv-ui/bin/python "$ROOT/scripts/fleet.py" "$action" "$@"
     ;;
   render)
     exec .venv-ui/bin/python scripts/render.py "$@"
@@ -81,6 +92,7 @@ case "$action" in
   help|-h|--help)
     echo 'Usage: bash deploy.sh [deploy | install | download | check [--nccl] | start | up | restart | stop | status | logs | render --help]'
     echo 'No arguments: install, download, check eight GPUs, and start ComfyUI.'
+    echo 'Options: --gpu-type h200|b200 --gpus 4|8 --port 8188 (4 = two workers, ports 8188/8189)'
     echo 'up: background start with worker auto-recovery; restart: reload; stop/status/logs: service controls.'
     ;;
   *) echo "Unknown action: $action" >&2; exit 2 ;;

@@ -64,20 +64,23 @@ class StreamingMP4:
         return {'checked': self.captured is not None, 'exact': True if self.captured is not None else None,
                 'chunks_checked': checked}
 
-    def finish(self, audio, video):
+    def seal(self, audio, video):
+        """Finish GPU work now; the returned handle owns only CPU buffers/futures."""
         if self.sent != self.plan.output_frames:
             raise RuntimeError(f'Output has {self.sent} frames, expected {self.plan.output_frames}')
         parity = self.check(video)
-        self.audio.set_result(audio)
+        # No CUDA operation is allowed in the completion thread after publishing
+        # GPU completion. Audio must leave the device here, alongside the pixels.
+        from .fast_output import measured
+        with measured(self.timings, 'device_to_host_seconds', audio.device):
+            host_audio = audio.cpu()
+        self.audio.set_result(host_audio)
         self.put(None)
-        encoding = self.writer.result()
-        self.closed = True
-        self.pool.shutdown(wait=True)
         self.captured = None
-        encoding.update(streaming_pixel_parity=parity, host_queue_chunks=4)
-        self.timings['first_pixel_chunk_seconds'] = self.first_chunk
-        self.timings['output_pipeline_wall_seconds'] = time.perf_counter() - self.started
-        return self.timings, encoding
+        return PendingMP4(self, parity)
+
+    def finish(self, audio, video):
+        return self.seal(audio, video).finish()
 
     def abort(self, error):
         if self.closed:
@@ -99,3 +102,20 @@ class StreamingMP4:
             pass
         self.pool.shutdown(wait=True)
         self.captured = None
+
+
+class PendingMP4:
+    def __init__(self, stream, parity):
+        self.stream, self.parity = stream, parity
+
+    def finish(self):
+        stream = self.stream
+        try:
+            encoding = stream.writer.result()
+        finally:
+            stream.closed = True
+            stream.pool.shutdown(wait=True)
+        encoding.update(streaming_pixel_parity=self.parity, host_queue_chunks=4)
+        stream.timings['first_pixel_chunk_seconds'] = stream.first_chunk
+        stream.timings['output_pipeline_wall_seconds'] = time.perf_counter() - stream.started
+        return dict(stream.timings), encoding

@@ -6,6 +6,7 @@ from pathlib import Path
 import time
 
 from .backend import read_json
+from .hardware import Hardware
 
 
 @dataclass(frozen=True)
@@ -49,7 +50,7 @@ class WorkerWatchdog:
         code = process.poll()
         if code is not None:
             return f'Worker exited with code {code}'
-        for rank in range(8):
+        for rank in range(Hardware.from_env().world_size):
             error = read_json(self.directory / 'errors' / f'{self.instance}-{rank}.json')
             if error:
                 return f'Rank {rank} failed: {error.get("traceback", "unknown error")[-8000:]}'
@@ -64,7 +65,7 @@ class WorkerWatchdog:
                 return None
         command = read_json(self.directory / 'command.json', {})
         token = command.get('token') if command.get('instance') == self.instance else None
-        pending = token and not (self.directory / 'results' / f'{token}.json').exists()
+        pending = token and not (self.directory / 'results' / f'{token}.json').exists() and not (self.directory / 'gpu_results' / f'{token}.json').exists()
         if pending:
             if token != self.token:
                 self.token, self.request_started = token, now
@@ -78,7 +79,7 @@ class WorkerWatchdog:
         self.token, self.request_started = None, None
         if self.idle_since is None:
             self.idle_since = now
-        for rank in range(8):
+        for rank in range(Hardware.from_env().world_size):
             beat = read_json(self.directory / 'heartbeats' / f'{self.instance}-{rank}.json', {})
             signature = beat.get('sequence')
             previous, seen = self.beats.get(rank, (None, self.idle_since))
@@ -98,4 +99,11 @@ def fail_pending(directory, instance, error):
     if command.get('instance') == instance and token:
         result = directory / 'results' / f'{token}.json'
         if not result.exists():
+            atomic_json(result, {'ok': False, 'error': error, 'worker_restarted': True})
+
+    # A worker restart also invalidates CPU outputs owned by that process.
+    for path in (directory / 'gpu_results').glob('*.json'):
+        receipt = read_json(path, {})
+        result = directory / 'results' / path.name
+        if receipt.get('instance') == instance and not result.exists():
             atomic_json(result, {'ok': False, 'error': error, 'worker_restarted': True})

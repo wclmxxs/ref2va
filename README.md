@@ -1,6 +1,6 @@
-# OpenVDN 8 步 · ComfyUI · 8×H200
+# OpenVDN 8 步 · ComfyUI · H200 / B200
 
-一条视频使用全部 8 张 H200。ComfyUI 负责输入、队列和视频预览；常驻八卡进程调用固定版本的 [OpenVDN](https://github.com/OpenVDN/vdn-minimax-h3)，默认 FP8、6 个 softmax rank + 2 个 linear rank、8 NFE。
+默认一条视频使用全部 8 张 H200；可选择 H200/B200，以及一套八卡或两套四卡服务。ComfyUI 负责输入、队列和视频预览；常驻 GPU 进程调用固定版本的 [OpenVDN](https://github.com/OpenVDN/vdn-minimax-h3)，默认 FP8、6 个 softmax rank + 2 个 linear rank、8 NFE。
 
 图片参考模式是官方 **Ref2VA-like**：FL2VA 权重接收参考图，不是 MiniMax 的独立 Ref2VA transformer。支持默认关闭的 DBCache 跨步缓存；暂不接入 LightX2V 或整块 DiT 编译；`inference_kernels` 控制官方融合/局部编译内核组合。
 
@@ -12,24 +12,24 @@
 cd /root/ref2va && git pull --ff-only && bash deploy.sh restart
 ```
 
-首次部署，在克隆的仓库目录执行 `bash deploy.sh`，自动安装固定版本源码、下载模型并启动。需要 Linux x86_64、8 张完整 H200、支持 CUDA 12.9 的驱动、NVLink/NCCL，约 250 GB 磁盘空间。首次部署命令在前台运行；依赖和模型就绪后，使用 `bash deploy.sh up` 后台启动，或 `bash deploy.sh restart` 更新重启。
+首次部署，在克隆的仓库目录执行 `bash deploy.sh`，自动安装固定版本源码、下载模型并启动。需要 Linux x86_64、8 张完整 H200 或 B200、支持 CUDA 12.9 的驱动、NVLink/NCCL，约 250 GB 磁盘空间。首次部署命令在前台运行；依赖和模型就绪后，使用 `bash deploy.sh up` 后台启动，或 `bash deploy.sh restart` 更新重启。
 
 当前默认测试 **2048 间隔的无屏蔽前缀分桶**：补齐 token 参与 attention，可能改变生成结果；尚无这版的 H200 耗时/效果实测。已有环境变量会继续生效；如需覆盖旧的 0/1024 设置，用 `REF2VA_TOKEN_BUCKET=2048 bash deploy.sh restart`；`REF2VA_TOKEN_BUCKET=0 bash deploy.sh start` 可回到不补齐的原生布局。
 
 启动依次执行：
 
 1. 停止本目录的旧服务。
-2. **自动停止所选 8 张 GPU 上已有的计算应用**，释放显存。识别到 systemd 应用服务或 Docker 容器时停止其服务/容器；其他情况停止推理进程树，先 TERM，再在超时后 KILL。不会卸载应用或永久禁用服务。清理动作写入 `.runtime/gpu-cleanup.json`。若外部调度器持续拉起应用，启动报错，不会无限杀进程。
-3. 检查模型、八卡环境与 NCCL。
-4. 加载八份 DiT、默认八份视频 VAE 和 rank 0 的音频 VAE；Qwen3-VL 条件编码器通过 Accelerate 分配到这 8 张 GPU，单卡权重预算 12 GiB，禁止 CPU/磁盘权重卸载。
+2. **自动停止本实例所选 GPU 上已有的计算应用**，释放显存。识别到 systemd 应用服务或 Docker 容器时停止其服务/容器；其他情况停止推理进程树，先 TERM，再在超时后 KILL。不会卸载应用或永久禁用服务。清理动作写入 `.runtime/gpu-cleanup.json`。若外部调度器持续拉起应用，启动报错，不会无限杀进程。
+3. 检查模型、所选 GPU 型号/卡数与 NCCL。
+4. 每卡加载一份 DiT、默认一份视频 VAE；音频 VAE 位于本实例 rank 0。Qwen3-VL 通过 Accelerate 分配到本实例的 GPU，单卡权重预算八卡时 12 GiB、四卡时 24 GiB，禁止 CPU/磁盘权重卸载。两套四卡 worker 各自加载完整模型。
 5. 使用一张合成参考图完成条件编码、正式 8 NFE、音视频解码及 MP4 编码预热。默认预热 10 秒、9:16、短边 768。
-6. 预热成功后才启动 ComfyUI，访问 `http://服务器IP:8188`。
+6. 每套 worker 预热成功后才开放对应 ComfyUI/API 端口，默认 8188；四卡模式还开放 8189。
 
 这是专用八卡服务的启动行为，会中止这些卡上原有的生成任务。设置 `REF2VA_CLEAR_GPU_APPS=0` 可关闭自动清理，改为显存不足时直接退出。清理只在启动执行；生成期间不会停止其他应用。
 
 模型全程常驻。后续生成复用 DiT、Qwen3-VL 和 VAE，不重新读权重，不执行额外去噪预热。同一 prompt、参考图内容、参考尺寸和模型版本命中条件缓存时，也会跳过编码。新序列长度/尺寸仍可能触发内核编译；启动预热不能覆盖所有输入形状。保留磁盘编译缓存，并在有限数量的新形状后重置 Dynamo 编译图记录，避免官方单次推理实现达到重编译上限。
 
-Ctrl-C 会回收 UI 和整个八卡进程组。取消正在推理的任务会终止整组 NCCL worker，并自动重新加载预热，期间生成接口返回 503。GPU OOM、CUDA/NCCL 错误、rank 退出、启动超时及推理卡死会自动回收整组 worker，重新加载模型并完成启动预热。UI 和查询接口在恢复期间保留，生成接口返回 503，就绪后自动恢复服务。
+Ctrl-C 会回收 UI 和当前部署的 GPU 进程组。取消正在推理的任务会终止整组 NCCL worker，并自动重新加载预热，期间生成接口返回 503。GPU OOM、CUDA/NCCL 错误、rank 退出、启动超时及推理卡死会自动回收整组 worker，重新加载模型并完成启动预热。UI 和查询接口在恢复期间保留，生成接口返回 503，就绪后自动恢复服务。
 
 ## 后台运行与 worker 自动恢复
 
@@ -38,7 +38,7 @@ bash deploy.sh up       # 后台启动；已运行时不会重复启动
 bash deploy.sh restart  # 停止旧服务，再以当前代码和环境变量后台启动
 bash deploy.sh status   # 查看控制进程、ready、阶段、重启次数及最近错误
 bash deploy.sh logs     # 持续查看 .runtime/service.log；Ctrl-C 只退出日志查看
-bash deploy.sh stop     # 停止控制进程、UI 和八卡 worker
+bash deploy.sh stop     # 停止控制进程、全部实例的 UI 和 GPU worker
 ```
 
 `up/restart` 返回表示后台进程已启动，**不表示模型已就绪**；用 `status` 或 `GET /openvdn/health` 确认 `ready=true`。关闭终端、断开 SSH 不影响运行。`start` 仍为前台启动，并使用相同的 worker 自动恢复机制。后台模式不安装系统服务，服务器重启后需要重新执行 `up`；控制进程本身被 SIGKILL 也需要重新启动。
@@ -47,7 +47,7 @@ bash deploy.sh stop     # 停止控制进程、UI 和八卡 worker
 
 失败请求保留错误和原始日志，**不会自动重跑**；已排队但在恢复期间开始执行的请求也可能失败，客户端需在恢复后决定是否重新提交。`/openvdn/health` 的 `supervision` 包含重启次数、最近错误、退避重试时间和超时配置；每次旧 worker 的错误快照在 `.runtime/backend/failures/`，推理详细日志在 `.runtime/backend/worker.log`。
 
-默认启动超时 3600 秒，单次 worker 请求上限 1800 秒（含条件编码、首次编译、推理及输出）。空闲时每个 rank 主循环报告心跳，连续 60 秒无心跳触发重启；**不根据 GPU 利用率为 0 判断故障**。推理期间使用请求总超时，不用空闲心跳阈值，避免把正常编译误判为卡死。按需调整，例如：
+默认启动超时 3600 秒，单次 worker GPU 阶段请求上限 1800 秒（含输出缓冲等待、条件编码、首次编译、推理、VAE 和像素回传，不含后续纯 CPU 输出尾段）。空闲时每个 rank 主循环报告心跳，连续 60 秒无心跳触发重启；**不根据 GPU 利用率为 0 判断故障**。推理期间使用请求总超时，不用空闲心跳阈值，避免把正常编译误判为卡死。按需调整，例如：
 
 ```bash
 REF2VA_REQUEST_TIMEOUT=900 REF2VA_STARTUP_TIMEOUT=3600 bash deploy.sh restart
@@ -56,11 +56,54 @@ REF2VA_REQUEST_TIMEOUT=900 REF2VA_STARTUP_TIMEOUT=3600 bash deploy.sh restart
 | 环境变量 | 默认秒数 | 含义 |
 | --- | --- | --- |
 | `REF2VA_STARTUP_TIMEOUT` | 3600 | 每次模型加载和预热总时限 |
-| `REF2VA_REQUEST_TIMEOUT` | 1800 | 单次 worker 请求总时限，不含排队/图片下载 |
+| `REF2VA_REQUEST_TIMEOUT` | 1800 | 单次 GPU 阶段请求总时限，不含排队/图片下载及纯 CPU 输出尾段 |
 | `REF2VA_IDLE_TIMEOUT` | 60 | 空闲 rank 心跳超时 |
 | `REF2VA_RESTART_DELAY` | 5 | 首次失败后的重试间隔 |
 | `REF2VA_RESTART_MAX_DELAY` | 60 | 连续失败退避的最大间隔 |
 | `REF2VA_STABLE_SECONDS` | 300 | 重置失败退避前需保持就绪的时间 |
+
+## 选择 GPU 型号、卡数与端口
+
+```bash
+bash deploy.sh restart                                  # 默认：一套 8×H200，8188
+bash deploy.sh restart --gpu-type b200 --gpus 8          # 一套 8×B200，8188
+bash deploy.sh restart --gpu-type h200 --gpus 4          # 两套 4×H200，8188 / 8189
+bash deploy.sh restart --gpu-type b200 --gpus 4 --port 9000  # 两套 4×B200，9000 / 9001
+```
+
+`--gpus` 是**每个 worker 的卡数**，部署机器仍需提供 8 张 GPU。四卡模式启动两套独立服务：worker-0 使用 GPU 0–3，worker-1 使用 GPU 4–7。指定 `CUDA_VISIBLE_DEVICES=...` 时须列出八个不同设备，按前四/后四拆分。两套服务各有一个 API 端口、一条队列、一套常驻模型；提交、查询、下载同一任务须使用同一端口，不自动负载均衡。两边都有任务时可同时生成两条视频。
+
+| GPU / 每 worker 卡数 | 默认 softmax backend | softmax + linear ranks |
+| --- | --- | --- |
+| H200 / 8 | flex | 6 + 2 |
+| H200 / 4 | flex | 3 + 1 |
+| B200 / 8 | decomposed | 5 + 3 |
+| B200 / 4 | decomposed | 2 + 2 |
+
+这是起始配置，不代表已测得各机型最优布局。请求级 `softmax_ranks` 范围为 0 到单 worker 卡数减 1；0 使用标准 Ulysses。B200 的 decomposed 路径不使用 Flex 的 token 分桶。显式 `REF2VA_SOFTMAX_BACKEND` / `REF2VA_SOFTMAX_RANKS` 仍覆盖默认；从八卡切为四卡时不要保留越界的 rank 数，启动器会在停止旧服务前检查配置。H200 默认关闭 NVLS 以兼容既有主机；B200 使用 NCCL 默认，仍可显式设置 `NCCL_NVLS_ENABLE`。
+
+四卡实例状态、GPU 锁、条件缓存、编译缓存、用户数据库、临时目录和日志分别位于 `.runtime/instances/worker-0/`、`.runtime/instances/worker-1/`。模型文件与唯一文件名的输出目录共用。`status/logs/stop` 自动读取 `.runtime/fleet.json`，无需再传卡数；切换拓扑用 `restart`。一组 OOM/卡死只重启该组，另一组继续工作。API 健康结果的 `hardware` 返回实际型号、设备列表和单 worker 卡数。
+
+`up` 和 `start` 也接受上述参数；首次安装可执行 `bash deploy.sh deploy --gpu-type b200 --gpus 4`。界面中选择带 `_h200_4`、`_b200_4` 等后缀的 starter workflow，参数会匹配对应实例，已有用户保存的工作流不会被覆盖。
+
+四卡和 B200 路径已覆盖本地配置、上游布局及故障隔离回归，实际显存峰值、CUDA 内核兼容性与吞吐量仍需目标服务器验证。
+
+## 连续请求的输出流水线
+
+新旧 REST 接口均在入队前准备图片。每个实例仍串行执行条件编码、DiT、VAE 和像素 GPU→CPU 回传；这些工作结束即释放 GPU 队列，MP4 编码/音频封装的剩余 CPU 工作可以与下一条 GPU 推理重叠。ComfyUI 可视化节点仍等待视频完整写好才返回预览，因此只从 UI 连续提交时，不会提前放行该 UI 队列。
+
+每实例最多保留两条尚未完成的输出，每条像素队列最多四个块；CPU/磁盘持续落后时会施加反压，不无限堆内存，也不能保证任何负载下 GPU 始终 100%。CPU 编码失败只使对应任务失败，不重启正在计算下一条的 GPU。GPU worker 崩溃时，其尚未完成的 CPU 输出也会明确失败；成功结果不会被重写。任务必须等 MP4 和耗时记录全部落盘后才进入 `succeeded`，中间阶段为 `running / encoding_output`。
+
+可用 `REF2VA_PIPELINE_OUTPUT=0 bash deploy.sh restart` 关闭跨请求输出重叠进行对照；默认 `1`。关闭时保持原来的整次 worker 输出完成后释放 GPU 锁；非流式模式的旧 pinned-memory 路径及 `REF2VA_ASYNC_OUTPUT` 开关也继续可用。
+
+耗时 schema 10 新增：
+
+- `gpu_worker_seconds`：条件编码至 VAE、回传、清理及同步结束的墙钟耗时，包含阶段内 CPU 调度/反压，不是纯 GPU kernel 时间。
+- `cpu_output_tail_seconds`：GPU 阶段结束后剩余输出处理时间，可与下一任务重叠。
+- `output_backpressure_seconds`：GPU 工作前等待空闲输出槽的时间。
+- `cross_request_output`：是否启用本次跨请求输出重叠。
+
+`worker_wall_seconds` 包含 GPU 阶段及 CPU 尾段；`generation_wall_seconds`、`processing_wall_seconds` 另包含对应排队/准备范围。单独看 DiT 仍使用 `denoise_seconds`。重叠的编码/回传/VAE 细项不能直接求和。
 
 ## 8b200 格式业务接口
 
@@ -70,7 +113,7 @@ REF2VA_REQUEST_TIMEOUT=900 REF2VA_STARTUP_TIMEOUT=3600 bash deploy.sh restart
 
 ## 原 JSON 接口（继续兼容）
 
-提交：`POST /openvdn/jobs`。返回 HTTP 202、`job_id`、`status_url` 和实际输出规格；通过 `GET /openvdn/jobs/{job_id}` 查询。该接口与 UI、CLI 共用队列/文件锁，一次只生成一条视频。
+提交：`POST /openvdn/jobs`。返回 HTTP 202、`job_id`、`status_url` 和实际输出规格；通过 `GET /openvdn/jobs/{job_id}` 查询。该接口与同实例 UI 共用队列，与 CLI 共用 GPU 文件锁；同实例一次只执行一条 GPU 推理，CPU 输出尾段可与下一条 GPU 推理重叠。
 
 ```bash
 curl -sS http://43.218.119.131:8188/openvdn/jobs \

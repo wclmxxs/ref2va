@@ -76,7 +76,7 @@ class CommunicationRuntime:
         device = self.runtime.device
         gen = torch.Generator(device=device).manual_seed(914 + self.runtime.rank)
         checks = []
-        layouts = layouts or (self.runtime.softmax_ranks or 6,)
+        layouts = layouts or (self.runtime.softmax_ranks or min(6, self.runtime.world_size - 1),)
         for parts in layouts:
             rows, heads, dim = 19, 56, head_dim
             q, k, v = [torch.randn(rows, heads, dim, generator=gen, device=device,

@@ -16,7 +16,9 @@ from pathlib import Path
 
 from .config import (ROOT, RUNTIME, UPSTREAM, WORKER_PYTHON, Settings, atomic_json,
                      source_lock)
-from .backend import call_worker
+from .backend import call_worker, wait_output
+from .hardware import Hardware
+from .exact_runtime import enabled
 
 _active = set()
 _active_lock = threading.Lock()
@@ -39,15 +41,18 @@ def worker_environment():
     # ComfyUI uses --cpu. These child processes alone own CUDA.
     env.update(PYTHONPATH=str(UPSTREAM), PYTHONUNBUFFERED="1", HF_HUB_OFFLINE="1",
                TRANSFORMERS_OFFLINE="1", TORCH_NCCL_ASYNC_ERROR_HANDLING="1")
-    env.setdefault("CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7")
+    hardware = Hardware.from_env()
+    env.setdefault("CUDA_VISIBLE_DEVICES", ",".join(hardware.visible_devices()))
     # This H200 deployment reports NVLS multicast bind CUDA error 401 with
     # NCCL 2.29. Use the same workaround for the probe and resident ranks.
     # This only disables NVLink SHARP offload, not P2P/NVLink transport.
     # An explicit setting can re-enable it after the host fabric is repaired.
-    env.setdefault("NCCL_NVLS_ENABLE", "0")
+    if hardware.gpu_type == "h200":
+        env.setdefault("NCCL_NVLS_ENABLE", "0")
     env.setdefault("OMP_NUM_THREADS", "8")
-    env.setdefault("TORCHINDUCTOR_CACHE_DIR", str(RUNTIME / "inductor"))
-    env.setdefault("TRITON_CACHE_DIR", str(RUNTIME / "triton"))
+    cache_root = RUNTIME if hardware.gpu_type == "h200" and hardware.world_size == 8 else RUNTIME / "compile" / f"{hardware.gpu_type}-{hardware.world_size}"
+    env.setdefault("TORCHINDUCTOR_CACHE_DIR", str(cache_root / "inductor"))
+    env.setdefault("TRITON_CACHE_DIR", str(cache_root / "triton"))
     env.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
     env.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "1")
     return env
@@ -144,7 +149,7 @@ def conditioning_key(prompt, refs, short_edge):
 
 
 def generate(*, prompt="", refs=(), settings=None, output=None, prompt_file=None,
-             interrupt=lambda: None, worker_call=call_worker, progress=lambda phase: None):
+             interrupt=lambda: None, worker_call=call_worker, progress=lambda phase: None, defer_output=False):
     settings = (settings or Settings()).validate()
     refs = [Path(path).resolve() for path in refs]
     if prompt_file is not None and (refs or prompt):
@@ -157,7 +162,7 @@ def generate(*, prompt="", refs=(), settings=None, output=None, prompt_file=None
         if not path.is_file():
             raise FileNotFoundError(path)
     if not WORKER_PYTHON.is_file():
-        raise RuntimeError("Run ./deploy.sh install on the H200 server first")
+        raise RuntimeError("Run ./deploy.sh install on the GPU server first")
     job_id = uuid.uuid4().hex
     job = RUNTIME / "jobs" / job_id
     job.mkdir(parents=True)
@@ -168,7 +173,8 @@ def generate(*, prompt="", refs=(), settings=None, output=None, prompt_file=None
     request = {"job_id": job_id, "settings": asdict(settings), "sources": source_lock(),
                "render_plan": settings.render_plan().metadata(),
                "mode": "cached_prompt" if prompt_file else "ref2va_like" if refs else "t2va",
-               "references": list(map(str, refs)), "prompt": prompt, "output": str(output)}
+               "references": list(map(str, refs)), "prompt": prompt, "output": str(output),
+               "defer_output": enabled('REF2VA_PIPELINE_OUTPUT')}
     atomic_json(job / "request.json", request)
     started = time.monotonic()
     try:
@@ -185,12 +191,13 @@ def generate(*, prompt="", refs=(), settings=None, output=None, prompt_file=None
             atomic_json(job / "inference.json", settings.inference_config(cache, output))
             progress("inference")
             metrics = worker_call({**request, "prompt_file": str(cache)}, interrupt=interrupt, progress=progress)
+        def finalize(metrics):
             if not output.is_file() or output.stat().st_size == 0:
                 raise RuntimeError("Inference succeeded without producing a video")
             upstream_record = json.loads(Path(str(output) + ".inference.json").read_text())
-            if upstream_record["parallel"]["world_size"] != 8:
-                raise RuntimeError("Upstream result did not use 8 GPUs")
-            result = {**request, "status": "complete", "metrics_schema_version": 9, "log_directory": str(job),
+            if upstream_record["parallel"]["world_size"] != Hardware.from_env().world_size:
+                raise RuntimeError("Upstream result did not use the configured GPU count")
+            result = {**request, "status": "complete", "metrics_schema_version": 10, "log_directory": str(job),
                       "conditioning_cache_hit": metrics["conditioning_cache_hit"], "prompt_file": str(cache),
                       "queue_seconds": queue_seconds, "encode_seconds": metrics["encode_seconds"],
                       "inference_process_seconds": metrics["inference_process_seconds"], "resident": True,
@@ -200,7 +207,25 @@ def generate(*, prompt="", refs=(), settings=None, output=None, prompt_file=None
             atomic_json(str(output) + ".metrics.json", result)
             atomic_json(job / "result.json", result)
             return result
+        def failed(error):
+            atomic_json(job / "result.json", {**request, "status": "failed", "error": str(error),
+                                             "request_wall_seconds": time.monotonic() - started})
+        pending = PendingGeneration(metrics, finalize, failed, interrupt if not defer_output else lambda: None)
+        return pending if defer_output else pending.finish()
     except BaseException as error:
         atomic_json(job / "result.json", {**request, "status": "failed", "error": str(error),
                                          "request_wall_seconds": time.monotonic() - started})
         raise
+
+
+class PendingGeneration:
+    def __init__(self, metrics, finalize, failed, interrupt=lambda: None):
+        self.metrics, self.finalize, self.failed, self.interrupt = metrics, finalize, failed, interrupt
+
+    def finish(self):
+        try:
+            metrics = wait_output(self.metrics['_output_ticket'], self.interrupt) if isinstance(self.metrics, dict) and '_output_ticket' in self.metrics else self.metrics
+            return self.finalize(metrics)
+        except BaseException as error:
+            self.failed(error)
+            raise

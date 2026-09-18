@@ -16,7 +16,8 @@ from openvdn_comfy.config import Settings, atomic_json
 from openvdn_comfy.resident_geometry import GeometryCache
 
 
-def test_actual_upstream_ulysses_changes_geometry_without_reloading(monkeypatch):
+@pytest.mark.parametrize('world_size,softmax_ranks', [(8,6),(8,5),(4,3),(4,2)])
+def test_actual_upstream_ulysses_changes_geometry_without_reloading(monkeypatch, world_size, softmax_ranks):
     # Exercise the actual pinned runtime's pure configuration code on CPU. Triton
     # kernel bodies/collectives are not executed in this test.
     path = Path(__file__).resolve().parents[1] / "work/upstream/openvdn/src/inference/utils/ulysses_runtime.py"
@@ -36,24 +37,24 @@ def test_actual_upstream_ulysses_changes_geometry_without_reloading(monkeypatch)
     spec.loader.exec_module(module)
     resets = []
     cache = GeometryCache(lambda: resets.append(True), max_shapes=2)
-    runtime = module.UlyssesRuntime(0, 8, 0, torch.device("cpu"), "gloo")
-    runtime.enable_branch_parallel(6)
+    runtime = module.UlyssesRuntime(0, world_size, 0, torch.device("cpu"), "gloo")
+    runtime.enable_branch_parallel(softmax_ranks)
     plan = Settings(duration=10, ratio="9:16", resolution=720).render_plan()
     for length in (200, 201, 201, 202):
         cache.prepare(runtime, plan, torch.zeros(length, 3), torch.ones(length, dtype=torch.long), None)
         runtime.configure(length, 56)
         assert sum(runtime.splits) == length
-        assert runtime.softmax_ranks == 6
+        assert runtime.softmax_ranks == softmax_ranks
         assert sum(runtime.softmax_head_splits) == sum(runtime.linear_head_splits) == 56
         cache.commit()
     assert resets == [True]
     fingerprints = []
-    for layout in (6, 4, 0, 6):
+    for layout in (softmax_ranks, softmax_ranks - 1, 0, softmax_ranks):
         runtime.softmax_ranks = layout
         cache.prepare(runtime, plan, torch.zeros(202, 3), torch.ones(202, dtype=torch.long), None)
         runtime.configure(202, 56)
         assert sum(runtime.splits) == 202
-        assert runtime.heads_per_rank == (56 // 8 if layout == 0 else runtime.branch_heads)
+        assert runtime.heads_per_rank == (56 // world_size if layout == 0 else runtime.branch_heads)
         fingerprints.append(cache.last["geometry_id"])
         cache.commit()
     assert len(set(fingerprints)) == 3 and fingerprints[0] == fingerprints[-1]

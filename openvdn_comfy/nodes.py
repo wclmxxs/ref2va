@@ -3,6 +3,11 @@ import io
 import json
 import uuid
 import time
+import os
+from concurrent.futures import ThreadPoolExecutor
+import psutil
+
+_OUTPUT_FINALIZERS = ThreadPoolExecutor(max_workers=2, thread_name_prefix="api-output")
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -10,6 +15,7 @@ import numpy as np
 from PIL import Image
 
 from .config import RUNTIME, Settings, atomic_json
+from .hardware import Hardware
 from .runner import generate
 from .references import download_references, parse_urls
 from .jobs import update_job, read_job
@@ -57,8 +63,8 @@ class OpenVDNH200Generate:
                 "tooltip": "Reference image short edge: preserves aspect, rounds dimensions to 32 pixels. Independent of video resolution."}),
             "fp8": ("BOOLEAN", {"default": True}),
             "inference_kernels": ("BOOLEAN", {"default": True}),
-            "softmax_backend": (["flex", "decomposed", "ref"],),
-            "softmax_ranks": ("INT", {"default": 6, "min": 0, "max": 7}),
+            "softmax_backend": (list(dict.fromkeys([Hardware.from_env().softmax_backend, "flex", "decomposed", "ref"])),),
+            "softmax_ranks": ("INT", {"default": Hardware.from_env().softmax_ranks, "min": 0, "max": Hardware.from_env().world_size - 1}),
             "warmup_steps": ("INT", {"default": 2, "min": 0, "max": 8}),
             "profile": ("BOOLEAN", {"default": False}),
         }, "optional": {"references": ("OPENVDN_REFS",), **cache_inputs(), **optimization_inputs()}}
@@ -68,7 +74,7 @@ class OpenVDNH200Generate:
     FUNCTION = "generate"
     OUTPUT_NODE = True
     CATEGORY = "OpenVDN H200"
-    DESCRIPTION = ("Official 8-NFE / 8×H200 Ulysses, 1344×768 at 24 fps. Ref2VA-like uses FL2VA weights. "
+    DESCRIPTION = ("Official 8-NFE Ulysses, 1344×768 at 24 fps; uses this API instance's GPU group. Ref2VA-like uses FL2VA weights. "
                    "inference_kernels controls the official fused/compiled kernel bundle; it is not a whole-DiT compile switch. "
                    "Optional approximate DBCache; disabled by default. Models are resident; kernel/precision settings must match /openvdn/health. "
                    "warmup_steps is a legacy field; startup performs 8 NFE once, requests perform no extra warmup.")
@@ -109,13 +115,13 @@ class OpenVDNH200Request(OpenVDNH200Generate):
             **{name: legacy[name] for name in ("seed", "reference_short_edge", "fp8", "inference_kernels", "softmax_backend", "softmax_ranks", "warmup_steps", "profile")},
         }, "optional": {**cache_inputs(), **optimization_inputs()}}
 
-    DESCRIPTION = "Reference-image URLs to video. Duration is in seconds, ratio is width:height, resolution is the output short edge. Uses all 8 GPUs and official Ref2VA-like weights."
+    DESCRIPTION = "Reference-image URLs to video. Duration is in seconds, ratio is width:height, resolution is the output short edge. Uses this instance's GPU group and official Ref2VA-like weights."
 
     async def generate(self, prompt, duration, ratio, resolution, reference_image_urls, **kwargs):
         return await self._execute(prompt, duration, ratio, resolution, reference_image_urls, **kwargs)
 
     async def _execute(self, prompt, duration, ratio, resolution, reference_image_urls,
-                       *, prepared_references=None, **kwargs):
+                       *, prepared_references=None, defer_result=False, **kwargs):
         import folder_paths
         import comfy.model_management as mm
         from comfy_api.input_impl import VideoFromFile
@@ -140,18 +146,31 @@ class OpenVDNH200Request(OpenVDNH200Generate):
             import asyncio
             result = await asyncio.to_thread(generate, prompt=prompt, refs=refs, settings=settings, output=output,
                               interrupt=mm.throw_exception_if_processing_interrupted,
-                              progress=lambda phase: update_job(job_id, status="running", phase=phase))
-            result["timings"].update(reference_download_seconds=download_seconds, api_queue_seconds=queue_seconds,
-                                     processing_wall_seconds=prepared_seconds + time.monotonic() - started,
-                                     api_wall_seconds=queue_seconds + prepared_seconds + time.monotonic() - started)
-            if prepared_references is not None:
-                result["timings"]["input_prepare_seconds"] = prepared_seconds
-            # Preserve the worker result's schema; adding API timings must not
-            # downgrade schema 6 compilation metrics to the old schema 5 label.
-            atomic_json(str(output) + ".metrics.json", result)
-            atomic_json(Path(result["log_directory"]) / "result.json", result)
-            video = {"filename": name, "subfolder": "openvdn", "type": "output"}
-            update_job(job_id, status="succeeded", phase="complete", video_url="/view?" + urlencode(video), metrics=result)
+                              progress=lambda phase: update_job(job_id, status="running", phase=phase), defer_output=defer_result)
+            def finish(result):
+                result["timings"].update(reference_download_seconds=download_seconds, api_queue_seconds=queue_seconds,
+                                         processing_wall_seconds=prepared_seconds + time.monotonic() - started,
+                                         api_wall_seconds=queue_seconds + prepared_seconds + time.monotonic() - started)
+                if prepared_references is not None:
+                    result["timings"]["input_prepare_seconds"] = prepared_seconds
+                # Preserve the worker result's schema; adding API timings must not
+                # downgrade schema 6 compilation metrics to the old schema 5 label.
+                atomic_json(str(output) + ".metrics.json", result)
+                atomic_json(Path(result["log_directory"]) / "result.json", result)
+                video = {"filename": name, "subfolder": "openvdn", "type": "output"}
+                update_job(job_id, status="succeeded", phase="complete", video_url="/view?" + urlencode(video), metrics=result)
+                return result, video
+            if defer_result:
+                update_job(job_id, status="running", phase="encoding_output",
+                           output_owner={"pid": os.getpid(), "created": psutil.Process().create_time()})
+                def complete():
+                    try:
+                        finish(result.finish())
+                    except BaseException as error:
+                        update_job(job_id, status="failed", phase="failed", error=str(error))
+                _OUTPUT_FINALIZERS.submit(complete)
+                return {"result": (job_id,)}
+            result, video = finish(result)
             return {"ui": {"openvdn_videos": [video]},
                     "result": (VideoFromFile(str(output)), json.dumps(result, ensure_ascii=False, indent=2))}
         except BaseException as error:
@@ -165,6 +184,9 @@ class OpenVDNH200BusinessRequest(OpenVDNH200Request):
     def INPUT_TYPES(cls):
         return {"required": {"job_id": ("STRING",)}}
 
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("job_id",)
+
     DESCRIPTION = "Internal gateway task. Submit reference images through the business API."
 
     async def generate(self, job_id):
@@ -173,11 +195,11 @@ class OpenVDNH200BusinessRequest(OpenVDNH200Request):
         if context is None or context.prompt_id != job_id:
             raise ValueError("Prepared request must execute in its original queued task")
         record = read_job(job_id)
-        if not record or "business" not in record or record["status"] != "queued":
+        if not record or "settings" not in record or "resolved_references" not in record or record["status"] != "queued":
             raise ValueError("Prepared gateway task is unavailable or already executed")
         request = record["request"]
         return await self._execute(request["prompt"], reference_image_urls="",
-                                   prepared_references=record["resolved_references"], **record["settings"])
+                                   prepared_references=record["resolved_references"], defer_result=True, **record["settings"])
 
 
 def cache_inputs():
@@ -197,7 +219,7 @@ NODE_CLASS_MAPPINGS = {"OpenVDNReference": OpenVDNReference, "OpenVDNH200Generat
                        "OpenVDNH200Request": OpenVDNH200Request,
                        "OpenVDNH200BusinessRequest": OpenVDNH200BusinessRequest}
 NODE_DISPLAY_NAME_MAPPINGS = {"OpenVDNReference": "OpenVDN · Reference Image",
-                              "OpenVDNH200Generate": "OpenVDN · 8×H200 · 8 NFE (Ref2VA-like)",
+                              "OpenVDNH200Generate": "OpenVDN · 8 NFE (Ref2VA-like)",
                               "OpenVDNH200Request": "OpenVDN · URL References · Duration / Ratio / Resolution",
                               "OpenVDNH200BusinessRequest": "OpenVDN · Gateway Task (internal)"}
 
