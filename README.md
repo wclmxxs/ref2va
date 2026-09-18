@@ -108,7 +108,7 @@ bash deploy.sh render \
 | `REF2VA_WARMUP_RECENT` | 0 | 默认不回放历史；可手动增加，最大为编译形状容量减 1 再减额外时长数 |
 | `REF2VA_WARMUP_DURATIONS` | 空 | 默认不额外预热时长；可设 `5,8,10,15`，最多四个 4–15 秒的值 |
 | `REF2VA_WARMUP_VERIFY` | 0 | 默认不复跑预热集验证热命中；1 开启该诊断检查，会增加启动时间 |
-| `REF2VA_TOKEN_BUCKET` | 1024 | Flex 路径的非生成视频 token 容量步长；0 关闭，或 256/512/1024/2048；只在 token 层补齐，不修改参考图或视频尺寸 |
+| `REF2VA_TOKEN_BUCKET` | 0 | 默认使用原生 FA4 路径，不补齐 token；256/512/1024/2048 显式开启实验性分桶，实测会增加 H200 热态耗时 |
 | `REF2VA_WARMUP_DURATION` | 10 | 启动预热时长 |
 | `REF2VA_WARMUP_RATIO` | 9:16 | 启动预热画幅 |
 | `REF2VA_WARMUP_RESOLUTION` | 768 | 启动预热短边 |
@@ -160,17 +160,27 @@ cd /root/ref2va && git pull --ff-only && bash deploy.sh start
 
 原先每 8 种几何配置就重置全部编译记录，现默认允许 32 种成功配置，并给每个静态 helper 预留多版本编译预算。超过容量才轮换 Dynamo 图，mask 的原有 64 项 LRU 不随之清空。保留超出编译预算直接报错的行为，避免 Flex 静默进入高显存 eager 路径。`geometry_seen` 仅表示进程执行过该输入布局，实际新图编译与磁盘缓存命中另由 PyTorch 计数返回，不能混为一谈。
 
-启动先用实际 FA4 校验补齐位置不会泄漏到有效输出，再完成一次完整 8 NFE、视频/音频 VAE、输出编码和原有数值校验。补齐检查覆盖不同有效长度和完整/局部窗口，失败则不开放服务，记录在 `.runtime/backend/token-bucket-parity.json`。它是注意力组件检查，不是全模型质量证明。
+默认启动完成一次完整 8 NFE、视频/音频 VAE、输出编码和原有数值校验。仅显式开启 token 分桶时，额外用实际 FA4 校验补齐位置不会泄漏到有效输出；补齐检查覆盖不同有效长度和完整/局部窗口，失败则不开放服务，记录在 `.runtime/backend/token-bucket-parity.json`。它是注意力组件检查，不是全模型质量证明。
 
-默认仅完成上述一次基础预热和正确性检查就开放服务，不预热全部时长、不回放历史 case、不再复跑整个集合。模型保持 GPU 常驻；token 分桶、进程内图缓存、磁盘编译缓存和条件缓存继续保留。新档位在第一次实际请求时编译，允许该次较慢，后续同档请求复用；运行时命中率和耗时仍逐次返回。
+默认仅完成上述一次基础预热和正确性检查就开放服务，不预热全部时长、不回放历史 case、不再复跑整个集合。模型保持 GPU 常驻；进程内图缓存、磁盘编译缓存和条件缓存继续保留。默认使用真实 token 长度，新计算规格在第一次实际请求时可能编译，后续兼容请求复用；运行时命中率和耗时仍逐次返回。
 
 额外预热可显式开启：`REF2VA_WARMUP_DURATIONS=5,8,10,15` 预热指定时长，`REF2VA_WARMUP_RECENT=27` 回放最近成功请求。历史从本地 `.runtime/backend/warmup-history.json` 和相同源码/模型版本最近 200 个成功 jobs 补齐，直接复用 `.pt`，不重新下载或编码，不输出重复视频。二者默认均关闭。
 
 `REF2VA_WARMUP_VERIFY=1` 可额外复跑所选集合，要求所有 rank 无新图编译才完成启动；默认关闭。健康接口 `startup_warmup.complete` 表示配置要求的启动检查完成；未执行热态复跑时 `verification_requested=false, verified_requests=0, all_runtime_graphs_reused=null`，不会把未检测伪装成全部命中。报告仍写入 `.runtime/backend/warmup-report.json`。
 
-Flex 默认把 `[文本/视觉条件 | 参考图 latent | 音频 | 视频]` 的非视频前缀补到 1024 token 的倍数，最多增加 1023 行。补齐放在音频与生成视频之间，真实 position_ids、参考图几何、文本行、噪声生成顺序均保留。窗口 BlockMask 使用容量形状，score modifier 用设备上的有效长度排除补齐 key（含 full blocks）；同档不同有效长度不改变 Python 标量 guard。线性注意力的文本状态只读取真实文本行，保留真实长度的归一化尺度；DBCache 的误差分组也排除补齐行。RDT 开关/阈值保持原请求值。
+Token 分桶作为实验选项保留：例如 `REF2VA_TOKEN_BUCKET=1024` 把 `[文本/视觉条件 | 参考图 latent | 音频 | 视频]` 的非视频前缀补到 1024 token 的倍数，最多增加 1023 行。补齐放在音频与生成视频之间，真实 position_ids、参考图几何、文本行、噪声生成顺序均保留。窗口 BlockMask 使用容量形状，score modifier 用设备上的有效长度排除补齐 key（含 full blocks）；同档不同有效长度不改变 Python 标量 guard。线性注意力的文本状态只读取真实文本行，保留真实长度的归一化尺度；DBCache 的误差分组也排除补齐行。RDT 开关/阈值保持原请求值。
 
-只对 Flex 路径分桶；decomposed/ref 自动使用原始布局。保持 FA4 静态编译，不直接改 `dynamic=True`。可用 `REF2VA_TOKEN_BUCKET=0 bash deploy.sh start` 关闭分桶，历史预热和耗时统计仍可使用。补齐可能改变 GEMM/归约的浮点顺序，并增加少量计算，不承诺逐位相等或固定加速比，需 H200 对比实际输出和热态延迟。
+只对 Flex 路径分桶；decomposed/ref 自动使用原始布局。保持 FA4 静态编译，不直接改 `dynamic=True`。2026-09-18 的同一「走廊功夫」10 秒案例，参考图短边 768、RDT 0.25、两次均无新编译且缓存步骤均为 4/6，分桶前后去噪为 11.80 / 15.08 秒，视频 VAE 均约 2.15 秒。因此默认关闭分桶；不能只用命中率判断收益。可用 `REF2VA_TOKEN_BUCKET=0 bash deploy.sh start` 显式覆盖旧环境变量。原生路径不安装分桶 attention 包装；参考图短边参数、编译磁盘缓存和耗时统计仍可使用。本次仅恢复默认执行路径，缓存键及容量策略未变，恢复后的 H200 耗时需部署后复测。
+
+### 原生路径的缓存命中条件
+
+- 视频时长以对齐后的采样帧数为准，ratio / resolution 以最终推理画布和潜变量形状为准；输入参数不同但最终形状相同不一定重编译。
+- 提示词的实际 token 数、文本/视觉 token 排列影响条件长度与布局。相同字数不保证相同 token 数；文字内容本身不作为编译缓存键。
+- 参考图短边、长宽比、张数及各图归一化后的 latent / 视觉 token 数影响布局。只替换同处理尺寸的图片像素，不必然产生新编译；条件编码缓存按提示词、图片内容、参考图短边和源码版本另算。
+- 当前 `GeometryCache` 管理签名包含 softmax ranks、推理宽高、采样帧数、embeds 形状、完整 tags 序列、参考锚点及各图 latent 形状。它用于管理 32 种成功配置；新签名不等同于底层新编译。容量满后遇到新签名会整体 reset Dynamo，磁盘缓存及 64 项 mask LRU 保留。
+- 底层编译还检查 tensor shape / stride / dtype / device、attention 分支和编译配置等 guard。mask LRU 按序列布局、窗口、锚帧、设备及 block 大小区分；mask 命中不等于运行图命中。
+- 重启会失去进程内热图；磁盘缓存可能复用，但仍有 tracing / 加载开销。删除缓存目录或改变源码、PyTorch / CUDA / FA4、硬件及编译配置可能使磁盘缓存失效。
+- seed、输出文件名通常不改变 attention 编译规格；RDT 阈值主要影响跨步激活复用和实际执行工作量，应与编译缓存命中分开统计。
 
 `metrics.upstream.compilation` 返回：
 

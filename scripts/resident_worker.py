@@ -137,7 +137,7 @@ def main():
     bucket_stride = compile_options["token_bucket"] if settings.softmax_backend == "flex" else 0
     buckets = TokenBuckets(bucket_stride)
     exact_runtime = ExactRuntime(model.transformer, ulysses, render, active=enabled("REF2VA_EXACT_RUNTIME"),
-                                 block_runtime=dit_runtime, token_buckets=buckets)
+                                 block_runtime=dit_runtime, token_buckets=buckets if bucket_stride else None)
     runtime.barrier()
     if parallel_vae:
         state("loading", "loading_parallel_video_vaes")

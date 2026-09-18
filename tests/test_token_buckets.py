@@ -173,16 +173,22 @@ def test_conditioning_metadata_works_with_new_and_old_cache(tmp_path):
     assert load_conditioning(path, 'cpu')[3]['references'][0]['qwen_grid_thw'] == [1, 64, 48]
 
 
-def test_pinned_forward_rewrites_install_with_and_without_exact_runtime():
+@pytest.mark.parametrize('stride', [0, 1024])
+def test_pinned_forward_rewrites_install_with_and_without_exact_runtime(stride):
     from tests.test_exact_runtime import sources, DummyTransformer
     from openvdn_comfy.exact_runtime import ExactRuntime
     for active in (True, False):
         ulysses, render = sources()
         ulysses._window_softmax_branch = lambda *args: None
+        # The AST fixture omits imports; emulate the native module's binding.
+        ulysses._ulysses_attention_forward.__globals__['_window_softmax_branch'] = ulysses._window_softmax_branch
         model = DummyTransformer(ulysses)
-        state = TokenBuckets()
-        ExactRuntime(model, ulysses, render, active=active, token_buckets=state)
+        state = TokenBuckets(stride) if stride else None
+        blocks = types.SimpleNamespace(install_attention=lambda forwards: None)
+        ExactRuntime(model, ulysses, render, active=active, token_buckets=state, block_runtime=blocks)
         assert model.attn._ref2va_buckets is state
+        if not stride:
+            assert model.attn.forward.__func__.__globals__['_window_softmax_branch'] is ulysses._window_softmax_branch
 
 
 def test_native_linear_branch_receives_only_real_text_and_video_rows():
