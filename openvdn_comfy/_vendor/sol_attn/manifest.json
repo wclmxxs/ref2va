@@ -3,7 +3,7 @@
   "revision": "bb60499af0e675095ff67424196d8c18e265f32a",
   "source_path": "models/minimax_h3/Sol-H3/h3_runtime/third_party/sol_attn",
   "license_statement": "https://nvlabs.github.io/Sana/Sol-Engine/Sol-H3/ (Apache-2.0 for Sol-H3 code; FlashAttention-derived files retain BSD-3-Clause)",
-  "changes": "Private-namespace import rewriting; SM90 compatibility converter accepts CuTe 4.6 keyword arguments and is scoped to Sol compilation. Rectangular host adapter is maintained separately in openvdn_comfy/sol_kernel.py. Upstream SM90 CUDA math is unchanged.",
+  "changes": "Private-namespace import rewriting; SM90 compatibility converter accepts CuTe 4.6 keyword arguments and is scoped to Sol compilation. Rectangular host adapter is maintained separately in openvdn_comfy/sol_kernel.py. Upstream SM90 CUDA math is unchanged. Private fmax helper uses the pinned CuTe 4.6 inferred-result NVVM signature independent of CUDA version; operation, operands, attributes and reduction order unchanged.",
   "files": [
     {
       "path": "_vendor/__init__.py",
@@ -88,7 +88,7 @@
     {
       "path": "_vendor/flash_attn/cute/utils.py",
       "upstream_sha256": "26a7577a2fb4f4a21fd27910c229896c687d13bda60481cd196471190b9f1222",
-      "sha256": "7b7ba9e492f072ae6d812bfc492a09ce76b1432c36270d2bdd5beee150e5806d"
+      "sha256": "f1c888750983222c4b2391eb67033fdb2d40259c67fa50a7fc34de23d2462382"
     },
     {
       "path": "common/__init__.py",

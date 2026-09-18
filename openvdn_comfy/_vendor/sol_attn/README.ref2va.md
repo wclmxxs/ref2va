@@ -23,3 +23,8 @@ CUDA math is otherwise unchanged. No SM100/SM120 backend is exposed here.
 The SM90 compatibility converter accepts CuTe 4.6's keyword arguments. Its
 legacy NamedTuple handling is scoped to Sol compilation and restored in a
 finally block, rather than changing the resident FA4 converter on import.
+
+The private FlashAttention `fmax` helper uses the inferred-result NVVM binding
+shipped in pinned CuTe 4.6.0.dev0, including its CUDA 12.9 build. The upstream
+CUDA-version test incorrectly selected the old explicit-result signature on
+that build. The operation, operands, attributes and reduction order are unchanged.

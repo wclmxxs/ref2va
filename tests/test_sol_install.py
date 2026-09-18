@@ -91,3 +91,37 @@ def test_sol_converter_preserves_new_keywords_and_restores_native_on_error():
     # Importing Sol must not globally replace the converter before the context.
     assert not any(isinstance(node, ast.Assign) and any(isinstance(target, ast.Attribute)
                    and target.attr == '_convert_single_arg' for target in node.targets) for node in parsed.body)
+
+
+@pytest.mark.parametrize('cuda_version', [(12, 9), (13, 0)])
+@pytest.mark.parametrize('third', [None, -2., 8.])
+def test_sol_fmax_uses_pinned_nvvm_signature_independent_of_cuda(monkeypatch, cuda_version, third):
+    import ast
+    import sys
+    from types import SimpleNamespace
+    root = Path(__file__).resolve().parents[1]
+    source = root/'openvdn_comfy/_vendor/sol_attn/_vendor/flash_attn/cute/utils.py'
+    function = next(node for node in ast.parse(source.read_text()).body
+                    if isinstance(node, ast.FunctionDef) and node.name == 'fmax')
+    # Exercise the real wrapper against CuTe 4.6.0.dev0's generated NVVM API.
+    # No native CUDA/MLIR libraries are available in the macOS test environment.
+    calls = []
+    class Float32:
+        def __init__(self, value):
+            self.value = value.value if isinstance(value, Float32) else value
+
+        def ir_value(self, *, loc=None, ip=None):
+            return self.value
+
+    def nvvm_fmax(a, b, *, c=None, ftz=None, nan=None, abs=None, results=None, loc=None, ip=None):
+        calls.append((a, b, c, ftz, nan, abs, results, loc, ip))
+        return max(a, b) if c is None else max(a, b, c)
+
+    monkeypatch.setitem(sys.modules, 'cutlass', SimpleNamespace(
+        CUDA_VERSION=SimpleNamespace(major=cuda_version[0], minor=cuda_version[1])))
+    namespace = dict(Float32=Float32, nvvm=SimpleNamespace(fmax=nvvm_fmax),
+                     T=SimpleNamespace(f32=lambda: 'f32'), dsl_user_op=lambda fn: fn)
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(source), 'exec'), namespace)
+    result = namespace['fmax'](Float32(-4.), 3., third, loc='location', ip='insertion')
+    assert result.value == (8. if third == 8. else 3.)
+    assert calls == [(-4., 3., third, None, None, None, None, 'location', 'insertion')]
