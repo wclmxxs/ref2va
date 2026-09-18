@@ -159,17 +159,20 @@ class SolKernel:
             k = torch.randn((2, tk, heads, 128), generator=generator, device=device, dtype=torch.bfloat16)
             v = torch.randn(k.shape, generator=generator, device=device, dtype=torch.bfloat16)
             for exact in (True, False):
+                case = (f'Tq={tq}, Tk={tk}, heads={heads}, sink_tokens={sink}, '
+                        f'all_exact={exact}, completed_checks={len(results)}')
                 out = self(q, k, v, scale=128**-.5, tau=1., sink_tokens=sink, all_exact=exact)
                 ref = sol_reference(q, k, v, scale=128**-.5, tau=1., sink_tokens=sink, all_exact=exact)
                 if not torch.isfinite(out).all():
-                    raise RuntimeError('Sol SM90 arithmetic check produced nonfinite output')
+                    raise RuntimeError(f'Sol SM90 arithmetic check produced nonfinite output: {case}')
                 error = (out.float()-ref).abs()
                 relative = float(torch.linalg.vector_norm(error)/torch.linalg.vector_norm(ref).clamp_min(1e-8))
                 maximum = float(error.max())
                 # BF16 centroid/value-sum and probability products introduce
                 # rounding. Check rectangular routing and tails before generation.
                 if relative > .025 or maximum > .08:
-                    raise RuntimeError(f'Sol SM90 arithmetic check failed: relative={relative}, max={maximum}')
+                    raise RuntimeError(f'Sol SM90 arithmetic check failed: {case}, '
+                                       f'relative={relative}, max={maximum}')
                 results.append(dict(tq=tq, tk=tk, heads=heads, sink_tokens=sink,
                                     all_exact=exact, relative_l2=relative, max_abs=maximum))
         self.validated[key] = {'passed': True, 'cases': results}

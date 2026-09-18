@@ -83,8 +83,31 @@ def test_reference_approximation_uses_value_sums_and_real_tail_lengths():
     k = torch.zeros((1, 197, 1, 8), dtype=torch.bfloat16)
     v = torch.arange(197, dtype=torch.float32)[None, :, None, None].expand_as(k).to(torch.bfloat16)
     actual = sol_reference(q, k, v, scale=.2, tau=1)
-    rounded_sum = sum(x.float().sum(1).to(torch.bfloat16).float() for x in v.split(64, 1))
-    torch.testing.assert_close(actual, (rounded_sum/197)[:, None].expand_as(actual))
+    for block, query in enumerate(actual.split(64, 1)):
+        # Near-diagonal blocks are exact even for zero logits. Other blocks
+        # contribute BF16-rounded V sums, including the five-token final block.
+        total = sum(x.float().sum(1) if abs(i-block) <= 1 else
+                    x.float().sum(1).to(torch.bfloat16).float()
+                    for i, x in enumerate(v.split(64, 1)))
+        torch.testing.assert_close(query, (total/197)[:, None].expand_as(query))
+
+
+@pytest.mark.parametrize('sink', [0, 193])
+def test_reference_preserves_forced_neighbor_blocks_below_threshold(sink):
+    import math
+    # All block centroids are zero, so none passes the positive threshold.
+    # Alternating +/-1 K=V makes exact attention observably different from
+    # centroid attention. The expected value follows directly from exp(+/-1).
+    q = torch.ones((1, 193, 1, 1), dtype=torch.bfloat16)
+    k = torch.zeros((1, 261, 1, 1), dtype=torch.bfloat16)
+    k[:, :256:2] = 1
+    k[:, 1:256:2] = -1
+    result = sol_reference(q, k, k, scale=1., tau=4., sink_tokens=sink)
+    for block, query in enumerate(result.split(64, 1)):
+        exact_blocks = {i for i in range(4) if abs(i-block) <= 1 or i < (sink+63)//64}
+        count = 64*len(exact_blocks)
+        expected = count*math.sinh(1)/(count*math.cosh(1)+(261-count))
+        torch.testing.assert_close(query, torch.full_like(query, expected), rtol=1e-6, atol=1e-6)
 
 
 def test_sol_options_reach_api_and_ui():

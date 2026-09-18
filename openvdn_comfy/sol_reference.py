@@ -12,12 +12,17 @@ def sol_reference(q, k, v, *, scale, tau, sink_tokens=0, all_exact=False):
     mean = kc.mean(1)
     variance = (kc.square().mean(1) - mean.square()).clamp_min(0)
     result = []
-    for query in q.split(64, dim=1):
+    key_blocks = torch.arange(kc.shape[1], device=q.device)
+    for query_block, query in enumerate(q.split(64, dim=1)):
         qb = query.float().mean(1)
         threshold = (qb * mean).sum(-1) * scale / math.log(2)
         threshold += tau * ((qb.square() * variance).sum(-1) * (scale / math.log(2))**2 + 1e-6).sqrt()
         centroid_logits = torch.einsum('bqhd,bkhd->bhqk', query.float(), kc) * scale
         exact = centroid_logits.mean(2) / math.log(2) > threshold[..., None]
+        # The pinned Sol selector always keeps q_block +/- 1 exact, including
+        # below-threshold blocks. These are the packed window block indices.
+        # See common/selector.py::sol_attn_route_is_exact; sinks are additional.
+        exact |= (key_blocks-query_block).abs() <= 1
         exact[..., :(sink_tokens+63)//64] = True
         if all_exact:
             exact.fill_(True)
