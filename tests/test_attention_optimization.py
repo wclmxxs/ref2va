@@ -29,6 +29,18 @@ def test_optimization_controls_roundtrip_and_reject_incompatible_modes():
             replace(settings, **{name:1}).validate()
 
 
+@pytest.mark.parametrize('removed', [dict(attention_kernel='sol'), dict(sol_tau=1.),
+                                   dict(sol_dense_steps=1), dict(sol_dense_layers=2)])
+def test_removed_backend_options_fail_validation_before_queueing(removed):
+    body = dict(prompt='hello', reference_image_urls=['https://example.com/ref.png'],
+                duration=10, ratio='9:16', resolution=768)
+    with pytest.raises(ValueError):
+        normalize_request({**body, **removed})
+    controls = OpenVDNH200Request.INPUT_TYPES()['optional']
+    assert controls['attention_kernel'][0] == ['native', 'decomposed']
+    assert not (set(removed)-{'attention_kernel'}) & set(controls)
+
+
 @pytest.mark.parametrize('prefix', [1, 3, 4])
 @pytest.mark.parametrize('full', [False, True])
 def test_padding_mask_preserves_native_attention_for_all_real_queries(prefix, full):

@@ -48,9 +48,6 @@ class Settings:
     fast_communication: bool = True
     linear_stats_chunk_frames: int = 16
     attention_kernel: str = "native"
-    sol_tau: float = 1.0
-    sol_dense_steps: int = 1
-    sol_dense_layers: int = 2
     isolate_padding: bool = False
     streaming_output: bool = True
     cleanup_policy: str = "adaptive"

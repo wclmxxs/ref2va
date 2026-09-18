@@ -35,11 +35,6 @@ download_models() {
     .venv-vdn/bin/python scripts/download.py "$@"
 }
 
-install_sol() {
-    [[ -x .runtime/bin/uv && -x .venv-vdn/bin/python ]] || { echo 'Run bash deploy.sh install first'; exit 1; }
-    .venv-vdn/bin/python scripts/install_sol.py
-}
-
 check_runtime() {
     [[ -x .venv-vdn/bin/python ]] || { echo 'Run ./deploy.sh install first'; exit 1; }
     .venv-vdn/bin/python scripts/doctor.py "$@"
@@ -70,7 +65,6 @@ case "$action" in
     start_ui "$@"
     ;;
   install) install_environment ;;
-  install-sol) install_sol ;;
   download) download_models "$@" ;;
   check) check_runtime "$@" ;;
   start)
@@ -81,7 +75,7 @@ case "$action" in
     exec .venv-ui/bin/python scripts/render.py "$@"
     ;;
   help|-h|--help)
-    echo 'Usage: bash deploy.sh [deploy | install | install-sol | download | check [--nccl] | start | render --help]'
+    echo 'Usage: bash deploy.sh [deploy | install | download | check [--nccl] | start | render --help]'
     echo 'No arguments: install, download, check eight GPUs, and start ComfyUI.'
     ;;
   *) echo "Unknown action: $action" >&2; exit 2 ;;

@@ -11,8 +11,7 @@ except ImportError:
     from scripts.benchmark_optimizations import Client, save
 
 BASELINE = dict(fast_communication=False, attention_kernel='native', isolate_padding=False,
-                streaming_output=False, cleanup_policy='always', linear_stats_chunk_frames=16,
-                sol_tau=1., sol_dense_steps=1, sol_dense_layers=2)
+                streaming_output=False, cleanup_policy='always', linear_stats_chunk_frames=16)
 COMBINED = {**BASELINE, 'fast_communication':True, 'streaming_output':True, 'cleanup_policy':'adaptive'}
 VARIANTS = {
     'baseline': BASELINE,

@@ -2,7 +2,7 @@
 
 一条视频使用全部 8 张 H200。ComfyUI 负责输入、队列和视频预览；常驻八卡进程调用固定版本的 [OpenVDN](https://github.com/OpenVDN/vdn-minimax-h3)，默认 FP8、6 个 softmax rank + 2 个 linear rank、8 NFE。
 
-图片参考模式是官方 **Ref2VA-like**：FL2VA 权重接收参考图，不是 MiniMax 的独立 Ref2VA transformer。支持默认关闭的 DBCache 跨步缓存、可选 Sol 窗口 softmax；暂不接入 LightX2V 或整块 DiT 编译；`inference_kernels` 控制官方融合/局部编译内核组合。
+图片参考模式是官方 **Ref2VA-like**：FL2VA 权重接收参考图，不是 MiniMax 的独立 Ref2VA transformer。支持默认关闭的 DBCache 跨步缓存；暂不接入 LightX2V 或整块 DiT 编译；`inference_kernels` 控制官方融合/局部编译内核组合。
 
 ## 一条命令启动
 
@@ -218,7 +218,7 @@ python3 scripts/benchmark_compile_cache.py --server http://43.218.119.131:8188 \
 
 ## 单次请求内的 DiT 去重与同步优化（schema 4）
 
-默认 `REF2VA_EXACT_RUNTIME=1`。默认关闭 DBCache 时完整运行 8 次 DiT，保留所有注意力和线性分支、FP8 设置、权重及采样器，不启用 Sol 或跨步残差缓存：
+默认 `REF2VA_EXACT_RUNTIME=1`。默认关闭 DBCache 时完整运行 8 次 DiT，保留所有注意力和线性分支、FP8 设置、权重及采样器，不启用跨步残差缓存：
 
 - 同一次请求的 `RoPE(position_ids)`、`token_refiner(context_embedder(prompt_embeds))` 只计算一次，其余 7 次复用。输入存储、形状、stride、版本、dtype、设备与 autocast 变化会失效；请求结束或异常立即释放。不同请求不共享这些结果。
 - 每层线性输出投影的 GPU 布尔索引/`any()`/`sum().item()` 改为 CPU 已知区间切片，保留原 GEMM 的输入形状、连续布局和精度。
@@ -226,7 +226,7 @@ python3 scripts/benchmark_compile_cache.py --server http://43.218.119.131:8188 \
 
 适配层只接受固定 OpenVDN 函数的完整源码 hash，保持 `.deps` 工作区不变；源码或注意力方法不匹配直接拒绝启动。启动及历史预热时，在相同输入上对比缓存常量与重算结果、每个 attention 模块第一次输出投影与原始布尔索引路径，要求有限且逐元素一致。各卡先完成去噪并交换校验状态，再统一报错，避免某一卡在 collective 前退出。记录位于 `.runtime/backend/exact-runtime-parity.json`、`warmup-report.json` 以及每次结果的 `upstream.exact_runtime.by_rank`。这是组件和预热案例校验，不是所有提示词的端到端质量证明；本地 CPU 通过也不代表 H200 已测性能。
 
-两个开关都只在启动配置：需要回退本轮优化时执行 `REF2VA_EXACT_RUNTIME=0 REF2VA_ASYNC_OUTPUT=0 bash deploy.sh start`，其余模型、并行 VAE 和编译缓存配置不变。`/openvdn/health` 返回开关及 `metrics_schema_version: 5`。
+两个开关都只在启动配置：需要回退本轮优化时执行 `REF2VA_EXACT_RUNTIME=0 REF2VA_ASYNC_OUTPUT=0 bash deploy.sh start`，其余模型、并行 VAE 和编译缓存配置不变。`/openvdn/health` 返回开关及 `metrics_schema_version: 9`。
 
 `GET /openvdn/jobs/{id}` 成功结果的 `metrics.timings` 返回秒数：
 
@@ -324,7 +324,7 @@ python3 scripts/benchmark_optimizations.py \
 
 输出 `results.json`、`summary.json`、`report.md` 和每次请求/完整响应，包括视频链接、缓存命中数、编译情况、每卡分析。报告的耗时只统计独立热态样本中位数，不混入预热或 profile；须另外观看缓存与无缓存视频比较动作、身份和音画同步。未完成 H200 实测前，不承诺某种布局或缓存阈值一定更快。
 
-## Attention、通信与流式输出优化（schema 7）
+## Attention、通信与流式输出优化（schema 9）
 
 ```bash
 cd /root/ref2va && git pull --ff-only && bash deploy.sh start
@@ -367,71 +367,3 @@ NCCL_NVLS_ENABLE=0 .venv-vdn/bin/torchrun --standalone --nproc_per_node=8 script
 ```
 
 覆盖 1+7 至 7+1 的 pack/unpack/NCCL，以及 FA4 隔离窗口/full-cover 和 decomposed 对 fp32 dense 参考的容差校验。**本地 CPU 回归通过不等于 H200 新路径已通过；只有服务器校验与热态对照完成后才能报告实际加速。**
-
-## Sol 窗口 attention（schema 8，H100/H200 实验后端）
-
-更新并补齐可选依赖，只执行这一条；不重新下载模型，不更换 CUDA PyTorch：
-
-```bash
-cd /root/ref2va && git pull --ff-only && bash deploy.sh install-sol && bash deploy.sh start
-```
-
-默认仍使用 `attention_kernel=native`，启动不会全量预热 Sol。首次请求选择 Sol 时，各 rank 先执行独立数学参考校验，包括 Q/K 不等长、尾块、全精确及稀疏分支；失败明确报错，不静默退回原 attention。第一次出现的形状可能编译，之后复用进程内 CuTe callable 和 Triton 编译缓存。CuTe callable 最多保留 128 个形状（LRU）；不把重启后首次加载宣称为进程内命中。依赖导入通过不等于 H200 数值/性能验证通过。
-
-`install-sol` 使用 FA4 `4.0.0b26` / quack 要求的 `nvidia-cutlass-dsl==4.6.0.dev0`，显式允许该预发行版。它保留已安装的 torch（包括 cu129 后缀）、torchvision、triton、FA4、quack 版本，先联合解析依赖，再安装并检查三套内核的导入。如果此前被 Sol 安装命令升到 4.7.1，再执行同一条更新命令即可：脚本会先移除 4.7 拆出的 `libs-core` / `libs-cu12`，再恢复 4.6，避免共享路径残留；不通过跳过依赖检查掩盖冲突。
-
-在原请求中增加：
-
-```json
-{
-  "attention_kernel": "sol",
-  "sol_tau": 1.0,
-  "sol_dense_steps": 1,
-  "sol_dense_layers": 2,
-  "softmax_ranks": 6
-}
-```
-
-- `attention_kernel`：`native / decomposed / sol`，支持 REST、ComfyUI 和 CLI 逐请求切换。
-- `sol_tau`：0–4，默认 1.0。阈值越大，通常越多局部 K/V 块使用质心近似。0 也不是全精确模式；要关闭 Sol 用 `native`。这是 Sol 路由阈值，和 `cache_dit_threshold` 的 RDT 无关。
-- `sol_dense_steps`：前多少次 DiT 调用沿用原 attention，0–8，默认 1。
-- `sol_dense_layers`：每次 DiT 调用的前多少层沿用原 attention，0–50，默认 2。两项任一达到最大值就不会实际执行 Sol。
-- `isolate_padding` 可与 Sol 同开。原路径的保留层/步用现有 BlockMask，Sol 窗口先排除 padding key 再计算；不通过 score_mod，也不将 Q 补成 K 的长度。排除 padding 会改变物理 K 长度，因此原始 prefix 变化可能产生新的 Sol 形状。
-
-实现固定 NVIDIA [Sol-H3 SM90 源码](https://github.com/NVlabs/Sana/tree/bb60499af0e675095ff67424196d8c18e265f32a/models/minimax_h3/Sol-H3/h3_runtime/third_party/sol_attn)，在其矩形 host 适配层按相同 Q/K 长度批量处理 VDN 窗口。**只近似局部视频 softmax 的一部分 key 块**；保持原窗口可见域，文本、参考、音频及 anchor keys 作为精确 sink（向外对齐 64，最多额外保留 63 个局部 key），全局/anchor query 行精确计算。VDN 线性分支、gate、输出投影、RoPE、权重及 8 NFE 不变。原先 full-cover 层仍用原生 dense 分支。Sol 是近似优化，不能保证画质或数值等同；默认参数是测试起点，不是已验证质量预设。
-
-可继续使用 Cache-DiT RDT 0.25。切换 native→Sol 的那一步会在所有 rank 清空旧残差，避免复用上个计算阶段的残差；其后仍按 RDT 实际判断。首次效果对照建议先保持相同 seed/提示词/参考图和缓存参数，同时记录实际缓存步数；要单独分析 Sol 的误差，再关闭 Cache-DiT 比较。
-
-Sol 的 K/V 预处理显式使用 FP32 累加，最后写回 BF16 质心与块内 V 总和。当前 Triton 3.7.1 的 `sum` 实现不会自动提升浮点输入类型；直接累加 BF16 会在阈值附近翻转稀疏路由。此修复不修改路由规则、`sol_tau` 或数值校验容差，也不影响 `native` attention。
-
-返回 `metrics.upstream.optimizations.attention`：
-
-- `sol.sparse_executed`、`sparse_kernel_launches_all_ranks`：是否真的调用，以及各 rank 调用总数。调用不等于加速或测得稀疏率；不在热路径额外同步统计每个选中块。
-- `by_rank[].sol`：原 attention 的步/层保留原因、dense/window query 行数、保护 key 数、过渡残差清理、校验结果、源码版本和实际参数。
-- `compilation.sol_compile_misses / sol_preprocess_signatures`：CuTe 首次形状、预处理首次签名。任一非零就把 `runtime_graph_reused` 标为 false，不能混进热态结论。
-- `timings.sol_compile_seconds` 是各 rank 最大 CuTe 编译/加载墙钟时间；`sol_preprocess_cold_seconds` 包括首次预处理的编译、autotune 和执行，不是纯编译时间。两项已包含在去噪耗时里，不可重复相加。首次小张量校验在 `condition_load_seconds` 内，另记 `verification_seconds`。
-
-可选：空闲时运行不加载模型的八卡校验，覆盖 6+2、5+3、4+4 的不等长 head 分片尺寸：
-
-```bash
-NCCL_NVLS_ENABLE=0 .venv-vdn/bin/torchrun --standalone --nproc_per_node=8 scripts/validate_sol_attention.py
-```
-
-如果数值校验失败，在常驻 worker 已停止时运行单卡诊断，无需加载模型：
-
-```bash
-.venv-vdn/bin/python scripts/diagnose_sol_attention.py
-```
-
-脚本保留校验器的随机数序列，检查 9/10/11/12/14 heads 的精确路径、稀疏路径、重复执行、预处理及 CPU 参考结果。数值不匹配会继续收集其他 head 的结果，最终以非零退出，不会放宽容差或启动服务。报告和失败的合成张量保存在 `output/sol-diagnostics/<run_id>/`，`latest.json` 指向最近一次；保存的均为随机测试输入，无模型权重或用户素材。ComfyUI 仍运行时可通过现有 `/view` 接口读取这些诊断文件。
-
-通过的 case 也记录 K/V 汇总、阈值偏差及独立计算的路由差异，方便核对精度修复。预处理中 V 总和的量级与 attention 输出不同，因此只报告偏差，不套用 attention 输出的绝对容差。
-
-部署后用同一份请求跑热态对照（默认 native/Sol 两组，各 1 次冷、3 次热；不重启）：
-
-```bash
-python3 scripts/benchmark_sol_attention.py --server http://43.218.119.131:8188 \
-  --request-file case.json --output-dir work/sol-benchmark --repeat 3
-```
-
-可加 `--layouts 6 5 4 --taus 0.5 1 1.5` 检查软最大值分支加速后的负载平衡。脚本保留输入和 Cache-DiT 参数，保存完整请求/响应、视频链接、分步耗时及缓存步数；拒绝把没有实际 Sol 调用、热态仍编译或跨服务实例的结果当成有效对照。`results.json` 包含冷态开销，`summary.json` 只统计有效热态中位数。本地 CPU 验证不包含 CUDA 内核执行，实际提速需在 H200 实测。
