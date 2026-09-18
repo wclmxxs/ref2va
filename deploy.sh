@@ -71,12 +71,17 @@ case "$action" in
     check_runtime
     start_ui "$@"
     ;;
+  up|restart|stop|status|logs)
+    [[ -x .venv-ui/bin/python ]] || { echo 'Run ./deploy.sh install first'; exit 1; }
+    exec .venv-ui/bin/python "$ROOT/scripts/service.py" "$action" "$@"
+    ;;
   render)
     exec .venv-ui/bin/python scripts/render.py "$@"
     ;;
   help|-h|--help)
-    echo 'Usage: bash deploy.sh [deploy | install | download | check [--nccl] | start | render --help]'
+    echo 'Usage: bash deploy.sh [deploy | install | download | check [--nccl] | start | up | restart | stop | status | logs | render --help]'
     echo 'No arguments: install, download, check eight GPUs, and start ComfyUI.'
+    echo 'up: background start with worker auto-recovery; restart: reload; stop/status/logs: service controls.'
     ;;
   *) echo "Unknown action: $action" >&2; exit 2 ;;
 esac

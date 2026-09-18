@@ -70,7 +70,12 @@ def health():
                 warmup.get("complete", warmup.get("all_runtime_graphs_reused")) is True)
     ready = (same_process(owner) and state.get("instance") == owner.get("instance")
              and state.get("status") in ("ready", "busy") and verified)
-    return {**state, "ready": bool(ready)}
+    supervision = read_json(BACKEND / "supervisor.json", {})
+    if supervision:
+        ready = (ready and same_process(supervision.get("controller", {}))
+                 and supervision.get("instance") == state.get("instance")
+                 and supervision.get("status") not in ("recovering", "stopped"))
+    return {**state, "ready": bool(ready), "supervision": supervision}
 
 
 def failure_detail(instance):
@@ -93,7 +98,10 @@ def validate_profile(settings, state=None):
                          "; use the active profile from /openvdn/health or change REF2VA_* and restart.")
 
 
-def call_worker(request, interrupt=lambda: None, progress=lambda phase: None, timeout=3600):
+def call_worker(request, interrupt=lambda: None, progress=lambda phase: None, timeout=None):
+    if timeout is None:
+        from .supervision import Policy
+        timeout = Policy.from_env().request_timeout
     # Caller holds gpu.lock, which serializes UI, REST and CLI requests in this checkout.
     state = health()
     validate_profile(Settings(**request["settings"]), state)
@@ -104,6 +112,7 @@ def call_worker(request, interrupt=lambda: None, progress=lambda phase: None, ti
     atomic_json(BACKEND / "command.json", command)
     previous_phase = None
     cancel_needed = False
+    cancel_reason = "cancelled"
     try:
         while True:
             try:
@@ -125,11 +134,12 @@ def call_worker(request, interrupt=lambda: None, progress=lambda phase: None, ti
                 progress(previous_phase or "inference")
             if time.monotonic() - started > timeout:
                 cancel_needed = True
+                cancel_reason = "timeout"
                 raise TimeoutError(f"OpenVDN request exceeded {timeout}s")
             time.sleep(.2)
     except BaseException:
         # Supervisor terminates the entire group on cancellation, then preloads again.
         # Do not signal a PID supplied by an HTTP request or a stale state record.
         if cancel_needed and not result_path.exists() and health().get("instance") == state["instance"]:
-            atomic_json(BACKEND / "cancel.json", {"instance": state["instance"], "token": token})
+            atomic_json(BACKEND / "cancel.json", {"instance": state["instance"], "token": token, "reason": cancel_reason})
         raise

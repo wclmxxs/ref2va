@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import time
+import traceback
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,7 +19,8 @@ from openvdn_comfy.compile_cache import cache_settings
 from openvdn_comfy.exact_runtime import enabled
 from openvdn_comfy.gpu_cleanup import clear_gpu_applications, stop_tree
 from openvdn_comfy.gpu_check import ensure_free_gpus
-from openvdn_comfy.runner import log_tail, stop_group, worker_environment
+from openvdn_comfy.runner import stop_group, worker_environment
+from openvdn_comfy.supervision import Policy, WorkerWatchdog, fail_pending
 
 
 def process_record(process, instance):
@@ -68,23 +70,8 @@ def launch_worker():
     return process, instance
 
 
-def await_ready(process, timeout=3600):
-    started, phase = time.monotonic(), None
-    while process.poll() is None:
-        current = health()
-        if current["ready"]:
-            print("OpenVDN ready: all models resident; 8-step video/audio warmup complete.", flush=True)
-            return
-        if current.get("phase") != phase:
-            phase = current.get("phase")
-            print(f"OpenVDN startup: {phase}; log: {BACKEND / 'worker.log'}", flush=True)
-        if time.monotonic() - started > timeout:
-            raise TimeoutError("OpenVDN startup exceeded one hour\n" + log_tail(BACKEND / "worker.log"))
-        time.sleep(.5)
-    raise RuntimeError(f"OpenVDN preload failed (code {process.returncode})\n" + failure_detail(health().get("instance")))
-
-
 def main():
+    policy = Policy.from_env()
     startup_settings()  # Validate before stopping an already running deployment.
     parallel_vae_enabled()
     cache_settings()
@@ -94,7 +81,8 @@ def main():
     retire_previous_server()
     lock = (BACKEND / "serve.lock").open("a")
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    atomic_json(BACKEND / "server.json", process_record(psutil.Process(), uuid.uuid4().hex))
+    controller = process_record(psutil.Process(), uuid.uuid4().hex)
+    atomic_json(BACKEND / "server.json", controller)
     worker = ui = None
     instance = None
 
@@ -103,41 +91,98 @@ def main():
 
     signal.signal(signal.SIGTERM, terminate)
     signal.signal(signal.SIGINT, terminate)
+    restart_count, consecutive = 0, 0
+    next_attempt = 0.
+    watchdog = None
+    last_error = None
+    status = None
+
+    def report(value, **extra):
+        nonlocal status
+        status = value
+        atomic_json(BACKEND / "supervisor.json", {
+            "controller": controller, "instance": instance, "status": value,
+            "restart_count": restart_count, "consecutive_failures": consecutive,
+            "last_error": last_error, "policy": asdict(policy), "updated_at": time.time(), **extra})
+
+    def recover(reason, cancelled=False):
+        nonlocal worker, consecutive, restart_count, next_attempt, last_error
+        restart_count += 1
+        consecutive = 0 if cancelled else consecutive + 1
+        last_error = reason
+        report("recovering")  # Reject new requests before stopping any CUDA ranks.
+        if worker is not None:
+            stop_group(worker)
+            # Capture diagnostics after all ranks exit. Preserve the original
+            # result if rank zero has already reported the failing request.
+            detail = reason + "\n" + failure_detail(instance)
+            fail_pending(BACKEND, instance, detail)
+            atomic_json(BACKEND / "failures" / f"{instance}.json",
+                        {"instance": instance, "error": detail, "time": time.time(), "cancelled": cancelled})
+            worker = None
+        delay = 1. if cancelled else policy.delay(consecutive)
+        next_attempt = time.monotonic() + delay
+        report("recovering", retry_at=time.time() + delay)
+        print(f"OpenVDN recovery #{restart_count}: {reason[-2000:]}\nRetrying worker in {delay:g}s; UI remains available.", flush=True)
+
     try:
+        report("loading")
         clear_gpu_applications()
         subprocess.run([str(WORKER_PYTHON), str(ROOT / "scripts/doctor.py"), "--nccl"], check=True, cwd=ROOT)
-        worker, instance = launch_worker()
-        await_ready(worker)
-        command = [str(ROOT / ".venv-ui/bin/python"), str(ROOT / ".deps/ComfyUI/main.py"), "--cpu", "--disable-dynamic-vram",
-                   "--listen", os.environ.get("REF2VA_LISTEN", "0.0.0.0"), "--port", os.environ.get("REF2VA_PORT", "8188"),
-                   "--output-directory", str(ROOT / "output"), "--input-directory", str(ROOT / "input"),
-                   "--user-directory", str(RUNTIME / "comfy-user"),
-                   "--database-url", f"sqlite:///{RUNTIME / 'comfy-user/comfyui.db'}", *sys.argv[1:]]
-        ui = subprocess.Popen(command, cwd=ROOT, start_new_session=True)
-        failed = False
-        while ui.poll() is None:
+        phase = None
+        while True:
+            if ui is not None and ui.poll() is not None:
+                raise RuntimeError(f"ComfyUI exited with code {ui.returncode}")
+            if worker is None:
+                if time.monotonic() < next_attempt:
+                    time.sleep(.3)
+                    continue
+                try:
+                    # Reclaim only our old group during recovery; do not kill
+                    # other services which acquired a GPU after initial startup.
+                    ensure_free_gpus()
+                    worker, instance = launch_worker()
+                    watchdog = WorkerWatchdog(BACKEND, instance, policy)
+                    phase = None
+                    report("loading")
+                except Exception:
+                    recover("Worker launch failed: " + traceback.format_exc())
+                    continue
+            current = health()
             cancel = read_json(BACKEND / "cancel.json", {})
             if cancel.get("instance") == instance:
-                print("Request cancelled; releasing all ranks and reloading the resident backend.", flush=True)
-                atomic_json(BACKEND / "state.json", {"instance": instance, "status": "loading", "phase": "restarting_after_cancel"})
-                stop_group(worker)
-                ensure_free_gpus()  # Never kill unrelated applications during request handling.
-                worker, instance = launch_worker()
-                await_ready(worker)
-                failed = False
-            elif worker.poll() is not None and not failed:
-                stop_group(worker)  # Reap surviving ranks even if torchrun already exited.
-                atomic_json(BACKEND / "state.json", {"instance": instance, "status": "failed", "phase": "failed",
-                            "error": failure_detail(instance)})
-                print("OpenVDN failed. UI remains available for diagnostics; restart with bash deploy.sh start.", flush=True)
-                failed = True
+                timed_out = cancel.get("reason") == "timeout"
+                recover("GPU request timed out" if timed_out else "Request cancelled", cancelled=not timed_out)
+                continue
+            reason = watchdog.check(worker, current)
+            if reason:
+                recover(reason)
+                continue
+            if current.get("phase") != phase:
+                phase = current.get("phase")
+                if not current["ready"]:
+                    print(f"OpenVDN startup: {phase}; log: {BACKEND / 'worker.log'}", flush=True)
+            if current["ready"]:
+                if status != "ready":
+                    report("ready")
+                    print("OpenVDN ready: all models resident; startup checks complete.", flush=True)
+                if consecutive and time.monotonic() - watchdog.ready_since >= policy.stable_seconds:
+                    consecutive = 0
+                    report("ready")
+                if ui is None:
+                    command = [str(ROOT / ".venv-ui/bin/python"), str(ROOT / ".deps/ComfyUI/main.py"), "--cpu", "--disable-dynamic-vram",
+                               "--listen", os.environ.get("REF2VA_LISTEN", "0.0.0.0"), "--port", os.environ.get("REF2VA_PORT", "8188"),
+                               "--output-directory", str(ROOT / "output"), "--input-directory", str(ROOT / "input"),
+                               "--user-directory", str(RUNTIME / "comfy-user"),
+                               "--database-url", f"sqlite:///{RUNTIME / 'comfy-user/comfyui.db'}", *sys.argv[1:]]
+                    ui = subprocess.Popen(command, cwd=ROOT, start_new_session=True)
+                    atomic_json(BACKEND / "ui.json", process_record(ui, instance))
             time.sleep(.3)
-        if ui.returncode:
-            raise RuntimeError(f"ComfyUI exited with code {ui.returncode}")
     finally:
         # Ignore repeated shutdown signals while reaping children.
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         signal.signal(signal.SIGINT, signal.SIG_IGN)
+        report("stopped")
         if ui is not None:
             stop_group(ui)
         if worker is not None:

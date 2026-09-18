@@ -421,13 +421,20 @@ def main():
           warmup_plan=settings.render_plan().metadata(), replayed_shapes=len(replay_box[0]))
     print(f"Rank {runtime.rank}: resident models loaded and warmed up", flush=True)
     last_token = None
+    heartbeat_at, heartbeat_sequence = 0., 0
     while True:
+        if time.monotonic() - heartbeat_at >= 2:
+            heartbeat_sequence += 1
+            atomic_json(BACKEND / "heartbeats" / f"{instance}-{runtime.rank}.json",
+                        {"sequence": heartbeat_sequence})
+            heartbeat_at = time.monotonic()
         request = read_json(BACKEND / "command.json", {})
         if request.get("instance") != instance or request.get("token") == last_token:
             time.sleep(.1)
             continue
         last_token = request["token"]
         try:
+            state("busy", "preparing_request", token=last_token)
             metrics = run(request)
             if runtime.is_main:
                 state("ready", "idle")

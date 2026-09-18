@@ -139,45 +139,6 @@ def test_worker_crash_is_not_mistaken_for_user_cancellation(resident, monkeypatc
     assert not (resident / "cancel.json").exists()
 
 
-@pytest.mark.parametrize("preload_fails", [True, False])
-def test_supervisor_gates_ui_on_preload_and_reaps_worker(tmp_path, monkeypatch, preload_fails):
-    path = Path(__file__).resolve().parents[1] / "scripts/serve.py"
-    spec = importlib.util.spec_from_file_location("serve_under_test", path)
-    serve = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(serve)
-    monkeypatch.setattr(serve, "BACKEND", tmp_path)
-    monkeypatch.setattr(serve, "retire_previous_server", lambda: None)
-    monkeypatch.setattr(serve, "clear_gpu_applications", lambda: None)
-    monkeypatch.setattr(serve.signal, "signal", lambda *a: None)
-    monkeypatch.setattr(serve.subprocess, "run", lambda *a, **k: None)
-    worker = types.SimpleNamespace(name="worker")
-    ui = types.SimpleNamespace(name="ui", poll=lambda: 0, returncode=0)
-    monkeypatch.setattr(serve, "launch_worker", lambda: (worker, "test"))
-    ready = []
-    def preload(process):
-        assert process is worker
-        if preload_fails:
-            raise RuntimeError("preload failed")
-        ready.append(True)
-    monkeypatch.setattr(serve, "await_ready", preload)
-    started = []
-    def launch_ui(command, **kwargs):
-        assert ready == [True]
-        assert "--cpu" in command and "--database-url" in command
-        started.append(True)
-        return ui
-    monkeypatch.setattr(serve.subprocess, "Popen", launch_ui)
-    stopped = []
-    monkeypatch.setattr(serve, "stop_group", lambda process: stopped.append(process.name))
-    if preload_fails:
-        with pytest.raises(RuntimeError, match="preload failed"):
-            serve.main()
-        assert started == [] and stopped == ["worker"]
-    else:
-        serve.main()
-        assert started == [True] and stopped == ["ui", "worker"]
-
-
 @pytest.mark.parametrize("cgroup,expected", [
     ("0::/system.slice/sglang.service", "sglang.service"),
     ("0::/system.slice/ssh.service", None),

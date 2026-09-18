@@ -9,12 +9,12 @@
 已部署的服务器更新：
 
 ```bash
-cd /root/ref2va && git pull --ff-only && REF2VA_TOKEN_BUCKET=2048 bash deploy.sh start
+cd /root/ref2va && git pull --ff-only && bash deploy.sh restart
 ```
 
-首次部署，在克隆的仓库目录执行 `bash deploy.sh`，自动安装固定版本源码、下载模型并启动。需要 Linux x86_64、8 张完整 H200、支持 CUDA 12.9 的驱动、NVLink/NCCL，约 250 GB 磁盘空间。命令在前台运行，可放入 tmux。
+首次部署，在克隆的仓库目录执行 `bash deploy.sh`，自动安装固定版本源码、下载模型并启动。需要 Linux x86_64、8 张完整 H200、支持 CUDA 12.9 的驱动、NVLink/NCCL，约 250 GB 磁盘空间。首次部署命令在前台运行；依赖和模型就绪后，使用 `bash deploy.sh up` 后台启动，或 `bash deploy.sh restart` 更新重启。
 
-当前默认测试 **2048 间隔的无屏蔽前缀分桶**：补齐 token 参与 attention，可能改变生成结果；尚无这版的 H200 耗时/效果实测。上面的更新命令显式覆盖旧环境中的 0/1024 设置；`REF2VA_TOKEN_BUCKET=0 bash deploy.sh start` 可回到不补齐的原生布局。
+当前默认测试 **2048 间隔的无屏蔽前缀分桶**：补齐 token 参与 attention，可能改变生成结果；尚无这版的 H200 耗时/效果实测。已有环境变量会继续生效；如需覆盖旧的 0/1024 设置，用 `REF2VA_TOKEN_BUCKET=2048 bash deploy.sh restart`；`REF2VA_TOKEN_BUCKET=0 bash deploy.sh start` 可回到不补齐的原生布局。
 
 启动依次执行：
 
@@ -29,7 +29,38 @@ cd /root/ref2va && git pull --ff-only && REF2VA_TOKEN_BUCKET=2048 bash deploy.sh
 
 模型全程常驻。后续生成复用 DiT、Qwen3-VL 和 VAE，不重新读权重，不执行额外去噪预热。同一 prompt、参考图内容、参考尺寸和模型版本命中条件缓存时，也会跳过编码。新序列长度/尺寸仍可能触发内核编译；启动预热不能覆盖所有输入形状。保留磁盘编译缓存，并在有限数量的新形状后重置 Dynamo 编译图记录，避免官方单次推理实现达到重编译上限。
 
-Ctrl-C 会回收 UI 和整个八卡进程组。取消正在推理的任务会终止整组 NCCL worker，并自动重新加载预热，期间生成接口返回 503。GPU/OOM 等非取消错误会保留 UI 和诊断接口，需执行上述启动命令恢复。
+Ctrl-C 会回收 UI 和整个八卡进程组。取消正在推理的任务会终止整组 NCCL worker，并自动重新加载预热，期间生成接口返回 503。GPU OOM、CUDA/NCCL 错误、rank 退出、启动超时及推理卡死会自动回收整组 worker，重新加载模型并完成启动预热。UI 和查询接口在恢复期间保留，生成接口返回 503，就绪后自动恢复服务。
+
+## 后台运行与 worker 自动恢复
+
+```bash
+bash deploy.sh up       # 后台启动；已运行时不会重复启动
+bash deploy.sh restart  # 停止旧服务，再以当前代码和环境变量后台启动
+bash deploy.sh status   # 查看控制进程、ready、阶段、重启次数及最近错误
+bash deploy.sh logs     # 持续查看 .runtime/service.log；Ctrl-C 只退出日志查看
+bash deploy.sh stop     # 停止控制进程、UI 和八卡 worker
+```
+
+`up/restart` 返回表示后台进程已启动，**不表示模型已就绪**；用 `status` 或 `GET /openvdn/health` 确认 `ready=true`。关闭终端、断开 SSH 不影响运行。`start` 仍为前台启动，并使用相同的 worker 自动恢复机制。后台模式不安装系统服务，服务器重启后需要重新执行 `up`；控制进程本身被 SIGKILL 也需要重新启动。
+
+恢复会保留磁盘编译缓存，重新加载模型及执行原有基础预热。连续失败按 5、10、20、40、60 秒退避重试，之后每次最多等待 60 秒，稳定运行 300 秒后重置退避。重启期间仅清理本服务的旧进程组，不重复执行启动时的其他 GPU 应用清理；显存仍被其他应用占用时，记录原因并退避等待。
+
+失败请求保留错误和原始日志，**不会自动重跑**；已排队但在恢复期间开始执行的请求也可能失败，客户端需在恢复后决定是否重新提交。`/openvdn/health` 的 `supervision` 包含重启次数、最近错误、退避重试时间和超时配置；每次旧 worker 的错误快照在 `.runtime/backend/failures/`，推理详细日志在 `.runtime/backend/worker.log`。
+
+默认启动超时 3600 秒，单次 worker 请求上限 1800 秒（含条件编码、首次编译、推理及输出）。空闲时每个 rank 主循环报告心跳，连续 60 秒无心跳触发重启；**不根据 GPU 利用率为 0 判断故障**。推理期间使用请求总超时，不用空闲心跳阈值，避免把正常编译误判为卡死。按需调整，例如：
+
+```bash
+REF2VA_REQUEST_TIMEOUT=900 REF2VA_STARTUP_TIMEOUT=3600 bash deploy.sh restart
+```
+
+| 环境变量 | 默认秒数 | 含义 |
+| --- | --- | --- |
+| `REF2VA_STARTUP_TIMEOUT` | 3600 | 每次模型加载和预热总时限 |
+| `REF2VA_REQUEST_TIMEOUT` | 1800 | 单次 worker 请求总时限，不含排队/图片下载 |
+| `REF2VA_IDLE_TIMEOUT` | 60 | 空闲 rank 心跳超时 |
+| `REF2VA_RESTART_DELAY` | 5 | 首次失败后的重试间隔 |
+| `REF2VA_RESTART_MAX_DELAY` | 60 | 连续失败退避的最大间隔 |
+| `REF2VA_STABLE_SECONDS` | 300 | 重置失败退避前需保持就绪的时间 |
 
 ## 8b200 格式业务接口
 
