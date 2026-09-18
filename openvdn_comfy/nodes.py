@@ -112,6 +112,10 @@ class OpenVDNH200Request(OpenVDNH200Generate):
     DESCRIPTION = "Reference-image URLs to video. Duration is in seconds, ratio is width:height, resolution is the output short edge. Uses all 8 GPUs and official Ref2VA-like weights."
 
     async def generate(self, prompt, duration, ratio, resolution, reference_image_urls, **kwargs):
+        return await self._execute(prompt, duration, ratio, resolution, reference_image_urls, **kwargs)
+
+    async def _execute(self, prompt, duration, ratio, resolution, reference_image_urls,
+                       *, prepared_references=None, **kwargs):
         import folder_paths
         import comfy.model_management as mm
         from comfy_api.input_impl import VideoFromFile
@@ -120,13 +124,17 @@ class OpenVDNH200Request(OpenVDNH200Generate):
         job_id = context.prompt_id if context else None
         started, started_wall = time.monotonic(), time.time()
         job_record = read_job(job_id) if job_id else None
-        queue_seconds = max(0., started_wall - job_record["created_at"]) if job_record else 0.
+        queue_seconds = max(0., started_wall - job_record.get("queued_at", job_record["created_at"])) if job_record else 0.
+        prepared_seconds = job_record.get("reference_prepare_seconds", 0.) if job_record else 0.
         try:
             settings = Settings(duration=duration, ratio=ratio, resolution=resolution, **kwargs).validate()
-            urls = parse_urls(reference_image_urls)
             update_job(job_id, status="running", phase="downloading_references")
-            refs = await download_references(urls, mm.throw_exception_if_processing_interrupted)
-            download_seconds = time.monotonic() - started
+            if prepared_references is None:
+                urls = parse_urls(reference_image_urls)
+                refs = await download_references(urls, mm.throw_exception_if_processing_interrupted)
+            else:
+                refs = prepared_references
+            download_seconds = prepared_seconds + time.monotonic() - started
             name = f"vdn8_{uuid.uuid4().hex}.mp4"
             output = Path(folder_paths.get_output_directory()) / "openvdn" / name
             import asyncio
@@ -134,8 +142,10 @@ class OpenVDNH200Request(OpenVDNH200Generate):
                               interrupt=mm.throw_exception_if_processing_interrupted,
                               progress=lambda phase: update_job(job_id, status="running", phase=phase))
             result["timings"].update(reference_download_seconds=download_seconds, api_queue_seconds=queue_seconds,
-                                     processing_wall_seconds=time.monotonic() - started,
-                                     api_wall_seconds=queue_seconds + time.monotonic() - started)
+                                     processing_wall_seconds=prepared_seconds + time.monotonic() - started,
+                                     api_wall_seconds=queue_seconds + prepared_seconds + time.monotonic() - started)
+            if prepared_references is not None:
+                result["timings"]["input_prepare_seconds"] = prepared_seconds
             # Preserve the worker result's schema; adding API timings must not
             # downgrade schema 6 compilation metrics to the old schema 5 label.
             atomic_json(str(output) + ".metrics.json", result)
@@ -147,6 +157,27 @@ class OpenVDNH200Request(OpenVDNH200Generate):
         except BaseException as error:
             update_job(job_id, status="failed", error=str(error))
             raise
+
+
+class OpenVDNH200BusinessRequest(OpenVDNH200Request):
+    """Private prepared-input bridge; HTTP never accepts local reference paths."""
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"job_id": ("STRING",)}}
+
+    DESCRIPTION = "Internal gateway task. Submit reference images through the business API."
+
+    async def generate(self, job_id):
+        from comfy_execution.utils import get_executing_context
+        context = get_executing_context()
+        if context is None or context.prompt_id != job_id:
+            raise ValueError("Prepared request must execute in its original queued task")
+        record = read_job(job_id)
+        if not record or "business" not in record or record["status"] != "queued":
+            raise ValueError("Prepared gateway task is unavailable or already executed")
+        request = record["request"]
+        return await self._execute(request["prompt"], reference_image_urls="",
+                                   prepared_references=record["resolved_references"], **record["settings"])
 
 
 def cache_inputs():
@@ -163,10 +194,12 @@ def cache_inputs():
 
 
 NODE_CLASS_MAPPINGS = {"OpenVDNReference": OpenVDNReference, "OpenVDNH200Generate": OpenVDNH200Generate,
-                       "OpenVDNH200Request": OpenVDNH200Request}
+                       "OpenVDNH200Request": OpenVDNH200Request,
+                       "OpenVDNH200BusinessRequest": OpenVDNH200BusinessRequest}
 NODE_DISPLAY_NAME_MAPPINGS = {"OpenVDNReference": "OpenVDN · Reference Image",
                               "OpenVDNH200Generate": "OpenVDN · 8×H200 · 8 NFE (Ref2VA-like)",
-                              "OpenVDNH200Request": "OpenVDN · URL References · Duration / Ratio / Resolution"}
+                              "OpenVDNH200Request": "OpenVDN · URL References · Duration / Ratio / Resolution",
+                              "OpenVDNH200BusinessRequest": "OpenVDN · Gateway Task (internal)"}
 
 
 def optimization_inputs():

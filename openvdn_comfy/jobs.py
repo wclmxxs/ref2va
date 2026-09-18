@@ -16,9 +16,9 @@ def read_job(job_id):
     return json.loads(path.read_text()) if path.exists() else None
 
 
-def create_job(job_id, request, plan):
+def create_job(job_id, request, plan, **metadata):
     record = {"job_id": job_id, "status": "queued", "phase": "queued", "request": request,
-              "render_plan": plan.metadata(), "created_at": time.time(), "updated_at": time.time()}
+              "render_plan": plan.metadata(), "created_at": time.time(), "updated_at": time.time(), **metadata}
     atomic_json(record_path(job_id), record)
     return record
 

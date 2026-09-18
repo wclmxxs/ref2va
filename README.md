@@ -31,7 +31,13 @@ cd /root/ref2va && git pull --ff-only && REF2VA_TOKEN_BUCKET=2048 bash deploy.sh
 
 Ctrl-C 会回收 UI 和整个八卡进程组。取消正在推理的任务会终止整组 NCCL worker，并自动重新加载预热，期间生成接口返回 503。GPU/OOM 等非取消错误会保留 UI 和诊断接口，需执行上述启动命令恢复。
 
-## JSON 接口
+## 8b200 格式业务接口
+
+已支持 `POST /ic/capcut/edit_gateway/v2/video_generation`、`POST /ic/capcut/edit_gateway/v2/query/video_generation`、`POST /sync_infer`（及业务前缀别名）和 MP4 下载。提交使用 `model/content/resolution/duration/ratio/num_inference_steps/seed/optimization`，参考图为 `content[].image_url`、`role=reference_image`，支持 URL / Base64；返回 `task_id`，查询返回 `task`。
+
+[完整接口文档与参数说明](docs/business-api.md) · [全参数请求示例（RDT 0.25 / 参考短边 768）](examples/business-request.json)。新接口固定 8 步；省略 seed 时随机，返回实际 seed。旧接口与 UI 行为保持兼容。需要参考短边 512 时只改示例中的 `reference_short_edge`。
+
+## 原 JSON 接口（继续兼容）
 
 提交：`POST /openvdn/jobs`。返回 HTTP 202、`job_id`、`status_url` 和实际输出规格；通过 `GET /openvdn/jobs/{job_id}` 查询。该接口与 UI、CLI 共用队列/文件锁，一次只生成一条视频。
 

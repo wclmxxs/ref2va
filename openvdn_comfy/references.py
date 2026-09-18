@@ -85,7 +85,7 @@ def save_image(content, directory):
     return str(path)
 
 
-async def fetch_one(session, url, directory, interrupt):
+async def fetch_one(session, url, directory, interrupt, *, saver=save_image, size_error=ValueError):
     for redirect in range(4):
         validate_url(url)
         interrupt()
@@ -97,14 +97,14 @@ async def fetch_one(session, url, directory, interrupt):
                 continue
             response.raise_for_status()
             if response.content_length is not None and response.content_length > MAX_BYTES:
-                raise ValueError("Reference image exceeds 20 MiB")
+                raise size_error("Reference image exceeds 20 MiB")
             content = bytearray()
             async for chunk in response.content.iter_chunked(65536):
                 interrupt()
                 content.extend(chunk)
                 if len(content) > MAX_BYTES:
-                    raise ValueError("Reference image exceeds 20 MiB")
-            return save_image(content, directory)
+                    raise size_error("Reference image exceeds 20 MiB")
+            return await asyncio.to_thread(saver, content, directory)
     raise ValueError("Too many reference image URL redirects")
 
 

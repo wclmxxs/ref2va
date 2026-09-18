@@ -46,6 +46,21 @@ def prompt_graph(request):
     return {"1": {"class_type": "OpenVDNH200Request", "inputs": inputs}}
 
 
+def current_job(server, job_id):
+    record = read_job(job_id)
+    if record is not None and record["status"] not in ("succeeded", "failed", "interrupted"):
+        history = server.prompt_queue.get_history(job_id).get(job_id)
+        running, pending = server.prompt_queue.get_current_queue_volatile()
+        if history and history.get("status", {}).get("status_str") == "error":
+            errors = [message[1] for message in history["status"].get("messages", []) if message[0] == "execution_error"]
+            update_job(job_id, status="failed", error=errors[-1].get("exception_message", "Execution failed") if errors else "Execution interrupted")
+            record = read_job(job_id)
+        elif not any(entry[1] == job_id for entry in [*running, *pending]):
+            update_job(job_id, status="interrupted", error="Job removed from queue or server restarted")
+            record = read_job(job_id)
+    return record
+
+
 def register_routes(server=None):
     if server is None:
         server_module = sys.modules.get("server")
@@ -88,21 +103,11 @@ def register_routes(server=None):
     async def status(request):
         job_id = request.match_info["job_id"]
         try:
-            record = read_job(job_id)
+            record = current_job(server, job_id)
         except (ValueError, TypeError):
             return web.json_response({"error": "Invalid job ID"}, status=400)
         if record is None:
             return web.json_response({"error": "Job not found"}, status=404)
-        if record["status"] not in ("succeeded", "failed", "interrupted"):
-            history = server.prompt_queue.get_history(job_id).get(job_id)
-            running, pending = server.prompt_queue.get_current_queue_volatile()
-            if history and history.get("status", {}).get("status_str") == "error":
-                errors = [message[1] for message in history["status"].get("messages", []) if message[0] == "execution_error"]
-                update_job(job_id, status="failed", error=errors[-1].get("exception_message", "Execution failed") if errors else "Execution interrupted")
-                record = read_job(job_id)
-            elif not any(entry[1] == job_id for entry in [*running, *pending]):
-                update_job(job_id, status="interrupted", error="Job removed from queue or server restarted")
-                record = read_job(job_id)
         return web.json_response(record)
 
     @server.routes.get("/openvdn/health")
@@ -110,4 +115,6 @@ def register_routes(server=None):
         state = health()
         return web.json_response(state, status=200 if state["ready"] else 503)
 
+    from .business_api import register_routes as register_business_routes
+    register_business_routes(server)
     server._openvdn_routes_registered = True

@@ -1,0 +1,43 @@
+{
+  "model": "MiniMax-H3",
+  "content": [
+    {
+      "type": "text",
+      "text": "subject_definitions: <Subject 1> is the person in <Picture 1> (Image 1). Generate a nighttime hotel arrival scene, signing autographs and waving to fans. Natural city ambience, brief cheers, no background music."
+    },
+    {
+      "type": "image_url",
+      "role": "reference_image",
+      "image_url": {
+        "url": "https://example.com/reference.png",
+        "base64": null
+      }
+    }
+  ],
+  "resolution": "768P",
+  "duration": 10,
+  "ratio": "9:16",
+  "num_inference_steps": 8,
+  "seed": 42,
+  "reference_short_edge": 768,
+  "optimization": {
+    "cache_dit": {
+      "enabled": true,
+      "warmup": 3,
+      "rdt": 0.25,
+      "max_continuous_cached_steps": 1,
+      "fn_blocks": 8,
+      "bn_blocks": 8,
+      "max_cached_steps": 2,
+      "last_steps": 1
+    },
+    "attention_kernel": "native",
+    "isolate_padding": false,
+    "linear_stats_chunk_frames": 16,
+    "softmax_ranks": 6,
+    "fast_communication": true,
+    "streaming_output": true,
+    "cleanup_policy": "adaptive",
+    "profile": false
+  }
+}
