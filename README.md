@@ -415,6 +415,14 @@ cd /root/ref2va && git pull --ff-only && bash deploy.sh install-sol && bash depl
 NCCL_NVLS_ENABLE=0 .venv-vdn/bin/torchrun --standalone --nproc_per_node=8 scripts/validate_sol_attention.py
 ```
 
+如果数值校验失败，在常驻 worker 已停止时运行单卡诊断，无需加载模型：
+
+```bash
+.venv-vdn/bin/python scripts/diagnose_sol_attention.py
+```
+
+脚本保留校验器的随机数序列，检查 9/10/11/12/14 heads 的精确路径、稀疏路径、重复执行、预处理及 CPU 参考结果。数值不匹配会继续收集其他 head 的结果，最终以非零退出，不会放宽容差或启动服务。报告和失败的合成张量保存在 `output/sol-diagnostics/<run_id>/`，`latest.json` 指向最近一次；保存的均为随机测试输入，无模型权重或用户素材。ComfyUI 仍运行时可通过现有 `/view` 接口读取这些诊断文件。
+
 部署后用同一份请求跑热态对照（默认 native/Sol 两组，各 1 次冷、3 次热；不重启）：
 
 ```bash
