@@ -93,7 +93,7 @@ async def submit(server, request):
     queued_at = time.time()
     create_job(internal_id, {'prompt': body['prompt'], 'reference_images': metadata}, settings.render_plan(),
                business={k: v for k, v in body.items() if k != 'prompt'}, settings=asdict(settings),
-               resolved_references=paths, created_at=created_at, queued_at=queued_at,
+               resolved_references=paths, image_anchors=body['image_anchors'], created_at=created_at, queued_at=queued_at,
                reference_prepare_seconds=time.monotonic() - started)
     number = server.number
     server.number += 1

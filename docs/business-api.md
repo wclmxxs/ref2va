@@ -1,6 +1,6 @@
 # 8b200 格式的 Ref2VA 业务接口
 
-业务 JSON 的字段和路由沿用同目录 `8b200` 的网关接口，底层使用当前 ComfyUI 队列和常驻 OpenVDN 8-NFE worker（部署可选八卡或两套四卡）。此服务支持 1–9 张 `reference_image`，不接受首尾帧、参考视频或参考音频。未新增 SGLang 代理或 TOS 上传依赖；成功结果通过本服务的 MP4 路由下载。
+业务 JSON 的字段和路由沿用同目录 `8b200` 的网关接口，底层使用当前 ComfyUI 队列和常驻 OpenVDN 8-NFE worker（部署可选八卡或两套四卡）。支持纯文生视频、1–9 张参考图、首帧、尾帧及首尾帧生成；不接受参考视频或参考音频。成功结果通过本服务的 MP4 路由下载。
 
 ## 路由
 
@@ -35,20 +35,38 @@ curl -sS http://108.136.40.172:8188/ic/capcut/edit_gateway/v2/video_generation \
 | 顶层字段 | 含义与约束 |
 | --- | --- |
 | `model` | 必填，默认模型名 `MiniMax-H3`；同 8b200 接受非空模型别名，但始终执行本服务部署的模型。响应使用 `BUSINESS_MODEL` 环境变量，默认 `MiniMax-H3` |
-| `content` | 必填，1–64 个条目；至少一个非空 `text` 和 1–9 个 `image_url`；多个 text 按顺序用换行连接，总计不超过 24000 字符 |
+| `content` | 必填，1–64 个条目；至少一个非空 `text`；图片可省略。多个 text 按顺序用换行连接，总计不超过 24000 字符 |
 | `content[].type` | `text` 或 `image_url` |
 | `content[].text` | text 条目的提示词 |
-| `content[].role` | 图片必须是 `reference_image`；text 可省略 role |
+| `content[].role` | 图片为 `reference_image`、`first_frame` 或 `last_frame`；text 可省略 role |
 | `content[].image_url` | 对象，包含 `url` 和/或 `base64`，规则见下文 |
 | `resolution` | 必填，如 `"768P"`、`"704P"`、`"512P"`，大写 P；输出短边为 256–1080 的偶数；仍受总画布面积限制 |
 | `duration` | 必填，4–15 秒，可以是小数，按 24 fps 四舍五入为整数输出帧 |
-| `ratio` | `"9:16"` 等宽高比，也接受 `"240:427"`；范围 1:4–4:1。省略、null 或 `"adaptive"` 时取第一张参考图 EXIF 方向修正后的比例 |
+| `ratio` | `"9:16"` 等宽高比，也接受 `"240:427"`；范围 1:4–4:1。省略、null 或 `"adaptive"` 时取第一张图片 EXIF 方向修正后的比例；无图时默认 16:9 |
 | `num_inference_steps` | 默认 8，只允许 8；4/6 步与当前 checkpoint 不匹配，返回 400 |
 | `seed` | 0–2^63−1 整数；省略或 null 时为每个新任务生成独立的随机 63 位 seed；实际值通过查询 `task.seed` 返回 |
-| `reference_short_edge` | 默认 768；128–2048、32 的倍数。控制所有参考图的预处理短边，独立于视频分辨率 |
+| `reference_short_edge` | 默认 768；128–2048、32 的倍数。只控制 `reference_image` 预处理短边；首尾帧直接使用生成画布，不使用此值 |
 | `optimization` | 可选请求级覆盖；未传或字段为 null 时继承服务默认，任务结束后不影响其他请求 |
 
-图片条目顺序对应 `<Picture 1>`、`<Picture 2>`，不会按文件名或 URL 排序。`adaptive` 只调整画布比例，不把参考图当作首帧；实际输出尺寸、采样尺寸和时长见 `task.render_plan`。
+参考图条目顺序对应 `<Picture 1>`、`<Picture 2>`，不会按文件名或 URL 排序。`adaptive` 只调整画布比例，不把参考图当作首帧；实际输出尺寸、采样尺寸和时长见 `task.render_plan`。
+
+### 文生视频与首尾帧
+
+示例见 [business-t2v-request.json](../examples/business-t2v-request.json) 和 [business-fl2v-request.json](../examples/business-fl2v-request.json)，路由及优化参数完全相同。模式由 `content` 自动决定，无需新增顶层字段：
+
+| 图片角色 | `task.conditioning_mode` | 原生锚点 |
+| --- | --- | --- |
+| 无图片 | `t2va` | `[]` |
+| 1–9 张 `reference_image` | `ref2va_like` | 每张 `ref` |
+| 一张 `first_frame` | `i2va` | `["first"]` |
+| 一张 `last_frame` | `l2va` | `["last"]` |
+| 一张 `first_frame` + 一张 `last_frame` | `fl2va` | `["first", "last"]` |
+
+首尾帧会按首帧、尾帧顺序编码，因此同时提供两张时，`<Picture 1>` 始终是首帧、`<Picture 2>` 始终是尾帧，与 JSON 图片条目顺序无关。不允许重复首/尾帧，也不允许与 `reference_image` 混用。查询返回 `image_anchors`，实际条件元数据也记录原生锚点。
+
+首尾帧按 OpenVDN 原生 keyframe 方式送入 Qwen 与 VAE：第一张缩放到请求的对齐生成画布，第二张等比覆盖缩放并居中裁切到同一画布。建议两张图片使用相同宽高比，并保持 `ratio=adaptive`，避免强制比例造成第一张拉伸或第二张裁切。缓存包含锚点类型及生成画布，不会复用同图的参考图编码或其他尺寸的首尾帧编码。
+
+提示词建议明确两张图对应视频的开始和结束，并描述中间运动，见示例。这是模型原生的首尾帧条件生成，并非输出后粘贴图片，不保证首尾像素完全相同。时长仍按 24 fps 输出；采样帧数按模型支持的 `17n+5` 对齐，多余尾帧沿用现有输出裁切规则。
 
 ### 图片 URL / Base64
 

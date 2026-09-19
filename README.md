@@ -129,7 +129,7 @@ bash deploy.sh --gpu-type b200 --gpus 4 --port 9000    # 两套四卡 B200，900
 
 ## 8b200 格式业务接口
 
-已支持 `POST /ic/capcut/edit_gateway/v2/video_generation`、`POST /ic/capcut/edit_gateway/v2/query/video_generation`、`POST /sync_infer`（及业务前缀别名）和 MP4 下载。提交使用 `model/content/resolution/duration/ratio/num_inference_steps/seed/optimization`，参考图为 `content[].image_url`、`role=reference_image`，支持 URL / Base64；返回 `task_id`，查询返回 `task`。
+已支持 `POST /ic/capcut/edit_gateway/v2/video_generation`、`POST /ic/capcut/edit_gateway/v2/query/video_generation`、`POST /sync_infer`（及业务前缀别名）和 MP4 下载。提交使用 `model/content/resolution/duration/ratio/num_inference_steps/seed/optimization`；图片为 `content[].image_url`，支持 URL / Base64。只传文字即文生视频，`role=reference_image` 为参考图，`first_frame` / `last_frame` 为原生首尾帧条件（不能混用参考图）；返回 `task_id`，查询返回 `task`。文生视频、首尾帧示例和图片预处理规则见 [业务接口文档](docs/business-api.md)。
 
 [完整接口文档与参数说明](docs/business-api.md) · [全参数请求示例（RDT 0.25 / 参考短边 768）](examples/business-request.json)。新接口固定 8 步；省略 seed 时随机，返回实际 seed。旧接口与 UI 行为保持兼容。需要参考短边 512 时只改示例中的 `reference_short_edge`。
 

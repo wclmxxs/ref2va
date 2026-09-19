@@ -137,8 +137,15 @@ def gpu_lock(interrupt):
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
-def conditioning_key(prompt, refs, short_edge):
+def conditioning_key(prompt, refs, short_edge, anchors=None, canvas=None):
+    from .keyframes import normalize_anchors
+    anchors = normalize_anchors(len(refs), anchors)
     identity = {"prompt": prompt, "reference_short_edge": short_edge, "sources": source_lock(), "images": []}
+    if anchors and anchors[0] != 'ref':
+        if canvas is None:
+            raise ValueError('Keyframe conditioning cache needs the generation canvas')
+        identity.pop('reference_short_edge')
+        identity.update(image_anchors=anchors, keyframe_canvas=canvas, keyframe_preprocess_version=1)
     for path in refs:
         digest = hashlib.sha256()
         with Path(path).open("rb") as stream:
@@ -148,11 +155,13 @@ def conditioning_key(prompt, refs, short_edge):
     return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
 
 
-def generate(*, prompt="", refs=(), settings=None, output=None, prompt_file=None,
+def generate(*, prompt="", refs=(), image_anchors=None, settings=None, output=None, prompt_file=None,
              interrupt=lambda: None, worker_call=call_worker, progress=lambda phase: None, defer_output=False):
     settings = (settings or Settings()).validate()
     refs = [Path(path).resolve() for path in refs]
-    if prompt_file is not None and (refs or prompt):
+    from .keyframes import normalize_anchors, conditioning_mode
+    anchors = normalize_anchors(len(refs), image_anchors)
+    if prompt_file is not None and (refs or prompt or image_anchors):
         raise ValueError("Choose a pre-encoded prompt_file OR prompt + references")
     if prompt_file is None and not prompt.strip():
         raise ValueError("Prompt cannot be empty")
@@ -172,7 +181,7 @@ def generate(*, prompt="", refs=(), settings=None, output=None, prompt_file=None
     output.parent.mkdir(parents=True, exist_ok=True)
     request = {"job_id": job_id, "settings": asdict(settings), "sources": source_lock(),
                "render_plan": settings.render_plan().metadata(),
-               "mode": "cached_prompt" if prompt_file else "ref2va_like" if refs else "t2va",
+               "mode": "cached_prompt" if prompt_file else conditioning_mode(anchors), "image_anchors": list(anchors),
                "references": list(map(str, refs)), "prompt": prompt, "output": str(output),
                "defer_output": enabled('REF2VA_PIPELINE_OUTPUT')}
     atomic_json(job / "request.json", request)
@@ -186,7 +195,9 @@ def generate(*, prompt="", refs=(), settings=None, output=None, prompt_file=None
                 if not cache.is_file():
                     raise FileNotFoundError(cache)
             else:
-                key = conditioning_key(prompt, refs, settings.reference_short_edge)
+                plan = settings.render_plan()
+                key = conditioning_key(prompt, refs, settings.reference_short_edge, anchors,
+                                       (plan.generation_width, plan.generation_height))
                 cache = RUNTIME / "conditioning" / f"{key}.pt"
             atomic_json(job / "inference.json", settings.inference_config(cache, output))
             progress("inference")

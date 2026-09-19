@@ -1,0 +1,14 @@
+{
+  "model": "MiniMax-H3",
+  "content": [
+    {"type": "text", "text": "How the reference pictures align with the target video — Picture 1 (from Shot 1) aligns with the 0.00-second mark of the target video; Picture 2 (from Shot 1) aligns with the 5.13-second mark of the target video. A single continuous shot connects the first and last frames with natural, smooth movement. Keep the subjects, lighting and scene consistent. Natural scene sounds, no music."},
+    {"type": "image_url", "role": "first_frame", "image_url": {"url": "https://example.com/first.png"}},
+    {"type": "image_url", "role": "last_frame", "image_url": {"url": "https://example.com/last.png"}}
+  ],
+  "resolution": "768P",
+  "duration": 5.166666666666667,
+  "ratio": "adaptive",
+  "num_inference_steps": 8,
+  "seed": 42,
+  "optimization": {"cache_dit": {"enabled": true, "rdt": 0.25}}
+}

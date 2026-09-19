@@ -10,6 +10,7 @@ from .business_media import select_source
 from .cache_dit import FIELDS as CACHE_FIELDS
 from .config import Settings, merge_request_options
 from .optimization_options import FIELDS as OPTIMIZATION_FIELDS
+from .keyframes import normalize_anchors, conditioning_mode
 
 PREFIX = '/ic/capcut/edit_gateway/v2'
 CACHE_MAPPING = {'enabled': 'cache_dit', 'warmup': 'cache_dit_warmup_steps',
@@ -50,7 +51,7 @@ def normalize_request(body, state):
     content = body.get('content')
     if not isinstance(content, list) or not 1 <= len(content) <= 64:
         raise ValueError('content must contain 1–64 items')
-    texts, sources = [], []
+    texts, sources, roles = [], [], []
     for item in content:
         require_object(item, 'content item')
         kind = item.get('type')
@@ -59,18 +60,25 @@ def normalize_request(body, state):
             if not isinstance(item.get('text'), str) or not item['text'].strip():
                 raise ValueError('text must be non-empty')
             texts.append(item['text'].strip())
-        elif kind == 'image_url' and item.get('role') == 'reference_image':
+        elif kind == 'image_url' and item.get('role') in ('reference_image', 'first_frame', 'last_frame'):
             reject_unknown(item, ('type', 'role', 'image_url'), 'image content')
             image = require_object(item.get('image_url'), 'image_url')
             reject_unknown(image, ('url', 'base64'), 'image_url')
             sources.append(select_source(image))
+            roles.append(item['role'])
         else:
-            raise ValueError('This service accepts text and image_url with role=reference_image only')
+            raise ValueError('Use text or image_url with role=reference_image, first_frame or last_frame')
     prompt = '\n'.join(texts)
     if not prompt or len(prompt) > 24000:
         raise ValueError('Combined prompt must contain 1–24000 characters')
-    if not 1 <= len(sources) <= 9:
-        raise ValueError('Provide 1–9 reference images')
+    if 'reference_image' in roles and any(role != 'reference_image' for role in roles):
+        raise ValueError('Cannot mix reference_image with first_frame/last_frame')
+    if 'reference_image' not in roles:
+        if len(roles) != len(set(roles)):
+            raise ValueError('At most one first_frame and one last_frame are allowed')
+        ordered = sorted(zip(roles, sources), key=lambda x: x[0] != 'first_frame')
+        roles, sources = [r for r, _ in ordered], [s for _, s in ordered]
+    anchors = normalize_anchors(len(sources), [{'reference_image':'ref', 'first_frame':'first', 'last_frame':'last'}[r] for r in roles])
     resolution = body.get('resolution')
     if not isinstance(resolution, str) or not re.fullmatch(r'\d{3,4}P', resolution):
         raise ValueError('resolution must be an output short edge such as 768P or 512P')
@@ -81,6 +89,8 @@ def normalize_request(body, state):
         raise ValueError('duration is required and must be 4–15 seconds')
     ratio = body.get('ratio')
     ratio = 'adaptive' if ratio is None else ratio
+    if not sources and ratio == 'adaptive':
+        ratio = '16:9'
     seed = body.get('seed')
     seed = secrets.randbits(63) if seed is None else seed
     options = {k: v for k, v in state.get('profile', {}).items()
@@ -103,7 +113,8 @@ def normalize_request(body, state):
                         ratio='1:1' if ratio == 'adaptive' else ratio).validate()
     return {'model': model_name(), 'prompt': prompt, 'resolution': resolution, 'duration': settings.duration,
             'ratio': ratio, 'num_inference_steps': 8, 'seed': settings.seed,
-            'reference_short_edge': settings.reference_short_edge}, settings, sources
+            'reference_short_edge': settings.reference_short_edge,
+            'conditioning_mode': conditioning_mode(anchors), 'image_anchors': list(anchors)}, settings, sources
 
 
 def resolve_geometry(request, settings, metadata):
@@ -135,6 +146,8 @@ def task_payload(record, base_url):
             'inference_time_s': round(timings['worker_wall_seconds'], 3) if timings.get('worker_wall_seconds') is not None else None,
             **{k: body[k] for k in ('resolution', 'duration', 'ratio', 'seed', 'num_inference_steps', 'reference_short_edge')},
             'task_type': 'generation', 'modality': 'video', 'phase': record.get('phase'),
+            'conditioning_mode': body.get('conditioning_mode', 'ref2va_like'),
+            'image_anchors': body.get('image_anchors', []),
             'render_plan': record['render_plan'], 'timings': timings,
             'compilation': upstream.get('compilation'), 'cache_dit': upstream.get('cache_dit'),
             'optimizations': upstream.get('optimizations'), 'profiling': upstream.get('parallel_profile'),

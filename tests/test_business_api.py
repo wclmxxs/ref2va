@@ -327,7 +327,7 @@ def test_http_errors_unready_restart_and_body_limit(environment):
             for value in ('not base64', 'data:image/png;base64,invalid', 'file:///etc/passwd'):
                 data = body();data['content'][1]['image_url'] = {'base64': value, 'url': 'https://example.com/no-fallback'}
                 invalid.append(data)
-            data = body();data['content'][1]['role'] = 'first_frame';invalid.append(data)
+            data = body();data['content'][1]['role'] = 'unknown_frame';invalid.append(data)
             data = body();data['content'][1]['image_url'] = {'url': 'http://127.0.0.1/private', 'base64': ''};invalid.append(data)
             for data in invalid:
                 response = await client.post(contract.PREFIX+'/video_generation', json=data)
@@ -506,4 +506,41 @@ def test_api_starts_next_gpu_job_while_previous_cpu_output_is_pending(environmen
                 await asyncio.sleep(.01)
             assert records[0]['status'] == ('failed' if encoder_fails else 'succeeded')
             assert records[1]['status'] == 'succeeded' and environment.state['ready']
+    asyncio.run(exercise())
+
+
+def test_text_and_keyframe_gateway_modes_and_anchor_order(environment):
+    async def exercise():
+        async with environment.client() as client:
+            for roles, mode, anchors in [([], 't2va', []), (['first_frame'], 'i2va', ['first']),
+                                        (['last_frame'], 'l2va', ['last']),
+                                        (['last_frame','first_frame'], 'fl2va', ['first','last'])]:
+                data=body(ratio=None)
+                data['content']=data['content'][:1]+[{'type':'image_url','role':role,
+                    'image_url':{'base64':inline_image((80,48) if role=='first_frame' else (48,80))}} for role in roles]
+                response=await client.post(contract.PREFIX+'/video_generation',json=data)
+                assert response.status==200,await response.text()
+                value=(await response.json())['task_id'];record=jobs.read_job(contract.job_id(value))
+                assert record['image_anchors']==anchors and record['business']['conditioning_mode']==mode
+                assert len(record['resolved_references'])==len(roles)
+                if mode=='t2va': assert record['settings']['ratio']=='16:9'
+                if mode=='fl2va':
+                    assert record['settings']['ratio']=='5:3'  # first, even when it appears last in content
+                    assert record['request']['reference_images'][0]['oriented_size']==[80,48]
+                task=(await (await client.post(contract.PREFIX+'/query/video_generation',
+                    json={'model':'MiniMax-H3','task_id':value})).json())['task']
+                assert task['conditioning_mode']==mode and task['image_anchors']==anchors
+    asyncio.run(exercise())
+
+
+def test_invalid_mixed_or_duplicate_keyframes_never_enqueue(environment):
+    async def exercise():
+        async with environment.client() as client:
+            for roles in [('reference_image','first_frame'),('last_frame','last_frame'),('first_frame','first_frame'),
+                          ('first_frame','last_frame','reference_image')]:
+                data=body();data['content']=data['content'][:1]+[{'type':'image_url','role':role,
+                    'image_url':{'url':'https://example.com/should-not-download.png'}} for role in roles]
+                response=await client.post(contract.PREFIX+'/video_generation',json=data)
+                assert response.status==400,await response.text()
+            assert not environment.server.prompt_queue.pending
     asyncio.run(exercise())

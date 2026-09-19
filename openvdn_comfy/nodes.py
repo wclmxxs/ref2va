@@ -122,7 +122,7 @@ class OpenVDNH200Request(OpenVDNH200Generate):
         return await self._execute(prompt, duration, ratio, resolution, reference_image_urls, **kwargs)
 
     async def _execute(self, prompt, duration, ratio, resolution, reference_image_urls,
-                       *, prepared_references=None, defer_result=False, **kwargs):
+                       *, prepared_references=None, image_anchors=None, defer_result=False, **kwargs):
         import folder_paths
         import comfy.model_management as mm
         from comfy_api.input_impl import VideoFromFile
@@ -145,7 +145,7 @@ class OpenVDNH200Request(OpenVDNH200Generate):
             name = f"vdn8_{uuid.uuid4().hex}.mp4"
             output = Path(folder_paths.get_output_directory()) / "openvdn" / name
             import asyncio
-            result = await asyncio.to_thread(generate, prompt=prompt, refs=refs, settings=settings, output=output,
+            result = await asyncio.to_thread(generate, prompt=prompt, refs=refs, image_anchors=image_anchors, settings=settings, output=output,
                               interrupt=mm.throw_exception_if_processing_interrupted,
                               progress=lambda phase: update_job(job_id, status="running", phase=phase), defer_output=defer_result)
             def finish(result):
@@ -188,7 +188,7 @@ class OpenVDNH200BusinessRequest(OpenVDNH200Request):
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("job_id",)
 
-    DESCRIPTION = "Internal gateway task. Submit reference images through the business API."
+    DESCRIPTION = "Internal gateway task. Submit text, references or first/last frames through the business API."
 
     async def generate(self, job_id):
         from comfy_execution.utils import get_executing_context
@@ -200,7 +200,8 @@ class OpenVDNH200BusinessRequest(OpenVDNH200Request):
             raise ValueError("Prepared gateway task is unavailable or already executed")
         request = record["request"]
         return await self._execute(request["prompt"], reference_image_urls="",
-                                   prepared_references=record["resolved_references"], defer_result=True, **record["settings"])
+                                   prepared_references=record["resolved_references"], image_anchors=record.get("image_anchors"),
+                                   defer_result=True, **record["settings"])
 
 
 def cache_inputs():

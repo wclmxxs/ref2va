@@ -61,6 +61,21 @@ def test_partial_encoding_never_becomes_cache(runtime):
     assert len(calls) == 1  # A failure must also release the GPU lock.
 
 
+def test_first_last_roles_reach_worker_and_preserve_cache_isolation(runtime):
+    refs = [runtime / 'first.png', runtime / 'last.png']
+    for path in refs:
+        path.write_bytes(b'image')
+    calls = []
+    for index, anchors in enumerate((None, ['first', 'last'], ['first', 'last'])):
+        runner.generate(prompt='same prompt', refs=refs, image_anchors=anchors,
+                        settings=Settings(duration=5, ratio='7:4', resolution=768),
+                        output=runtime / f'role-{index}.mp4', worker_call=fake_success(calls))
+    assert calls[0]['mode'] == 'ref2va_like'
+    assert calls[1]['mode'] == 'fl2va' and calls[1]['image_anchors'] == ['first', 'last']
+    assert calls[0]['prompt_file'] != calls[1]['prompt_file'] == calls[2]['prompt_file']
+    assert calls[1]['render_plan']['generation_width'] == 1344
+
+
 def test_preencoded_prompt_skips_conditioner(runtime):
     cache = runtime / "ready prompt.pt"
     cache.write_bytes(b"cached")

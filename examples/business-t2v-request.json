@@ -1,0 +1,11 @@
+{
+  "model": "MiniMax-H3",
+  "content": [
+    {"type": "text", "text": "A single continuous cinematic shot of a rainy city street at night. The camera slowly tracks past a warmly lit cafe, realistic puddle reflections and soft steam, coherent perspective. Sound: light rain, footsteps, distant traffic; no music."}
+  ],
+  "resolution": "768P",
+  "duration": 5,
+  "ratio": "16:9",
+  "num_inference_steps": 8,
+  "seed": 42
+}

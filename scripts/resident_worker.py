@@ -56,13 +56,15 @@ class Conditioner:
         self.input_device = self.encoder.get_input_embeddings().weight.device
         print(f"Resident Qwen3-VL placement: {self.encoder.hf_device_map}", flush=True)
 
-    def encode(self, prompt, refs, output, short_edge):
+    def encode(self, prompt, refs, output, short_edge, anchors=None, plan=None):
         import numpy as np
         import torch
         from PIL import Image
         from src.inference.encode_keyframes import (normalize_references, build_presentation,
             qwen3vl_prompt_embeds, encode_vae_condition, PIXEL_MEAN, PIXEL_STD, KEYFRAME_ENCODE_SEED)
         from src.inference.encode_prompt import encode
+        from openvdn_comfy.keyframes import normalize_anchors, prepare_keyframes
+        anchors = normalize_anchors(len(refs), anchors)
         if not refs:
             encode(self.processor, self.encoder, prompt, str(output), self.input_device)
             return
@@ -70,7 +72,15 @@ class Conditioner:
         for path in refs:
             with Image.open(path) as image:
                 images.append(image.convert("RGB"))
-        prepared = normalize_references(images, short_edge)
+        is_keyframe = anchors[0] != 'ref'
+        if is_keyframe:
+            if plan is None:
+                raise ValueError('Keyframe encoding requires the requested generation canvas')
+            width, height = plan.generation_width, plan.generation_height
+            prepared = prepare_keyframes(images, width, height)
+        else:
+            width, height = 1344, 768
+            prepared = normalize_references(images, short_edge)
         ids, tags, vision = build_presentation(self.processor, prompt, prepared)
         embeds = qwen3vl_prompt_embeds(self.encoder, self.processor, ids, vision, self.input_device)
         with torch.no_grad():
@@ -78,9 +88,9 @@ class Conditioner:
                 self.vae, torch.from_numpy(np.array(image)).to(self.device).permute(2, 0, 1)[None, :, None],
                 PIXEL_MEAN, PIXEL_STD, KEYFRAME_ENCODE_SEED).cpu() for image in prepared]
         torch.save({"prompt": prompt, "prompt_embeds": embeds, "text_token_tags": torch.tensor(tags),
-                    "keyframe_anchors": ["ref"] * len(refs), "keyframe_files": refs,
-                    "condition_latents": conditions, "height": 768, "width": 1344,
-                    "reference_size": short_edge,
+                    "keyframe_anchors": list(anchors), "keyframe_files": refs,
+                    "condition_latents": conditions, "height": height, "width": width,
+                    "reference_size": None if is_keyframe else short_edge,
                     "reference_metadata": [
                         {"original_size": list(original.size), "normalized_size": list(prepared_image.size),
                          "qwen_grid_thw": vision["image_grid_thw"][index].tolist()}
@@ -135,6 +145,7 @@ def main():
                         "world_size": runtime.world_size, "hardware": Hardware.from_env().metadata(),
                         "video_vae_world_size": runtime.world_size if parallel_vae else 1,
                         "metrics_schema_version": 13, "compile_cache": compile_options,
+                        "input_modes": ["t2va", "ref2va_like", "i2va", "l2va", "fl2va"],
                         "sglang_acceleration_version": 1,
                         "profiling_capabilities": {"fine_scopes_version": 1, "optional_kernel_trace": True},
                         "pipeline_output": enabled('REF2VA_PIPELINE_OUTPUT'), "output_buffer_capacity": 2,
@@ -232,7 +243,8 @@ def main():
             cache.parent.mkdir(parents=True, exist_ok=True)
             temporary = cache.with_suffix(".partial.pt")
             try:
-                conditioner.encode(request["prompt"], request["references"], temporary, current.reference_short_edge)
+                conditioner.encode(request["prompt"], request["references"], temporary, current.reference_short_edge,
+                                   request.get("image_anchors"), plan)
                 temporary.replace(cache)
             finally:
                 temporary.unlink(missing_ok=True)

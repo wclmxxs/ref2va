@@ -23,6 +23,7 @@ def load_conditioning(path, device):
                     latent_shape=list(latent.shape))
         references.append(item)
     metadata = {"reference_short_edge": data.get("reference_size"),
+                "image_anchors": list(data.get("keyframe_anchors", [])),
                 "references": references, "size_order": "width,height",
                 "prompt_tokens": data["prompt_embeds"].shape[0],
                 "text_tokens": int((tags == 1).sum()), "vision_tokens": int((tags == 0).sum())}
