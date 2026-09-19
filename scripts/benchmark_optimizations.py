@@ -28,7 +28,9 @@ class Client:
         data = None if body is None else json.dumps(body, allow_nan=False).encode()
         request = Request(self.base + path, data=data, headers={'Content-Type': 'application/json'})
         try:
-            with urlopen(request, timeout=30) as response:
+            # Embedded reference images can take longer to upload on remote
+            # links; this is independent of the GPU request deadline.
+            with urlopen(request, timeout=180 if data and len(data) > 131072 else 30) as response:
                 return json.load(response)
         except HTTPError as error:
             raise RuntimeError(f'HTTP {error.code}: {error.read().decode()[:4000]}') from error
