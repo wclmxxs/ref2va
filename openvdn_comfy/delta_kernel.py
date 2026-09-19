@@ -3,42 +3,25 @@ import ctypes
 import hashlib
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import tempfile
 from functools import lru_cache
 
 
-def compiler():
-    candidates = [shutil.which('nvcc')]
-    candidates += [str(Path(p)/'bin/nvcc') for p in
-                   (os.environ.get('CUDA_HOME', ''), '/usr/local/cuda') if p]
-    for path in candidates:
-        if path and Path(path).is_file():
-            return path
-    raise RuntimeError('fused_delta requires nvcc (CUDA toolkit); install it or set fused_delta=false')
-
-
 @lru_cache(maxsize=4)
 def compiler_info(major, minor):
-    nvcc = compiler()
-    version = subprocess.check_output([nvcc, '--version'], text=True, timeout=15)
-    arch = f'{major}{minor}'
-    supported = subprocess.check_output([nvcc, '--list-gpu-code'], text=True, timeout=15)
-    if f'sm_{arch}' not in supported.split():
-        raise RuntimeError(f'nvcc does not support sm_{arch}; update CUDA toolkit or disable fused_delta')
-    return nvcc, version, arch
+    from .cuda_toolchain import find_compiler
+    return find_compiler(major, minor)
 
 
-def load_kernel(device):
+def build_kernel(major, minor):
     import fcntl
-    import torch
-    from .config import RUNTIME
+    from .config import ROOT
     source = Path(__file__).parent/'_vendor/sglang_vdn/delta_factors.cu'
-    nvcc, version, arch = compiler_info(*torch.cuda.get_device_capability(device))
+    nvcc, version, arch = compiler_info(major, minor)
     flags = ['-O3', '-std=c++17', '--shared', '-Xcompiler', '-fPIC', f'-arch=sm_{arch}']
     digest = hashlib.sha256(source.read_bytes()+repr((version, flags)).encode()).hexdigest()[:24]
-    folder = RUNTIME/'cuda-kernels'/digest
+    folder = ROOT/'.runtime/cuda-kernels'/digest
     folder.mkdir(parents=True, exist_ok=True)
     library = folder/'delta.so'
     # Eight ranks may launch together. Compile once and publish atomically; the
@@ -54,12 +37,18 @@ def load_kernel(device):
                 if result.returncode:
                     raise RuntimeError(f'Delta CUDA compilation failed; see {folder / "build.log"}: {result.stderr[-1500:]}')
                 built.replace(library)
+    return library, {'architecture': f'sm_{arch}', 'cache_key': digest, 'library': str(library)}
+
+
+def load_kernel(device):
+    import torch
+    library, report = build_kernel(*torch.cuda.get_device_capability(device))
     module = ctypes.CDLL(str(library))
     module.ref2va_delta_factors.argtypes = [ctypes.c_void_p]*5 + [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
     module.ref2va_delta_factors.restype = ctypes.c_int
     module.ref2va_cuda_error.argtypes = [ctypes.c_int]
     module.ref2va_cuda_error.restype = ctypes.c_char_p
-    return module, {'architecture': f'sm_{arch}', 'cache_key': digest, 'library': str(library)}
+    return module, report
 
 
 class DeltaKernel:

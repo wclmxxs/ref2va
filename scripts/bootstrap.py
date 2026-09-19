@@ -11,7 +11,8 @@ import math
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / 'scripts')]
 from check_install import environment_errors, model_errors
-from openvdn_comfy.hardware import detect_hardware
+from openvdn_comfy.hardware import detect_hardware, GPU_SPECS
+from openvdn_comfy.cuda_toolchain import ensure_toolchain
 
 
 def run(command, **kwargs):
@@ -91,6 +92,13 @@ def main():
                 raise RuntimeError('Model verification failed after download:\n' + '\n'.join(errors))
         else:
             print('Pinned models verified; reusing existing weights.', flush=True)
+        fused_delta = env.get('REF2VA_FUSED_DELTA', '1')
+        if fused_delta not in ('0', '1'):
+            raise ValueError('REF2VA_FUSED_DELTA must be 0 or 1')
+        if fused_delta == '1':
+            # Finish download/compiler/linker checks before fleet stops a live worker.
+            env['REF2VA_NVCC'] = ensure_toolchain(*GPU_SPECS[gpu][0])
+            run([str(ROOT / '.venv-vdn/bin/python'), str(ROOT / 'scripts/prepare_kernels.py')], env=env)
         command = [str(ROOT / '.venv-ui/bin/python'), str(ROOT / 'scripts/fleet.py'), 'ensure',
                    '--gpu-type', gpu, '--gpus', str(args.gpus), '--port', str(args.port)]
         if args.wait_timeout is not None:

@@ -52,6 +52,7 @@ def test_unified_bootstrap_only_installs_missing_parts_and_rechecks(monkeypatch,
     monkeypatch.setattr(boot,'detect_hardware',lambda *a:('b300',','.join(f'GPU-{i}' for i in range(8))))
     env_checks=iter([['missing'] if repair_env else [], []])
     model_checks=iter([['missing'] if repair_models else [], []])
+    monkeypatch.setattr(boot,'ensure_toolchain',lambda *a:'/prepared/bin/nvcc')
     monkeypatch.setattr(boot,'environment_errors',lambda root:next(env_checks))
     monkeypatch.setattr(boot,'model_errors',lambda root:next(model_checks))
     calls=[]
@@ -63,6 +64,8 @@ def test_unified_bootstrap_only_installs_missing_parts_and_rechecks(monkeypatch,
     assert sum(isinstance(c,list) and c[-1]=='install' for c in stages)==int(repair_env)
     assert sum(isinstance(c,list) and c[-1]=='download' for c in stages)==int(repair_models)
     assert stages[-1][2]=='ensure'
+    assert stages[-2][-1]==str(tmp_path/'scripts/prepare_kernels.py')
+    assert calls[-1][1]['REF2VA_NVCC']=='/prepared/bin/nvcc'
     assert all(env['REF2VA_GPU_TYPE']=='b300' and env['REF2VA_GPUS']=='4' for _,env in calls)
     assert stages.count('stop')==int(repair_env)+int(repair_models)
 
@@ -255,3 +258,31 @@ def test_pinned_source_check_does_not_fetch_network_and_detects_relocation(monke
     assert check.source_errors(tmp_path)==[]
     link.unlink();link.symlink_to(tmp_path/'old-clone-path')
     assert check.source_errors(tmp_path)==['ComfyUI node link is missing or belongs to another checkout']
+
+
+@pytest.mark.parametrize('failure', ['compiler', 'kernel', 'disabled'])
+def test_cuda_preflight_happens_before_stopping_live_service(monkeypatch, tmp_path, failure):
+    boot = script('bootstrap')
+    monkeypatch.setattr(boot, 'ROOT', tmp_path)
+    monkeypatch.setattr(boot, 'detect_hardware', lambda *a: ('b300', '0,1,2,3,4,5,6,7'))
+    monkeypatch.setattr(boot, 'environment_errors', lambda _: [])
+    monkeypatch.setattr(boot, 'model_errors', lambda _: [])
+    monkeypatch.setenv('REF2VA_FUSED_DELTA', '0' if failure == 'disabled' else '1')
+    monkeypatch.setattr(sys, 'argv', ['bootstrap', '--gpus', '8'])
+    calls = []
+    def compiler(*_):
+        calls.append('compiler')
+        if failure == 'compiler': raise RuntimeError('cannot prepare compiler')
+        return '/prepared/bin/nvcc'
+    def run(command, **kwargs):
+        calls.append(command)
+        if failure == 'kernel': raise RuntimeError('cannot compile kernel')
+    monkeypatch.setattr(boot, 'ensure_toolchain', compiler)
+    monkeypatch.setattr(boot, 'run', run)
+    monkeypatch.setattr(boot, 'stop_before_repair', lambda _: pytest.fail('Healthy service must remain running'))
+    if failure == 'disabled':
+        boot.main()
+        assert len(calls) == 1 and calls[0][2] == 'ensure'
+    else:
+        with pytest.raises(RuntimeError, match='cannot'): boot.main()
+        assert not any(isinstance(c, list) and c[2:] and c[2] == 'ensure' for c in calls)

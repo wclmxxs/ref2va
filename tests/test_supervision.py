@@ -310,3 +310,25 @@ def test_stop_during_preflight_reaps_shell_child(tmp_path, monkeypatch):
         if child and child.is_running():
             try: child.kill()
             except psutil.NoSuchProcess: pass
+
+
+def test_current_start_error_survives_controller_exit_without_old_sigterm(tmp_path, monkeypatch):
+    service = load_script('service')
+    monkeypatch.setattr(service, 'RECORD', tmp_path / 'service.json')
+    monkeypatch.setattr(service, 'LOG', tmp_path / 'service.log')
+    monkeypatch.setattr(service, 'controller', lambda: None)
+    monkeypatch.setattr(service, 'health', lambda: {'ready': False})
+    old = b'old worker received SIGTERM\n'
+    error = b'Traceback: nvcc missing\n'
+    service.LOG.write_bytes(old + error)
+    record = {'host': service.host_identity(), 'log_offset': len(old), 'log_inode': service.LOG.stat().st_ino}
+    atomic_json(service.RECORD, record)
+    assert service.snapshot()['startup_error'] == error.decode().strip()
+    fleet = load_script('fleet')
+    monkeypatch.setattr(fleet, 'get_status', lambda _: service.snapshot())
+    with pytest.raises(RuntimeError, match='nvcc missing') as caught:
+        fleet.wait_ready([{'REF2VA_PORT': '8188', 'REF2VA_INSTANCE': ''}], 5)
+    assert 'SIGTERM' not in str(caught.value)
+    record['host'] = {'boot_id': 'different'}
+    atomic_json(service.RECORD, record)
+    assert service.snapshot()['startup_error'] == ''

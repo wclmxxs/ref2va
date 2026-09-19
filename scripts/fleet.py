@@ -93,7 +93,8 @@ def wait_ready(selected, timeout):
             status = get_status(plan)
             port = plan['REF2VA_PORT']
             if not status['running']:
-                raise RuntimeError(f'API {port}: controller exited; see {runtime(plan) / "service.log"}')
+                detail = status.get('startup_error') or 'No startup error captured.'
+                raise RuntimeError(f'API {port}: controller exited; see {runtime(plan) / "service.log"}\n{detail}')
             supervision = status.get('supervision', {})
             if supervision.get('status') in ('recovering', 'stopped'):
                 raise RuntimeError(f'API {port}: startup failed: {supervision.get("last_error", "worker stopped")}')
@@ -116,8 +117,13 @@ def wait_ready(selected, timeout):
 
 def diagnostics(selected):
     for plan in selected:
+        directory = runtime(plan)
+        service = read_json(directory / 'backend/service.json', {})
+        owner = read_json(directory / 'backend/owner.json', {})
         for name in ('service.log', 'backend/worker.log'):
-            path = runtime(plan) / name
+            if name == 'backend/worker.log' and owner.get('created', 0) < service.get('created', 0):
+                continue  # Preflight failed before new ranks launched: old SIGTERM is unrelated.
+            path = directory / name
             if path.is_file():
                 with path.open('rb') as stream:
                     stream.seek(max(0, path.stat().st_size - 12000))

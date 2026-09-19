@@ -397,7 +397,9 @@ Schema 12 增加按请求的细粒度分析，业务接口通过 `optimization.p
 
 `fused_delta` 和 `boundary_scan` 保持方程与全部输入，改变 FP32 运算顺序，不能称为逐位等价；没有新增 K/V 下采样。双流路径的 gate GEMM 形状也会改变。Cache-DiT 和 `linear_kv_keep_ratio` 仍单独控制，做精度对照时设为关闭和 `1.0`。
 
-启动默认值可设 `REF2VA_FUSED_DELTA=0|1`、`REF2VA_BOUNDARY_SCAN=0|1`、`REF2VA_FAST_SOFTMAX=0|1`、`REF2VA_DUAL_STREAM=0|1`；启用最后一项须同时 `REF2VA_SOFTMAX_RANKS=0`。仅预热原配置的一种 shape，其他组合首请求按需编译。融合 kernel 需要 `nvcc`，自动按源码、CUDA toolkit 版本及实际 GPU 架构缓存到实例目录的 `cuda-kernels/`；镜像更换 H200/B200/B300 后重新选对应缓存，不依赖 IP。
+启动默认值可设 `REF2VA_FUSED_DELTA=0|1`、`REF2VA_BOUNDARY_SCAN=0|1`、`REF2VA_FAST_SOFTMAX=0|1`、`REF2VA_DUAL_STREAM=0|1`；启用最后一项须同时 `REF2VA_SOFTMAX_RANKS=0`。仅预热原配置的一种 shape，其他组合首请求按需编译。融合 kernel 需要 `nvcc`。一键启动先发现兼容的系统/项目编译器；缺失或不完整时，自动下载 NVIDIA 官方 CUDA 12.9.1 的 `cuda_nvcc`、`cuda_cudart` 和 `cuda_cccl` 组件，校验固定 SHA256，安装到 `.runtime/toolchains/cuda-12.9.1/`。首次下载约 84 MB；已有完整工具链离线复用，不更改系统驱动和 Python 包。宿主机需有 `g++`（Amazon Linux/RHEL：`dnf install -y gcc-c++`；Ubuntu：`apt-get install -y g++`）。可通过 `REF2VA_NVCC=/path/to/nvcc` 明确指定编译器。
+
+工具链检查和实际 kernel 编译/加载在停止旧服务之前完成；内核按源码、CUDA toolkit 版本及 GPU 架构缓存到共享 `.runtime/cuda-kernels/`，4+4 两个实例复用同一编译产物。镜像更换 H200/B200/B300 后重新选择对应架构，不依赖 IP。数值正确性仍在 worker 启动时用实际 GPU 检查，不因预编译而跳过。组件来源与 SHA256 见 [NVIDIA CUDA 12.9.1 redistrib](https://developer.download.nvidia.com/compute/cuda/redist/redistrib_12.9.1.json)。
 
 返回 `task.optimizations.linear_acceleration.by_rank` 包含实际路径调用次数、求解/扫描 GPU 校验；`task.optimizations.dual_stream.by_rank` 包含双流启用与校验状态。不开 profile 也返回这些记录。双流的 `softmax_return_launch` / `linear_return_launch` 是提交跨度，`output_stream_join` 是主流等待；只有 kernel trace 的 NCCL 活动统计才是设备通信活动时间。第一种新双流几何的数值核对会增加一次原路径 forward，不能混入热态测速。
 

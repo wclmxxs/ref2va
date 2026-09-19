@@ -97,13 +97,16 @@ def start(args):
     with LOG.open('ab') as output:
         output.write(f'\n=== Ref2VA background start {time.strftime("%Y-%m-%d %H:%M:%S")} ===\n'.encode())
         output.flush()
+        log_offset = output.tell()
+        log_inode = os.fstat(output.fileno()).st_ino
         process = subprocess.Popen(['bash', str(ROOT / 'deploy.sh'), 'start', *args], cwd=ROOT,
                                    stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
                                    start_new_session=True, env={**os.environ, 'PYTHONUNBUFFERED': '1'})
-    atomic_json(RECORD, {'pid': process.pid, 'created': psutil.Process(process.pid).create_time(), 'host': host_identity()})
+    atomic_json(RECORD, {'pid': process.pid, 'created': psutil.Process(process.pid).create_time(), 'host': host_identity(),
+                         'log_offset': log_offset, 'log_inode': log_inode})
     time.sleep(.2)
     if process.poll() is not None:
-        raise RuntimeError(f'Startup exited with code {process.returncode}; see {LOG}')
+        raise RuntimeError(f'Startup exited with code {process.returncode}; see {LOG}\n{startup_log_tail()}')
     print(f'Ref2VA loading (PID {process.pid}). Log: {LOG}', flush=True)
 
 
@@ -123,6 +126,23 @@ def api_ready(state):
         return False
 
 
+def startup_log_tail():
+    """Only this boot's last start, never the old worker's SIGTERM/log history."""
+    record = read_json(RECORD, {})
+    offset = record.get('log_offset')
+    if record.get('host') != host_identity() or not isinstance(offset, int) or offset < 0:
+        return ''
+    try:
+        with LOG.open('rb') as stream:
+            stat = os.fstat(stream.fileno())
+            if stat.st_ino != record.get('log_inode') or offset > stat.st_size:
+                return ''
+            stream.seek(max(offset, stat.st_size - 8000))
+            return stream.read().decode(errors='replace').strip()
+    except OSError:
+        return ''
+
+
 def snapshot():
     process = controller()
     state = health()
@@ -132,7 +152,8 @@ def snapshot():
     return {'running': process is not None, 'controller_pid': process.pid if process else None,
             'ready': bool(current and api_ready(state)), 'worker_ready': bool(current and state['ready']),
             'phase': state.get('phase') if current else 'checking_environment',
-            'supervision': supervision if current else {}, 'log': str(LOG)}
+            'supervision': supervision if current else {}, 'log': str(LOG),
+            'startup_error': startup_log_tail() if process is None else None}
 
 
 def main():
