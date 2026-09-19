@@ -104,11 +104,25 @@ bash deploy.sh --gpu-type b200 --gpus 4 --port 9000    # 两套四卡 B200，900
 
 - GPU 型号和所选卡的 UUID 在每次启动重新查询，不用镜像里保存的 UUID；默认用本机 0–7，显式 `CUDA_VISIBLE_DEVICES` 必须属于新机器。
 - PID 记录绑定机器/boot ID 和进程创建时间，旧机器的 ready、PID、命令不会当成新机器的服务，也不自动重跑镜像中的未完成请求。模型、历史输出和可复用缓存保留。
-- 默认监听 `0.0.0.0`；生成/查询的视频 URL 按当前 HTTP 请求 origin 生成，不在代码或启动配置中写死公私网 IP。旧 fleet 文件里的 `PUBLIC_BASE_URL` 不会重放。镜像中不要通过 shell/systemd 额外导出旧 IP、旧 GPU UUID 或旧网卡名；这些是用户显式覆盖，程序不会猜测并替换。
+- 默认同时监听 `0.0.0.0,::`（IPv4 + IPv6）；生成/查询的视频 URL 按当前 HTTP 请求 origin 生成，IPv6 地址保留方括号，不在代码或启动配置中写死公私网 IP。旧 fleet 文件里的 `PUBLIC_BASE_URL` 不会重放。镜像中不要通过 shell/systemd 额外导出旧 IP、旧 GPU UUID 或旧网卡名；这些是用户显式覆盖，程序不会猜测并替换。
 - 同机 torchrun 使用 loopback rendezvous 和自动分配端口；两个 worker 不共用固定 master 端口，也不依赖旧主机名。硬件型号/卡数的编译缓存目录分开，B300 不强用 B200 的缓存目录。
 - 完整机器镜像可保留 Python 环境和模型；代码目录移动后会检查 venv、editable 包路径和 ComfyUI 节点链接，需要时修复。自定义 `REF2VA_MODELS` 挂载路径仍须在新机器可用。
 
 业务使用稳定反向代理域名时，可显式设置 `PUBLIC_BASE_URL`（单实例）或 `REF2VA_PUBLIC_BASE_URL_0/1`（双实例）；裸 IP 部署建议不设置，让 API 自动按当前请求生成链接。
+
+### IPv4 / IPv6 访问
+
+默认启动命令即可为每个 API 同时开启 IPv4、IPv6，两种地址共用该端口的同一个任务队列。也可显式指定：
+
+```bash
+bash deploy.sh --gpu-type b300 --gpus 4 --listen '0.0.0.0,::'
+```
+
+`--listen` 优先于 `REF2VA_LISTEN`，接受逗号分隔的 IP 地址（不带端口）。`--listen ::` 只监听 IPv6；`--listen 0.0.0.0` 只监听 IPv4。系统禁用 IPv6 或指定地址不可绑定时会在模型加载前报错，不会悄悄只开启 IPv4。
+
+启动完成前，每个端口都必须通过 `http://127.0.0.1:端口/openvdn/health` 和 `http://[::1]:端口/openvdn/health` 的检查，并确认它们对应当前 worker。显式绑定其他 IP 时检查相应地址。监听配置写入当前实例记录，后续 `bash deploy.sh status` 无需再传环境变量，会显示 `listen` 和 `health_urls`。
+
+外部 IPv6 的 URL 格式是 `http://[服务器IPv6]:8188/...`，另一组为 8189；域名有 AAAA 记录时也可直接使用域名。实例需要配置可路由的 IPv6，子网需有 IPv6 公网路由，安全组和主机防火墙需允许调用方 IPv6 访问 TCP 8188/8189。启动 ready 表示本机 API 可用，不代表已验证公网路由和安全组。
 
 ## 连续请求的输出流水线
 
@@ -202,7 +216,7 @@ bash deploy.sh render \
 | `CUDA_VISIBLE_DEVICES` | 0,1,2,3,4,5,6,7 | 恰好 8 张卡，可用 GPU UUID |
 | `NCCL_NVLS_ENABLE` | H200=0；B200/B300=NCCL 默认 | 绕过当前 H200 主机的 NVLS multicast 内存绑定 CUDA 401；通信自检和常驻 worker 使用相同值。仅关闭 NVLink SHARP offload，不设置 P2P/NVLink transport 禁用开关；主机修复后可显式设 1/2 重测。 |
 | `REF2VA_MODELS` | ./models | 下载、启动使用同一权重目录 |
-| `REF2VA_PORT` / `REF2VA_LISTEN` | 8188 / 0.0.0.0 | ComfyUI 地址 |
+| `REF2VA_PORT` / `REF2VA_LISTEN` | 8188 / 0.0.0.0,:: | API 端口 / 监听 IP 列表；默认 IPv4 + IPv6，可用 `--listen` 覆盖 |
 | `REF2VA_FP8` | 1 | 官方 FP8 线性层；0 为 BF16 |
 | `REF2VA_INFERENCE_KERNELS` | 1 | 官方融合/局部编译内核；0 也不代表全部禁用编译 |
 | `REF2VA_SOFTMAX_BACKEND` | H200=flex；B200/B300=decomposed | flex / decomposed / ref |

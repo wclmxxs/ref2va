@@ -18,6 +18,7 @@ from openvdn_comfy.supervision import Policy
 from openvdn_comfy.compile_cache import cache_settings
 from openvdn_comfy.exact_runtime import enabled
 from openvdn_comfy.host_identity import host_identity
+from openvdn_comfy.network import listen_value, health_urls, check_bindings
 
 LOG = RUNTIME / 'service.log'
 RECORD = BACKEND / 'service.json'
@@ -40,6 +41,7 @@ def controller():
 
 
 def validate_start():
+    check_bindings([(listen_value(), 0)])  # Fail before stopping workers or loading any models.
     Policy.from_env()
     startup_settings()
     parallel_vae_enabled()
@@ -103,25 +105,33 @@ def start(args):
                                    stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
                                    start_new_session=True, env={**os.environ, 'PYTHONUNBUFFERED': '1'})
     atomic_json(RECORD, {'pid': process.pid, 'created': psutil.Process(process.pid).create_time(), 'host': host_identity(),
-                         'log_offset': log_offset, 'log_inode': log_inode})
+                         'log_offset': log_offset, 'log_inode': log_inode, 'listen': listen_value()})
     time.sleep(.2)
     if process.poll() is not None:
         raise RuntimeError(f'Startup exited with code {process.returncode}; see {LOG}\n{startup_log_tail()}')
     print(f'Ref2VA loading (PID {process.pid}). Log: {LOG}', flush=True)
 
 
+def active_listen():
+    record = read_json(RECORD, {})
+    if same_process(record):
+        # Legacy records lack this field. Use the explicit environment or old
+        # IPv4 default when inspecting a controller started before this change.
+        return record.get('listen', os.environ.get('REF2VA_LISTEN', '0.0.0.0'))
+    return listen_value()
+
+
 def api_ready(state):
     if not state.get('ready') or not same_process(read_json(BACKEND / 'ui.json', {})):
         return False
-    listen = os.environ.get('REF2VA_LISTEN', '0.0.0.0')
-    host = '127.0.0.1' if listen == '0.0.0.0' else '::1' if listen == '::' else listen
-    host = f'[{host}]' if ':' in host else host
     try:
         # Ignore inherited HTTP_PROXY settings: readiness must reach this local API.
-        url = f'http://{host}:{os.environ.get("REF2VA_PORT", "8188")}/openvdn/health'
-        with build_opener(ProxyHandler({})).open(url, timeout=2) as response:
-            actual = json.load(response)
-        return actual.get('ready') is True and actual.get('instance') == state.get('instance')
+        for url in health_urls(os.environ.get('REF2VA_PORT', '8188'), active_listen()):
+            with build_opener(ProxyHandler({})).open(url, timeout=2) as response:
+                actual = json.load(response)
+            if actual.get('ready') is not True or actual.get('instance') != state.get('instance'):
+                return False
+        return True
     except (OSError, ValueError):
         return False
 
@@ -150,6 +160,7 @@ def snapshot():
     supervisor_owner = supervision.get('controller', {})
     current = bool(process and supervisor_owner.get('pid') == process.pid and same_process(supervisor_owner))
     return {'running': process is not None, 'controller_pid': process.pid if process else None,
+            'listen': active_listen(), 'health_urls': health_urls(os.environ.get('REF2VA_PORT', '8188'), active_listen()),
             'ready': bool(current and api_ready(state)), 'worker_ready': bool(current and state['ready']),
             'phase': state.get('phase') if current else 'checking_environment',
             'supervision': supervision if current else {}, 'log': str(LOG),

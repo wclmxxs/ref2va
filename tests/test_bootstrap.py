@@ -16,6 +16,7 @@ import pytest
 from openvdn_comfy import backend, hardware
 from openvdn_comfy.config import atomic_json
 from openvdn_comfy.host_identity import host_identity
+from openvdn_comfy import network
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -157,6 +158,108 @@ def test_service_requires_real_api_with_matching_worker_and_ignores_http_proxy(m
     finally:
         http.shutdown();http.server_close();thread.join()
     assert not service.api_ready({'ready':True,'instance':'current'})
+
+
+def test_listener_configuration_and_ipv6_health_url_format(monkeypatch):
+    monkeypatch.delenv('REF2VA_LISTEN', raising=False)
+    assert network.listen_value() == '0.0.0.0,::'
+    assert network.health_urls(8189) == ['http://127.0.0.1:8189/openvdn/health',
+                                        'http://[::1]:8189/openvdn/health']
+    monkeypatch.setenv('REF2VA_LISTEN', '127.0.0.1')
+    assert network.listen_value() == '127.0.0.1'
+    assert network.listen_value('0.0.0.0, [::], ::') == '0.0.0.0,::'
+    assert network.health_urls(8188, '[2001:db8::123]') == ['http://[2001:db8::123]:8188/openvdn/health']
+    for value in ('', ',', 'http://[::1]', '[::1]:8188', '0.0.0.0,', '::,invalid'):
+        with pytest.raises(ValueError, match='addresses without ports'):
+            network.listen_value(value)
+
+
+def test_bootstrap_listen_argument_overrides_environment(monkeypatch, tmp_path):
+    boot = script('bootstrap')
+    monkeypatch.setattr(boot, 'ROOT', tmp_path)
+    monkeypatch.setattr(boot, 'detect_hardware', lambda *a: ('b300', '0,1,2,3,4,5,6,7'))
+    monkeypatch.setattr(boot, 'environment_errors', lambda _: [])
+    monkeypatch.setattr(boot, 'model_errors', lambda _: [])
+    monkeypatch.setenv('REF2VA_FUSED_DELTA', '0')
+    monkeypatch.setenv('REF2VA_LISTEN', '127.0.0.1')
+    monkeypatch.setattr(sys, 'argv', ['bootstrap', '--gpus', '4', '--listen', '0.0.0.0,::'])
+    calls = []
+    monkeypatch.setattr(boot, 'run', lambda command, **kw: calls.append((command, kw['env'])))
+    boot.main()
+    assert len(calls) == 1 and calls[0][1]['REF2VA_LISTEN'] == '0.0.0.0,::'
+    assert '--listen' not in calls[0][0]  # Consumed once, never passed as a conflicting UI argument.
+
+
+def test_fleet_preserves_listener_for_status_but_rebuilds_it_on_new_deployment(monkeypatch):
+    fleet = script('fleet')
+    plan = fleet.plans('b300', 4, 8188, listen='::')[1]
+    monkeypatch.setenv('REF2VA_LISTEN', '0.0.0.0')
+    captured = []
+    monkeypatch.setattr(fleet.subprocess, 'run', lambda *a, **kw: captured.append(kw['env']))
+    fleet.invoke('status', plan)
+    assert captured[0]['REF2VA_LISTEN'] == '::' and captured[0]['REF2VA_PORT'] == '8189'
+    # Starting on a cloned machine uses current configuration, not old saved IPs.
+    assert fleet.plans('b300', 4, 8188)[1]['REF2VA_LISTEN'] == '0.0.0.0'
+
+
+def test_dual_stack_port_preflight_detects_ipv6_conflict():
+    import socket
+    try:
+        occupied = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        occupied.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        occupied.bind(('::', 0))
+        occupied.listen(1)
+    except OSError:
+        pytest.skip('Host lacks IPv6 loopback')
+    port = occupied.getsockname()[1]
+    try:
+        with pytest.raises(RuntimeError, match='Cannot bind API address ::'):
+            network.check_bindings([('0.0.0.0,::', port)])
+    finally:
+        occupied.close()
+    network.check_bindings([('0.0.0.0,::', port)])
+
+
+def test_dual_stack_readiness_requires_both_listeners_and_current_instance(monkeypatch, tmp_path):
+    import asyncio
+    from aiohttp import web
+    service = script('service')
+    monkeypatch.setattr(service, 'BACKEND', tmp_path)
+    monkeypatch.setattr(service, 'RECORD', tmp_path/'service.json')
+    owner = {'pid': os.getpid(), 'created': psutil.Process().create_time(), 'host': host_identity()}
+    atomic_json(tmp_path/'ui.json', owner)
+    atomic_json(service.RECORD, {**owner, 'listen': '0.0.0.0,::'})
+    # A later status shell's overrides must not hide a broken listener.
+    monkeypatch.setenv('REF2VA_LISTEN', '127.0.0.1')
+    monkeypatch.setenv('http_proxy', 'http://unreachable.invalid:9')
+    monkeypatch.setenv('HTTP_PROXY', 'http://unreachable.invalid:9')
+    payload = {'ready': True, 'instance': 'current'}
+    ipv6_instance = ['current']
+    async def exercise():
+        async def handler(request):
+            return web.json_response({**payload, 'instance': ipv6_instance[0] if ':' in request.remote else 'current'})
+        app = web.Application(); app.router.add_get('/openvdn/health', handler)
+        runner = web.AppRunner(app); await runner.setup()
+        try:
+            ipv4 = web.TCPSite(runner, '0.0.0.0', 0); await ipv4.start()
+            port = ipv4._server.sockets[0].getsockname()[1]
+            ipv6 = web.TCPSite(runner, '::', port)
+            try:
+                await ipv6.start()
+            except OSError:
+                pytest.skip('Host lacks IPv6 wildcard binding')
+            monkeypatch.setenv('REF2VA_PORT', str(port))
+            assert await asyncio.to_thread(service.api_ready, payload)
+            ipv6_instance[0] = 'old-worker'
+            assert not await asyncio.to_thread(service.api_ready, payload)
+            ipv6_instance[0] = 'current'
+            await ipv6.stop()
+            assert not await asyncio.to_thread(service.api_ready, payload)
+            atomic_json(service.RECORD, {**owner, 'listen': '0.0.0.0'})
+            assert await asyncio.to_thread(service.api_ready, payload)
+        finally:
+            await runner.cleanup()
+    asyncio.run(exercise())
 
 
 def test_old_boot_pid_and_ready_state_cannot_be_reused(monkeypatch,tmp_path):

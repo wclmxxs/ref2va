@@ -23,6 +23,7 @@ from openvdn_comfy.runner import stop_group, worker_environment
 from openvdn_comfy.hardware import Hardware, install_workflows
 from openvdn_comfy.host_identity import host_identity
 from openvdn_comfy.supervision import Policy, WorkerWatchdog, fail_pending
+from openvdn_comfy.network import listen_value
 
 
 def process_record(process, instance):
@@ -176,7 +177,7 @@ def main():
                 if ui is None:
                     install_workflows(ROOT, RUNTIME / 'comfy-user', startup_settings())
                     command = [str(ROOT / ".venv-ui/bin/python"), str(ROOT / ".deps/ComfyUI/main.py"), "--cpu", "--disable-dynamic-vram",
-                               "--listen", os.environ.get("REF2VA_LISTEN", "0.0.0.0"), "--port", os.environ.get("REF2VA_PORT", "8188"),
+                               "--listen", listen_value(), "--port", os.environ.get("REF2VA_PORT", "8188"),
                                "--output-directory", str(ROOT / "output"), "--input-directory", str(ROOT / "input"),
                                "--user-directory", str(RUNTIME / "comfy-user"),
                                "--temp-directory", str(RUNTIME / "comfy-temp"),

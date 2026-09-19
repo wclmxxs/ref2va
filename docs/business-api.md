@@ -133,6 +133,17 @@ curl -sS http://108.136.40.172:8188/ic/capcut/edit_gateway/v2/query/video_genera
 
 反向代理部署时设置 `PUBLIC_BASE_URL=https://你的服务地址`；未设置时根据当前请求的 origin 生成视频 URL。不自动信任 Forwarded 头。双 API 模式若使用反向代理，分别设置 `REF2VA_PUBLIC_BASE_URL_0` 和 `REF2VA_PUBLIC_BASE_URL_1`；否则不要设置全局 `PUBLIC_BASE_URL`，以各请求 origin 生成对应端口的链接。
 
+默认同时监听 IPv4、IPv6（`--listen '0.0.0.0,::'`），两种地址访问同一个端口时共用同一队列。IPv6 地址必须在 URL 中加方括号，生成结果的 `task.content.url` 自动保留 IPv6 地址、方括号和请求端口。异步提交、查询、同步接口和支持 Range 的视频播放接口均使用相同路径，例如：
+
+```bash
+# 将下方示例地址替换为服务器实际的公网 IPv6。
+curl -6 --noproxy '*' -g 'http://[2001:db8::123]:8188/openvdn/health'
+curl -6 --noproxy '*' -g 'http://[2001:db8::123]:8188/ic/capcut/edit_gateway/v2/video_generation' \
+  -H 'Content-Type: application/json' --data-binary @examples/business-request.json
+```
+
+实例公网 IPv6、子网路由和 IPv6 入站 TCP 8188/8189 需在云平台/主机上配置。启动器会分别检查本机 IPv4/IPv6 API，不能代替外部连通性验证。
+
 错误格式为 `{"error":{"type":"invalid_request_error","message":"...","http_code":400}}`。同步超时另含顶层 `task_id`，可以继续查询。任务请求和结果保存在 `.runtime/api/jobs`；四卡实例分别保存在 `.runtime/instances/worker-{0,1}/api/jobs`，可用原内部 UUID 通过旧管理接口排障。
 
 统一启动命令：`bash deploy.sh --gpus 4`，自动识别本机 H200/B200/B300、复用已安装依赖和权重，等待两个 API 就绪后才返回终端。新机器默认无需指定 IP；仍须在对应端口查询该端口提交的任务。

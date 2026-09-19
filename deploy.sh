@@ -85,9 +85,10 @@ case "$action" in
     exec .venv-ui/bin/python scripts/render.py "$@"
     ;;
   help|-h|--help)
-    echo 'Usage: bash deploy.sh [--gpu-type auto|h200|b200|b300] [--gpus 4|8] [--port 8188] [--wait-timeout seconds]'
+    echo 'Usage: bash deploy.sh [--gpu-type auto|h200|b200|b300] [--gpus 4|8] [--port 8188] [--listen 0.0.0.0,::] [--wait-timeout seconds]'
     echo 'Checks/reuses dependencies and models, reloads changed code/config, waits for every API, then returns with services running.'
     echo 'Default: auto-detect GPU model, one 8-GPU worker. --gpus 4: two workers, ports 8188/8189.'
+    echo 'API defaults to IPv4 + IPv6; --listen overrides REF2VA_LISTEN. Readiness checks every bind address.'
     echo 'Controls: status | logs | stop. Legacy deploy/start/up/restart are aliases for the unified startup.'
     echo 'Maintenance only: install | download | check [--nccl] | render --help'
     ;;

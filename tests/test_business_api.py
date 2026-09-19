@@ -73,10 +73,10 @@ def environment(monkeypatch, tmp_path):
     server = types.SimpleNamespace(routes=web.RouteTableDef(), number=0, prompt_queue=Queue())
     api.register_routes(server)
 
-    def client():
+    def client(host='127.0.0.1'):
         app = web.Application()
         app.add_routes(server.routes)
-        return TestClient(TestServer(app))
+        return TestClient(TestServer(app, host=host))
 
     def finish(job_id, status='succeeded'):
         output = tmp_path/'output'/'openvdn'/f'{job_id}.mp4'
@@ -317,6 +317,31 @@ def test_http_submission_query_order_inline_privacy_and_range_download(environme
             outside = environment.root/'outside.mp4';outside.write_bytes(b'private')
             jobs.update_job(job_id, metrics={'output': str(outside)})
             assert (await client.get(content_path)).status == 404
+    asyncio.run(exercise())
+
+
+def test_ipv6_submit_query_and_playable_result_url(environment):
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as probe:
+            probe.bind(('::1', 0))
+    except OSError:
+        pytest.skip('Host lacks IPv6 loopback')
+    async def exercise():
+        async with environment.client(host='::1') as client:
+            response = await client.post(contract.PREFIX+'/video_generation', json=body())
+            assert response.status == 200, await response.text()
+            task_id = (await response.json())['task_id']
+            query = {'model': 'MiniMax-H3', 'task_id': task_id}
+            response = await client.post(contract.PREFIX+'/query/video_generation', json=query)
+            assert response.status == 200 and (await response.json())['task']['status'] == 'queued'
+            environment.finish(contract.job_id(task_id))
+            response = await client.post(contract.PREFIX+'/query/video_generation', json=query)
+            task = (await response.json())['task']
+            url = task['content']['url']
+            assert url == f'http://[::1]:{client.port}{contract.PREFIX}/video_generation/{task_id}/content'
+            async with client.session.get(url, headers={'Range': 'bytes=2-7'}) as video:
+                assert video.status == 206 and await video.read() == b'234567'
+                assert video.headers['Content-Type'] == 'video/mp4'
     asyncio.run(exercise())
 
 

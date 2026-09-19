@@ -13,6 +13,7 @@ sys.path[:0] = [str(ROOT), str(ROOT / 'scripts')]
 from check_install import environment_errors, model_errors
 from openvdn_comfy.hardware import detect_hardware, GPU_SPECS
 from openvdn_comfy.cuda_toolchain import ensure_toolchain
+from openvdn_comfy.network import listen_value
 
 
 def run(command, **kwargs):
@@ -59,8 +60,10 @@ def main():
     parser.add_argument('--gpu-type', choices=['auto', 'h200', 'b200', 'b300'], default=os.environ.get('REF2VA_GPU_TYPE', 'auto'))
     parser.add_argument('--gpus', type=int, choices=[4,8], default=int(os.environ.get('REF2VA_GPUS', '8')))
     parser.add_argument('--port', type=int, default=int(os.environ.get('REF2VA_PORT', '8188')))
+    parser.add_argument('--listen', help='Comma-separated bind IPs; default: 0.0.0.0,:: (IPv4 and IPv6)')
     parser.add_argument('--wait-timeout', type=float, default=None)
     args, extras = parser.parse_known_args()
+    listen = listen_value(args.listen)
     if not 1 <= args.port <= 65535 - (args.gpus == 4):
         parser.error('Invalid API port range')
     if args.wait_timeout is not None and (not math.isfinite(args.wait_timeout) or args.wait_timeout <= 0):
@@ -70,7 +73,7 @@ def main():
         fcntl.flock(lock, fcntl.LOCK_EX)
         gpu, devices = detect_hardware(args.gpu_type, os.environ.get('CUDA_VISIBLE_DEVICES'))
         env = {**os.environ, 'REF2VA_GPU_TYPE': gpu, 'REF2VA_GPUS': str(args.gpus),
-               'REF2VA_PORT': str(args.port), 'CUDA_VISIBLE_DEVICES': devices}
+               'REF2VA_PORT': str(args.port), 'CUDA_VISIBLE_DEVICES': devices, 'REF2VA_LISTEN': listen}
         print(f'Detected {gpu.upper()}: {8//args.gpus} worker(s), {args.gpus} GPUs per worker', flush=True)
         errors = environment_errors(ROOT)
         if errors:

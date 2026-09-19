@@ -7,7 +7,6 @@ import math
 import os
 from pathlib import Path
 import signal
-import socket
 import subprocess
 import sys
 import time
@@ -19,12 +18,13 @@ from openvdn_comfy.backend import read_json
 from openvdn_comfy.hardware import GPU_SPECS
 from openvdn_comfy.host_identity import host_identity
 from openvdn_comfy.supervision import Policy
+from openvdn_comfy.network import listen_value, check_bindings, health_urls
 
 MANIFEST = ROOT / '.runtime/fleet.json'
 PYTHON = ROOT / '.venv-ui/bin/python'
 
 
-def plans(gpu_type, gpus, port, devices=None):
+def plans(gpu_type, gpus, port, devices=None, listen=None):
     if gpu_type not in GPU_SPECS or gpus not in (4, 8) or not 1 <= port <= 65535 - (gpus == 4):
         raise ValueError('Choose h200|b200|b300, 4|8 GPUs per worker and a valid base port')
     devices = devices or ','.join(map(str, range(8)))
@@ -32,6 +32,7 @@ def plans(gpu_type, gpus, port, devices=None):
     if len(ids) != 8 or len(set(ids)) != 8 or not all(ids):
         raise ValueError('This launcher needs 8 distinct visible GPUs: one 8-GPU worker or two 4-GPU workers')
     return [{'REF2VA_GPU_TYPE': gpu_type, 'REF2VA_GPUS': str(gpus),
+             'REF2VA_LISTEN': listen_value(listen),
              'REF2VA_PORT': str(port + i), 'CUDA_VISIBLE_DEVICES': ','.join(ids[i*gpus:(i+1)*gpus]),
              'REF2VA_INSTANCE': '' if gpus == 8 else f'worker-{i}'} for i in range(8//gpus)]
 
@@ -77,12 +78,7 @@ def get_status(plan):
 
 
 def check_ports(selected):
-    listen = os.environ.get('REF2VA_LISTEN', '0.0.0.0')
-    for plan in selected:
-        family = socket.AF_INET6 if ':' in listen else socket.AF_INET
-        with socket.socket(family, socket.SOCK_STREAM) as probe:
-            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            probe.bind((listen, int(plan['REF2VA_PORT'])))
+    check_bindings([(plan.get('REF2VA_LISTEN', listen_value()), int(plan['REF2VA_PORT'])) for plan in selected])
 
 
 def wait_ready(selected, timeout):
@@ -108,7 +104,9 @@ def wait_ready(selected, timeout):
         if ready:
             print('All models warmed up and APIs ready. Services remain running in the background.', flush=True)
             for plan in selected:
-                print(f'API port {plan["REF2VA_PORT"]}; use this machine\'s current IP or DNS name.', flush=True)
+                listen = plan.get('REF2VA_LISTEN', listen_value())
+                print(f'API port {plan["REF2VA_PORT"]}; listening on {listen}; use this machine\'s current IP or DNS name.', flush=True)
+                print('Local readiness passed: ' + ', '.join(health_urls(plan['REF2VA_PORT'], listen)), flush=True)
             return
         if time.monotonic() - started >= timeout:
             raise TimeoutError(f'Startup exceeded {timeout:g}s before every API became ready')
@@ -137,6 +135,7 @@ def main():
     parser.add_argument('--gpu-type', choices=list(GPU_SPECS), default=os.environ.get('REF2VA_GPU_TYPE', 'h200'))
     parser.add_argument('--gpus', type=int, choices=[4,8], default=int(os.environ.get('REF2VA_GPUS','8')))
     parser.add_argument('--port', type=int, default=int(os.environ.get('REF2VA_PORT','8188')))
+    parser.add_argument('--listen', help='Comma-separated bind IPs; default: 0.0.0.0,::')
     parser.add_argument('--wait-timeout', type=float, default=None)
     args, ui_args = parser.parse_known_args()
     MANIFEST.parent.mkdir(parents=True, exist_ok=True)
@@ -148,7 +147,7 @@ def main():
             stop_all()
             return
         desired = existing if args.action in ('status', 'logs') and existing else plans(
-            args.gpu_type, args.gpus, args.port, os.environ.get('CUDA_VISIBLE_DEVICES'))
+            args.gpu_type, args.gpus, args.port, os.environ.get('CUDA_VISIBLE_DEVICES'), args.listen)
         if args.action in ('status', 'logs'):
             if args.action == 'status':
                 for plan in desired:
