@@ -23,7 +23,7 @@ bash deploy.sh            # 自动识别型号，一套八卡服务，8188
 
 需要 Linux x86_64、系统 `python3`、8 张同型号完整 H200/B200/B300、支持当前 CUDA 12.9 PyTorch 的驱动、NVLink/NCCL 和约 250 GB 磁盘空间。依赖/权重检查不等于校验全部权重文件的 SHA-256；CUDA/NCCL 和模型预热检查在目标机器实际执行。
 
-H200 Flex 后端默认使用 **2048 间隔的无屏蔽前缀分桶**（B200/B300 decomposed 后端不补齐）：补齐 token 参与 attention，可能改变生成结果；新双流组合的 H200 耗时仍需复测。已有环境变量会继续生效；如需覆盖旧的 0/1024 设置，用 `REF2VA_TOKEN_BUCKET=2048 bash deploy.sh restart`；`REF2VA_TOKEN_BUCKET=0 bash deploy.sh start` 可回到不补齐的原生布局。
+Flex 和 decomposed 后端默认使用 **2048 间隔的无屏蔽前缀分桶**，覆盖 H200、B200/B300：补齐 token 参与 attention，可能改变生成结果；decomposed 继续使用 dense/varlen 内核。新双流组合的 H200 耗时及 B200/B300 分桶后的耗时、命中率仍需复测。已有环境变量会继续生效；如需覆盖旧的 0/1024 设置，用 `REF2VA_TOKEN_BUCKET=2048 bash deploy.sh restart`；`REF2VA_TOKEN_BUCKET=0 bash deploy.sh start` 可回到不补齐的原生布局。
 
 启动依次执行：
 
@@ -232,7 +232,7 @@ bash deploy.sh render \
 | `REF2VA_WARMUP_RECENT` | 0 | 默认不回放历史；可手动增加，最大为编译形状容量减 1 再减额外时长数 |
 | `REF2VA_WARMUP_DURATIONS` | 空 | 默认不额外预热时长；可设 `5,8,10,15`，最多四个 4–15 秒的值 |
 | `REF2VA_WARMUP_VERIFY` | 0 | 默认不复跑预热集验证热命中；1 开启该诊断检查，会增加启动时间 |
-| `REF2VA_TOKEN_BUCKET` | 2048 | 无屏蔽前缀分桶间隔，可设 256/512/1024/2048；padding 参与 attention，可能影响效果；0 恢复不补齐的原生布局 |
+| `REF2VA_TOKEN_BUCKET` | 2048 | Flex/decomposed 共用的无屏蔽前缀分桶间隔，可设 256/512/1024/2048；padding 参与 attention，可能影响效果；0 恢复不补齐的原生布局；ref 始终不补齐 |
 | `REF2VA_WARMUP_DURATION` | 10 | 启动预热时长 |
 | `REF2VA_WARMUP_RATIO` | 9:16 | 启动预热画幅 |
 | `REF2VA_WARMUP_RESOLUTION` | 768 | 启动预热短边 |
@@ -296,7 +296,9 @@ cd /root/ref2va && git pull --ff-only && bash deploy.sh start
 
 当前实验默认 `REF2VA_TOKEN_BUCKET=2048`，把 `[文本/视觉条件 | 参考图 latent | 音频 | 视频]` 的非视频前缀补到 2048 token 的倍数，最多增加 2047 行。补齐放在音频与生成视频之间，真实 position_ids、参考图几何、文本行、噪声生成顺序均保留。删除 padding `score_mod` 和 attention 包装，恢复上游完整窗口的原生 dispatch 与局部窗口的原生 Flex/FA4 路径；局部窗口 BlockMask 仍限制视频间的注意力范围，但将 gap 视为全局前缀，**不排除补齐 key**。这会改变 softmax 归一化及后续特征，不承诺生成效果与不补齐相同。线性注意力的文本状态仍只读取真实文本行，DBCache 的误差分组也仍排除补齐行；RDT 开关/阈值保持原请求值，但实际缓存决定可能随特征变化。
 
-只对 Flex 配置启用分桶；decomposed/ref 自动使用原始布局。保持 FA4 静态编译，不直接改 `dynamic=True`。旧版带 `score_mod`、1024 桶的同一「走廊功夫」10 秒案例，参考图短边 768、RDT 0.25、两次均无新编译且缓存步骤均为 4/6，分桶前后去噪为 11.80 / 15.08 秒，视频 VAE 均约 2.15 秒；这些不是当前无屏蔽 2048 桶的测量。新策略名为 `prefix_gap_unmasked_v2`，健康接口 `token_bucket_policy` 和每次结果的 `compilation.token_bucket.policy` 可核对部署，后者另返回 `padding_attention=unmasked`。本次没有修改编译形状容量/淘汰策略，仍需部署后复测热态耗时、DBCache 命中和画质。
+Flex 和 decomposed 配置共用分桶；ref 自动使用原始布局，任一后端也可通过 `REF2VA_TOKEN_BUCKET=0` 关闭补齐。decomposed 将 gap 纳入全局前缀的 dense 查询及各窗口 KV，沿用 dense/varlen 内核，不切换到 Flex，也不新增 padding mask。保持 FA4 静态编译，不直接改 `dynamic=True`。旧版带 `score_mod`、1024 桶的同一「走廊功夫」10 秒案例，参考图短边 768、RDT 0.25、两次均无新编译且缓存步骤均为 4/6，分桶前后去噪为 11.80 / 15.08 秒，视频 VAE 均约 2.15 秒；这些不是当前无屏蔽 2048 桶的测量。策略名为 `prefix_gap_unmasked_v2`，健康接口 `token_bucket_policy` / `token_bucket_stride` 返回实际生效的策略和间隔，每次结果的 `compilation.token_bucket` 另返回容量、补齐数量及 `padding_attention=unmasked`。
+
+同一生成画布、采样帧数、条件模式和 attention 配置下，前缀落入同一桶时，主要 attention/逐点运算可以复用形状；实际文本行仍参与原始长度的条件编码和线性分支，不保证整条请求零编译。跨桶、换画布/帧数或执行路径仍可能编译。编译形状容量仍为 32，满后整体 reset Dynamo 的策略未改变。需要部署后用 `runtime_graph_reused` 和实际耗时验证收益，不能把 `geometry_seen=true` 当作所有子图命中。
 
 ### 原生路径的缓存命中条件
 

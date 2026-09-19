@@ -35,7 +35,7 @@ from openvdn_comfy.runner import conditioning_key
 from openvdn_comfy.vae_tiles import ClipDecoder
 from openvdn_comfy.warmup_history import WarmupHistory
 from openvdn_comfy.conditioning import load_conditioning
-from openvdn_comfy.token_buckets import BUCKET_POLICY, TokenBuckets, describe_bucket
+from openvdn_comfy.token_buckets import BUCKET_POLICY, TokenBuckets, describe_bucket, effective_bucket_stride
 sys.path.insert(0, str(UPSTREAM))
 
 
@@ -118,6 +118,7 @@ def main():
         compile_options["recompile_limit"] * 4, torch._dynamo.config.accumulated_recompile_limit)
     torch._dynamo.config.fail_on_recompile_limit_hit = True
     settings = Settings(**launch["settings"]).validate()
+    bucket_stride = effective_bucket_stride(settings.softmax_backend, compile_options["token_bucket"])
     cfg = load_config(InferenceConfig, ["--config", str(BACKEND / "inference.json")],
                       extra_validators=[validate_ablation, validate_kernels, validate_parallel])
     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
@@ -150,7 +151,8 @@ def main():
                         "profiling_capabilities": {"fine_scopes_version": 1, "optional_kernel_trace": True},
                         "pipeline_output": enabled('REF2VA_PIPELINE_OUTPUT'), "output_buffer_capacity": 2,
                         "nccl": {"nvls_enable": os.environ.get("NCCL_NVLS_ENABLE", "NCCL default")},
-                        "token_bucket_policy": BUCKET_POLICY if compile_options["token_bucket"] and settings.softmax_backend == "flex" else "native",
+                        "token_bucket_policy": BUCKET_POLICY if bucket_stride else "native",
+                        "token_bucket_stride": bucket_stride,
                         "startup_warmup": startup_report,
                         "exact_runtime_enabled": enabled("REF2VA_EXACT_RUNTIME"),
                         "sampler_geometry": "request_bound_v1",
@@ -170,8 +172,8 @@ def main():
     fine_profile = FineProfiler(runtime, linear_kv, decomposed, features, scan, delta_rule, acceleration)
     state("loading", "checking_linear_kernels")
     acceleration.select(settings, device)
-    # Native decomposed/reference paths remain available, without padded tokens.
-    bucket_stride = compile_options["token_bucket"] if settings.softmax_backend == "flex" else 0
+    # Flex and decomposed use the same prefix buckets and retain their own
+    # attention kernels. Stride zero (or ref) keeps the original packed layout.
     buckets = TokenBuckets(bucket_stride)
     attention_runtime = AttentionRuntime(dit_runtime.hybrids, buckets, ulysses._window_softmax_branch)
     communication = CommunicationRuntime(runtime)

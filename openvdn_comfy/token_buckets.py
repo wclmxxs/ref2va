@@ -13,6 +13,16 @@ DEFAULT_BUCKET_STRIDE = 2048
 BUCKET_POLICY = "prefix_gap_unmasked_v2"
 
 
+def effective_bucket_stride(softmax_backend, configured_stride):
+    """Flex and decomposed share the padded layout; ref remains an unpadded control.
+
+    Decomposed includes every global-prefix row in both dense and window KV
+    groups, so the gap has the same unmasked semantics as Flex. The selected
+    attention implementation does not otherwise change.
+    """
+    return configured_stride if softmax_backend in ("flex", "decomposed") else 0
+
+
 @dataclass(frozen=True)
 class PrefixBucket:
     text_tokens: int

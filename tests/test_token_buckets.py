@@ -12,10 +12,11 @@ from openvdn_comfy.cache_dit import CacheConfig, DBCache
 from openvdn_comfy.conditioning import load_conditioning
 from openvdn_comfy.config import Settings
 from openvdn_comfy.resident_geometry import GeometryCache
-from openvdn_comfy.token_buckets import PrefixBucket, TokenBuckets, describe_bucket
+from openvdn_comfy.token_buckets import (PrefixBucket, TokenBuckets, describe_bucket,
+                                        effective_bucket_stride)
 
 
-def native_ref_layout():
+def native_ref_layout(keyframes=False):
     """Run pinned Diffusers packing, without loading its model dependencies."""
     root = Path(__file__).resolve().parents[1]
     suffix = 'src/diffusers/modular_pipelines/minimax_h3/before_denoise.py'
@@ -27,16 +28,43 @@ def native_ref_layout():
     selected = [node for node in tree.body if isinstance(node, ast.FunctionDef)
                 and node.name.startswith(('_spatial_', '_temporal_', '_frame_', '_fill_audio_'))]
     owner = next(n for n in tree.body if isinstance(n, ast.ClassDef)
-                 and n.name == 'MiniMaxH3Ref2VAPrepareLayoutStep')
+                 and n.name == ('MiniMaxH3PrepareLayoutStep' if keyframes else 'MiniMaxH3Ref2VAPrepareLayoutStep'))
     function = next(n for n in owner.body if isinstance(n, ast.FunctionDef)
-                    and n.name == 'build_ref2va_packed_sequence')
+                    and n.name == ('build_packed_sequence' if keyframes else 'build_ref2va_packed_sequence'))
     function.decorator_list = []
     tree.body = [ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0),
                  *selected, function]
     ns = {'torch': torch, 'np': np, '_ROPE_FRAME_RESCALE': 5 / 3,
           '_ROPE_FRAMES_PER_LATENT': (1, 4, 4, 4, 4), '_ROPE_SPATIAL_SCALE': 32}
     exec(compile(ast.fix_missing_locations(tree), str(path), 'exec'), ns)
-    return ns['build_ref2va_packed_sequence']
+    return ns[function.name]
+
+
+@pytest.mark.parametrize('backend', ['flex', 'decomposed', 'ref'])
+@pytest.mark.parametrize('stride', [0, 256, 512, 1024, 2048])
+def test_backend_bucket_selection_and_native_rollback(backend, stride):
+    assert effective_bucket_stride(backend, stride) == (0 if backend == 'ref' else stride)
+
+
+@pytest.mark.parametrize('anchors', [(), ('first',), ('last',), ('first', 'last')])
+@pytest.mark.parametrize('stride', [0, 256])
+def test_decomposed_t2v_and_keyframes_preserve_positions_and_output_rows(anchors, stride):
+    length, frames, spatial = 13, 3, 8
+    native = native_ref_layout(keyframes=True)(torch.arange(length) % 2, frames, 8, 4, 2,
+                                              (1, 2, 2), 2, 2, 0, keyframe_anchors=anchors)
+    state = TokenBuckets(effective_bucket_stride('decomposed', stride))
+    bucket = PrefixBucket(length, len(anchors) * spatial, 4, frames * spatial, state.stride)
+    state.prepare(bucket, 'cpu')
+    packed = state.pack_layout(native)
+    assert len(packed[0]) == bucket.capacity + frames * spatial
+    assert packed[5] == len(anchors) * spatial
+    assert torch.equal(packed[2][:packed[5]], native[2][:native[5]])
+    for indices in (2, 3, 4):
+        assert torch.equal(packed[0][packed[indices]], native[0][native[indices]])
+        assert torch.equal(packed[1][packed[indices]], native[1][native[indices]])
+    assert int(packed[2][packed[5]]) == bucket.capacity
+    if not stride:
+        assert packed is native
 
 
 @pytest.mark.parametrize('length,refs,stride', [(13, [(4, 6)], 64), (29, [(8, 4), (4, 8)], 64),
@@ -129,14 +157,16 @@ def test_padding_never_changes_dbcache_modality_error():
     assert result(False) == result(True)
 
 
-def test_bucket_geometry_reuses_capacity_not_caption_or_reference_aspect():
+@pytest.mark.parametrize('backend', ['flex', 'decomposed'])
+def test_bucket_geometry_reuses_capacity_not_caption_or_reference_aspect(backend):
     plan = Settings(duration=10, ratio='9:16', resolution=768).render_plan()
     cache = GeometryCache(lambda: pytest.fail('unexpected reset'))
     runtime = types.SimpleNamespace(softmax_ranks=6)
     for index, (length, shape) in enumerate([(117, (1, 24, 1, 48, 32)), (165, (1, 24, 1, 32, 48))]):
         embeds = torch.zeros(length, 3)
         conditions = (('ref',), [torch.zeros(shape)])
-        bucket = describe_bucket(embeds, conditions, plan, (1, 2, 2), 810, 72, 2048)
+        bucket = describe_bucket(embeds, conditions, plan, (1, 2, 2), 810, 72,
+                                 effective_bucket_stride(backend, 2048))
         assert bucket.video_tokens == 72 * 24 * 43
         assert bucket.metadata()['policy'] == 'prefix_gap_unmasked_v2'
         assert bucket.metadata()['padding_attention'] == 'unmasked'
@@ -144,6 +174,94 @@ def test_bucket_geometry_reuses_capacity_not_caption_or_reference_aspect():
         cache.commit()
     runtime.softmax_ranks = 4
     assert cache.prepare(runtime, plan, embeds, torch.ones(length), conditions, bucket)
+
+
+@pytest.mark.parametrize('fast', [False, True])
+@pytest.mark.parametrize('full', [False, True])
+@pytest.mark.parametrize('anchors', ['none', 'rows', 'columns', 'both'])
+def test_decomposed_bucket_matches_padded_mask_and_reuses_window_plan(monkeypatch, fast, full, anchors):
+    """Run pinned decomposition and optimized routing with CPU SDPA kernel bodies.
+
+    The independent dense mask checks the global gap, frame windows and anchors,
+    including strided head shards. CUDA/FA4 coverage is a separate optional test.
+    """
+    import sys
+    from openvdn_comfy.attention_runtime import window_attention
+    from tests.test_sglang_acceleration import softmax_module
+    native = softmax_module()
+    ns = native.window_softmax_decomposed.__globals__
+    for name in ('varlen_kernel', 'sdpa_kernel', '_dense_backends', 'scaled_dot_product_attention'):
+        setattr(native, name, ns[name])
+    monkeypatch.setitem(sys.modules, 'src.models.softmax_attention', types.SimpleNamespace(decomposed=native))
+    frames, spatial = 4, 8
+    bounds = [(0, 3)] * frames if full else [(0, 1), (0, 1), (2, 3), (2, 3)]
+    generator = torch.Generator().manual_seed(127)
+    previous_plan = None
+    for length in (19, 27, 32):
+        bucket = PrefixBucket(length - 7, 3, 4, frames * spatial, 32)
+        buckets = TokenBuckets(32)
+        buckets.prepare(bucket, 'cpu')
+        layout = types.SimpleNamespace(video_start=bucket.capacity, video_end=bucket.capacity + 32,
+                                       seq_len=bucket.capacity + 32, num_frames=frames, tokens_per_frame=spatial)
+        tensors = []
+        for _ in range(3):
+            real = torch.randn(length + 32, 4, 8, generator=generator, dtype=torch.float64)
+            tensors.append(torch.cat((real[:length], real.new_full((bucket.padding, 4, 8), 2.),
+                                      real[length:]))[:, ::2])
+        assert not tensors[0].is_contiguous()
+        runtime = types.SimpleNamespace(kernel='native', isolate_padding=False, fast_softmax=fast,
+                                        fast_softmax_calls=0, buckets=buckets,
+                                        native=lambda attn, *args: native.window_softmax_decomposed(
+                                            *args, anchor_frames=attn.anchor_frames))
+        attn = types.SimpleNamespace(_ref2va_attention=runtime, anchor_frames=anchors, inference_mode=True,
+                                     _window_kernel=lambda *a: 'decomposed',
+                                     _ulysses_runtime=types.SimpleNamespace(profile_enabled=False))
+        actual = window_attention(attn, *tensors, layout, bounds, 8**-.5)
+        positions = torch.arange(layout.seq_len)
+        qf = (positions[:, None] - bucket.capacity) // spatial
+        kf = (positions[None, :] - bucket.capacity) // spatial
+        windows = torch.ones_like(qf + kf, dtype=torch.bool) if full else qf // 2 == kf // 2
+        if anchors in ('rows', 'both'):
+            windows = windows | (qf == 0) | (qf == frames - 1)
+        if anchors in ('columns', 'both'):
+            windows = windows | (kf == 0) | (kf == frames - 1)
+        allowed = (qf < 0) | (kf < 0) | windows
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            *(t.transpose(0, 1)[None] for t in tensors), attn_mask=allowed)[0].transpose(0, 1)
+        torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
+        if bucket.padding:
+            ids = torch.cat((positions[:length], positions[bucket.capacity:]))
+            unpadded = torch.nn.functional.scaled_dot_product_attention(
+                *(t[ids].transpose(0, 1)[None] for t in tensors), attn_mask=allowed[ids][:, ids])[0].transpose(0, 1)
+            assert not torch.allclose(actual[ids], unpadded)
+        plan = native._plan(layout, bounds, anchors, tensors[0].device)
+        if previous_plan is not None:
+            assert plan is previous_plan
+        previous_plan = plan
+        assert runtime.fast_softmax_calls == int(fast)
+
+
+def test_decomposed_bucket_reuses_actual_fused_residual_graph_within_capacity():
+    from tests.test_exact_runtime import upstream_functions
+    body = upstream_functions('src/models/ops/fused_block.py', {'_post_ref'})._post_ref
+    torch._dynamo.reset()
+    from torch._dynamo import utils
+    compiled = torch.compile(body, backend='eager', dynamic=False)
+    counts = []
+    try:
+        for text in (117, 165, 117, 200):
+            bucket = PrefixBucket(text, 64, 20, 128, effective_bucket_stride('decomposed', 256))
+            local_rows = (bucket.capacity + bucket.video_tokens) // 4
+            residual, branch = [torch.randn(1, local_rows, 8) for _ in range(2)]
+            gate = torch.randn(9, 8)
+            indices = torch.arange(local_rows) % len(gate)
+            expected = body(residual, gate, indices, branch)
+            torch.testing.assert_close(compiled(residual, gate, indices, branch), expected)
+            counts.append(utils.counters['stats']['unique_graphs'])
+        assert counts[0] == counts[1] == counts[2]
+        assert counts[3] > counts[2]  # crossing a bucket still specializes
+    finally:
+        torch._dynamo.reset()
 
 
 def test_reference_short_edge_is_independent_and_in_graph():
@@ -224,8 +342,10 @@ def test_native_linear_branch_receives_only_real_text_and_video_rows():
             assert torch.equal(native, bucketed)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason='FA4 requires CUDA / H200')
-def test_actual_fa4_bucket_padding_on_cuda():
+@pytest.mark.parametrize('backend', ['flex', 'decomposed'])
+@pytest.mark.parametrize('fast', [False, True])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='FA4 requires CUDA')
+def test_actual_fa4_bucket_padding_on_cuda(backend, fast):
     import sys
     root = Path(__file__).resolve().parents[1]
     upstream = root / '.deps/openvdn'
@@ -234,8 +354,14 @@ def test_actual_fa4_bucket_padding_on_cuda():
     sys.path.insert(0, str(upstream))
     from src.inference.utils.ulysses import _window_softmax_branch
     from src.models.sequence_layout import SequenceLayout
+    from openvdn_comfy.attention_runtime import AttentionRuntime, window_attention
+    buckets = TokenBuckets(64)
+    buckets.prepare(PrefixBucket(28, 3, 4, 128, 64), 'cuda')
     attn = types.SimpleNamespace(anchor_frames='none', inference_mode=True,
-                                 _window_kernel=lambda *args: 'flex')
+                                 _window_kernel=lambda *args: backend,
+                                 _ulysses_runtime=types.SimpleNamespace(profile_enabled=False))
+    state = AttentionRuntime([attn], buckets, _window_softmax_branch)
+    state.fast_softmax = fast
     # A small real FA4 check against padded SDPA, not parity with unpadded output.
     for full in (False, True):
         layout = SequenceLayout(192, 64, 4, 32)
@@ -247,6 +373,6 @@ def test_actual_fa4_bucket_padding_on_cuda():
         allowed = window_mask(64, 4, 32, full)(None, None, positions[:, None], positions[None, :])
         expected = torch.nn.functional.scaled_dot_product_attention(
             *(t.transpose(0, 1)[None] for t in tensors), attn_mask=allowed)[0].transpose(0, 1)
-        actual = _window_softmax_branch(attn, *tensors, layout, bounds, 128**-.5)
+        actual = window_attention(attn, *tensors, layout, bounds, 128**-.5)
         assert actual.isfinite().all()
         torch.testing.assert_close(actual, expected, rtol=.02, atol=.002)
