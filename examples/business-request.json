@@ -44,6 +44,8 @@
     "fused_delta": true,
     "boundary_scan": true,
     "fast_softmax": true,
-    "dual_stream": false
+    "dual_stream": false,
+    "vae_tile_batch_size": 4,
+    "vae_compile": true
   }
 }

@@ -12,7 +12,8 @@ except ImportError:
 
 BASELINE = dict(fast_communication=False, attention_kernel='native', isolate_padding=False,
                 streaming_output=False, cleanup_policy='always', linear_stats_chunk_frames=16, linear_kv_keep_ratio=1.0,
-                profile_kernels=False, fused_delta=False, boundary_scan=False, fast_softmax=False, dual_stream=False)
+                profile_kernels=False, fused_delta=False, boundary_scan=False, fast_softmax=False, dual_stream=False,
+                vae_tile_batch_size=1, vae_compile=False)
 COMBINED = {**BASELINE, 'fast_communication':True, 'streaming_output':True, 'cleanup_policy':'adaptive'}
 VARIANTS = {
     'baseline': BASELINE,
@@ -75,8 +76,8 @@ def run(client, body, root, variants, repeat):
     if body.get('softmax_backend','flex') != 'flex':
         raise ValueError('Use the current flex resident profile for a same-bucket comparison')
     health=client.http('/openvdn/health')
-    if not health.get('ready') or health.get('metrics_schema_version',0)<7:
-        raise RuntimeError('Deploy schema 7 first')
+    if not health.get('ready') or health.get('metrics_schema_version',0)<13:
+        raise RuntimeError('Deploy schema 13 first (VAE optimizations are explicitly disabled in this ablation)')
     before=root/'health-before.json'
     if before.exists() and json.loads(before.read_text())['instance']!=health['instance']:
         raise RuntimeError('Worker instance changed; start a separate output directory')

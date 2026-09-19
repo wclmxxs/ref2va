@@ -29,7 +29,7 @@ from openvdn_comfy.streaming_output import StreamingMP4
 from openvdn_comfy.optimization_options import FIELDS as OPTIMIZATION_FIELDS
 from openvdn_comfy.dit_runtime import DiTRuntime, summarize_profiles, summarize_cache
 from openvdn_comfy.cache_dit import FIELDS as CACHE_FIELDS
-from openvdn_comfy.parallel_vae import decode_parallel
+from openvdn_comfy.parallel_vae import decode_parallel, clip_plan, clip_provider
 from openvdn_comfy.resident_geometry import GeometryCache
 from openvdn_comfy.runner import conditioning_key
 from openvdn_comfy.vae_tiles import ClipDecoder
@@ -134,7 +134,7 @@ def main():
                         "active_softmax_ranks": runtime.softmax_ranks,
                         "world_size": runtime.world_size, "hardware": Hardware.from_env().metadata(),
                         "video_vae_world_size": runtime.world_size if parallel_vae else 1,
-                        "metrics_schema_version": 12, "compile_cache": compile_options,
+                        "metrics_schema_version": 13, "compile_cache": compile_options,
                         "sglang_acceleration_version": 1,
                         "profiling_capabilities": {"fine_scopes_version": 1, "optional_kernel_trace": True},
                         "pipeline_output": enabled('REF2VA_PIPELINE_OUTPUT'), "output_buffer_capacity": 2,
@@ -193,12 +193,14 @@ def main():
     base_record = render_record(cfg, model) if runtime.is_main else None
     from src.models.softmax_attention import flex_attention as flex_module
     compiler = CompilerMonitor(flex_module, device)
-    clip_decoder = ClipDecoder(model.vae) if parallel_vae else None
+    clip_decoder = ClipDecoder(model.vae) if parallel_vae or runtime.is_main else None
     history = WarmupHistory(BACKEND / "warmup-history.json", source_lock(), profile,
                             capacity=compile_options["max_shapes"]) if runtime.is_main else None
 
     def reset_compiler():
         torch._dynamo.reset()
+        if clip_decoder is not None:
+            clip_decoder.reset_compiler()
         # BlockMasks are deterministic tensors, independent of Dynamo's graph
         # lifetime. Keep their existing bounded LRU across a graph rotation.
         gc.collect()
@@ -306,33 +308,57 @@ def main():
         pending_output = None
         video_decode_seconds = None
         video_decode_details = {"world_size": 1, "native_temporal_assembly": True}
+        vae_compilation = None
         output_timings, encoding = {}, {}
         stream_writer = (StreamingMP4(plan, request["output"], model.audio_vae.config.sampling_rate,
                                       render.PIXEL_MEAN, render.PIXEL_STD, verify=warmup)
                          if current.streaming_output and parallel_vae and runtime.is_main and not denoise_only else None)
         try:
-            if parallel_vae and not denoise_only:
+            if not denoise_only:
                 state(run_status, "decoding_video_vae", token=request.get("token"))
                 decode_timings = {}
-                clip_decoder.tile_count = 0
+                # Keep the existing exact native transport/assembly startup
+                # check. Optimized tile shapes compile and verify lazily on the
+                # first real request instead of adding a startup shape sweep.
+                if clip_decoder is not None:
+                    clip_decoder.configure(1 if warmup else current.vae_tile_batch_size,
+                                           False if warmup else current.vae_compile)
+                vae_compile_before = compiler.snapshot()
                 with measured(decode_timings, "video_vae_decode_seconds", device):
-                    mean = torch.tensor(model.vae.config.latents_mean, device=device).view(1, -1, 1, 1, 1)
-                    std = torch.tensor(model.vae.config.latents_std, device=device).view(1, -1, 1, 1, 1)
-                    with torch.autocast(device_type="cuda", dtype=torch.float16):
-                        decoded_video, video_decode_details = decode_parallel(
-                            model.vae, latents * std + mean, rank=runtime.rank, world_size=runtime.world_size,
-                            verify=warmup, clip_decode=clip_decoder, streaming=current.streaming_output,
-                            on_chunk=stream_writer.submit if stream_writer else None)
-                tile_counts = [None] * runtime.world_size
-                dist.all_gather_object(tile_counts, clip_decoder.tile_count)
+                    if clip_decoder is not None:
+                        mean = torch.tensor(model.vae.config.latents_mean, device=device).view(1, -1, 1, 1, 1)
+                        std = torch.tensor(model.vae.config.latents_std, device=device).view(1, -1, 1, 1, 1)
+                        with torch.autocast(device_type="cuda", dtype=torch.float16):
+                            if parallel_vae:
+                                decoded_video, video_decode_details = decode_parallel(
+                                    model.vae, latents * std + mean, rank=runtime.rank, world_size=runtime.world_size,
+                                    verify=warmup, clip_decode=clip_decoder, streaming=current.streaming_output,
+                                    on_chunk=stream_writer.submit if stream_writer else None)
+                            else:
+                                with clip_provider(model.vae, clip_decoder):
+                                    decoded_video = model.vae.decode(latents * std + mean, return_dict=False)[0]
+                                video_decode_details['temporal_clips'] = len(clip_plan(model.vae, latents.shape)[1])
+                vae_records = [None] * runtime.world_size
+                dist.all_gather_object(vae_records, {"rank": runtime.rank, "tiles": clip_decoder.tile_count if clip_decoder else 0,
+                                                   "decoder": clip_decoder.report() if clip_decoder else None,
+                                                   "compiler": {"rank": runtime.rank, **compiler.since(vae_compile_before)}})
+                vae_compilation = summarize_compilation([r['compiler'] for r in vae_records])
+                vae_compilation.pop('times_overlap_denoise')
+                vae_compilation.update(times_overlap_video_vae=True,
+                                       enabled=current.vae_compile and not warmup,
+                                       scope='VAE decoder repeated blocks; excludes DiT, includes first-shape tracing/cache loading')
+                tile_counts = [r['tiles'] for r in vae_records]
                 video_decode_details.update(spatial_tiles_by_rank=tile_counts,
+                                            tile_decoder_by_rank=[{'rank': r['rank'], **r['decoder']} for r in vae_records if r['decoder']],
+                                            compilation=vae_compilation,
+                                            startup_native_check=warmup,
                                             stitch="preallocated_native_blending",
                                             wall_time_scope="decode, transport, assembly, and pixel-queue backpressure"
-                                            if current.streaming_output else "decode, transport, assembly")
+                                            if current.streaming_output and parallel_vae else "decode, transport, assembly")
                 video_decode_seconds = decode_timings["video_vae_decode_seconds"]
                 if warmup and runtime.is_main:
                     atomic_json(BACKEND / "vae-parity.json", {"instance": instance, **video_decode_details})
-                    print(f"Parallel video VAE: startup parity passed for {video_decode_details['temporal_clips']} clips", flush=True)
+                    print(f"Video VAE: native startup decode complete for {video_decode_details['temporal_clips']} clips", flush=True)
             if runtime.is_main and not denoise_only:
                 state(run_status, "decoding", token=request.get("token"))
                 output_timings, encoding = decode_and_save(
@@ -373,6 +399,11 @@ def main():
             timings.update(output_timings)
             if video_decode_details.get('streaming'):
                 timings['video_vae_compute_max_rank_seconds'] = max(r['compute_seconds'] for r in video_decode_details['by_rank'])
+            if vae_compilation is not None:
+                timings['video_vae_compile_seconds'] = vae_compilation['dynamo_compile_seconds']
+                for field in ('tile_decoder_seconds', 'tile_stitch_seconds', 'verification_seconds'):
+                    timings['video_vae_' + field] = max(r['timings'].get(field, 0.)
+                                                       for r in video_decode_details['tile_decoder_by_rank'])
             timings.update(conditioning_seconds=encode_seconds, condition_load_seconds=condition_load_seconds,
                            cleanup_seconds=cleanup_seconds, worker_wall_seconds=time.monotonic() - worker_start,
                            gpu_worker_seconds=time.monotonic() - worker_start, cross_request_output=defer_output)

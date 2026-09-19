@@ -240,4 +240,6 @@ def optimization_inputs():
         "boundary_scan": ("BOOLEAN", {"default": True, "tooltip": "Compose frame transitions within chunks; preserves information with FP32 reassociation."}),
         "fast_softmax": ("BOOLEAN", {"default": True, "tooltip": "Optimize copies in the decomposed window attention path."}),
         "dual_stream": ("BOOLEAN", {"default": False, "tooltip": "Experimental shared-QKV two-stream Ulysses; requires softmax_ranks=0."}),
+        "vae_tile_batch_size": ([4, 1, 2, 8], {"tooltip": "Batch independent same-shape VAE tiles. 1 with vae_compile=false restores scalar decode."}),
+        "vae_compile": ("BOOLEAN", {"default": True, "tooltip": "Compile repeated VAE decoder blocks on first use, with native numerical checks. Uses disk cache; no exhaustive startup warmup."}),
     }

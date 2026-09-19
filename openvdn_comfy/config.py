@@ -57,6 +57,8 @@ class Settings:
     attention_kernel: str = "native"
     isolate_padding: bool = False
     streaming_output: bool = True
+    vae_tile_batch_size: int = 4
+    vae_compile: bool = True
     cleanup_policy: str = "adaptive"
     cache_dit: bool = False
     cache_dit_threshold: float = 0.08

@@ -28,6 +28,21 @@ class ClipDecoder:
         self.decode_clip = vae._decode_clip
         self.weights = OrderedDict()
         self.tile_count = 0
+        self.batcher = None
+
+    def configure(self, batch_size, compile_decoder):
+        from .vae_batch import TileBatcher
+        if self.batcher is None:
+            self.batcher = TileBatcher(self.vae, self.decode_clip)
+        self.batcher.configure(batch_size, compile_decoder)
+        self.tile_count = 0
+
+    def reset_compiler(self):
+        if self.batcher is not None:
+            self.batcher.reset_compiler()
+
+    def report(self):
+        return self.batcher.report() if self.batcher is not None else {}
 
     def blend(self, a, b, extent, dim):
         import torch
@@ -77,5 +92,7 @@ class ClipDecoder:
         return output
 
     def __call__(self, z):
+        if self.batcher is not None:
+            return self.batcher.decode_clip(z, self.stitch)
         with override_methods(self.vae, _stitch_tiles=self.stitch, _blend=self.blend):
             return self.decode_clip(z)

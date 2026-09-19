@@ -45,6 +45,8 @@ def startup_settings():
         attention_kernel=os.environ.get("REF2VA_ATTENTION_KERNEL", "native"),
         isolate_padding=boolean("REF2VA_ISOLATE_PADDING", False),
         streaming_output=boolean("REF2VA_STREAMING_OUTPUT", True),
+        vae_tile_batch_size=int(os.environ.get("REF2VA_VAE_TILE_BATCH_SIZE", "4")),
+        vae_compile=boolean("REF2VA_VAE_COMPILE", True),
         cleanup_policy=os.environ.get("REF2VA_CLEANUP_POLICY", "adaptive"),
         softmax_backend=os.environ.get("REF2VA_SOFTMAX_BACKEND", Hardware.from_env().softmax_backend),
         softmax_ranks=int(os.environ.get("REF2VA_SOFTMAX_RANKS", str(Hardware.from_env().softmax_ranks))),

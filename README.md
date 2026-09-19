@@ -314,6 +314,21 @@ python3 scripts/benchmark_compile_cache.py --server http://43.218.119.131:8188 \
 
 ## 输出优化与阶段耗时
 
+视频 VAE 默认每批解码 4 个同形状空间块，并按需编译 decoder 的重复 Transformer block。块只拼在 batch 轴，attention、RoPE、tile 边界、重叠、时间拼接和最终裁剪规则保持原样；FP32 权重和原来的 FP16 autocast 保留。没有扩大 tile、补齐像素或减少计算层数。并行和单 rank VAE 都支持。
+
+业务接口 `optimization` 新增 `vae_tile_batch_size: 1|2|4|8`（默认 4）和 `vae_compile: true|false`（默认 true）；ComfyUI 也有同名控件。`1 + false` 恢复逐块 eager 解码，可做同 seed 对照。启动默认值可用 `REF2VA_VAE_TILE_BATCH_SIZE` / `REF2VA_VAE_COMPILE=0|1` 设置。
+
+启动仍使用逐块 eager 路径执行原有的精确传输/组装校验，**不新增全量编译预热**。首个实际请求才编译其所需的 block 形状，后续内存复用；重启后利用现有 Inductor/Triton 磁盘缓存（仍可能有 tracing/cache loading）。关闭 CUDA graphs 和全量 autotune。每卡首次出现的 batch/shape/stride/dtype/autocast/compile 组合，会把结果与原生逐块 eager 输出比较，必须有限且同时满足 relative L2 ≤ 0.005、max abs ≤ 0.05；失败直接报错，不能当作成功。只缓存最近 64 个数值校验记录，不缓存图像 tensor；Dynamo 重置后重新校验编译路径。这是实现正确性的抽样数值门槛，**不是全片逐像素一致或感知画质保证**；需要目标 GPU 实测速度及同 case 对照。
+
+schema 13 的业务任务结果新增 `video_vae_decode`，包含每卡 tile 数、实际 decoder 调用数、batch 分布、编译命中和数值校验误差。`timings.video_vae_compile_seconds`、`video_vae_tile_decoder_seconds`、`video_vae_tile_stitch_seconds`、`video_vae_verification_seconds` 分别报告跨卡最大值；均是 `video_vae_decode_seconds` 内的诊断子项，不能再累加。DiT 的 `compilation` 字段仍仅统计去噪。首次 VAE 编译/校验请求不能计入热态测速。
+
+同一请求对比逐块 eager、4 块合批、4 块合批 + 编译（每组一次预热、三次交错热跑，保留完整响应）：
+
+```bash
+python3 scripts/benchmark_vae.py --server http://HOST:8188 \
+  --request-file case.json --output-dir work/vae-benchmark
+```
+
 使用原版视频/音频 VAE。输出阶段在 GPU 按 8 帧处理颜色、缩放、uint8 转换，提前裁掉超出目标时长的帧；只复制目标尺寸的 RGB 到 CPU。默认使用两个固定大小的 pinned CPU 缓冲区，独立 CUDA stream 执行像素准备和非阻塞 D2H，CPU 同时编码已完成的批次。消费者只等待该批次的完成事件，编码结束后才复用缓冲区；不在每批前后同步整个 GPU。保留像素运算顺序、舍入、插值、libx264 `veryfast` / CRF 23 / 8 线程和 AAC 参数。MP4 仍原子提交，失败不留下可被误认成功的文件。
 
 `REF2VA_ASYNC_OUTPUT=0` 恢复原有单预取线程输出；CPU 测试也使用此路径。启动合成案例逐批比较异步传回的 RGB 与原同步路径，要求逐元素一致；失败则不开放 UI。`upstream.output_encoding` 返回 `async_pinned_output`、`pixel_timing_method` 和 `pixel_parity`。GPU 对照测试还覆盖非默认生产流、缓冲区复用、非整批尾帧，以及同步/异步输出 MP4 的解码后音视频一致性；在没有 CUDA 的环境中明确跳过，不计为通过。

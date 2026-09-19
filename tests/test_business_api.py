@@ -97,7 +97,8 @@ def test_complete_optimization_mapping_and_request_defaults(environment):
         'attention_kernel': 'native', 'isolate_padding': False, 'linear_stats_chunk_frames': 16, 'linear_kv_keep_ratio': .5,
         'softmax_ranks': 6, 'fast_communication': True, 'streaming_output': True,
         'cleanup_policy': 'adaptive', 'profile': False, 'profile_kernels': False,
-        'fused_delta': True, 'boundary_scan': True, 'fast_softmax': True, 'dual_stream': False}
+        'fused_delta': True, 'boundary_scan': True, 'fast_softmax': True, 'dual_stream': False,
+        'vae_tile_batch_size': 4, 'vae_compile': True}
     request, settings, sources = contract.normalize_request(body(optimization=optimization, reference_short_edge=512), state)
     assert request['seed'] == 42 and request['reference_short_edge'] == 512
     for new, old in contract.CACHE_MAPPING.items():
