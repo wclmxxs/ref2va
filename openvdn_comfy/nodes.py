@@ -230,6 +230,7 @@ def optimization_inputs():
         "fast_communication": ("BOOLEAN", {"default": True}),
         "attention_kernel": (["native", "decomposed"],),
         "linear_stats_chunk_frames": ([16, 8, 32],),
+        "linear_kv_keep_ratio": ([1.0, 0.5, 0.25], {"tooltip": "Approximate video K/V statistics in linear attention. 1.0 preserves the original path; 0.5/0.25 can change temporal consistency."}),
         "isolate_padding": ("BOOLEAN", {"default": False}),
         "streaming_output": ("BOOLEAN", {"default": True}),
         "cleanup_policy": (["adaptive", "always"],),

@@ -78,15 +78,19 @@ class AttentionRuntime:
         from src.models.linear_attention import scan
         self.kernel, self.isolate_padding = settings.attention_kernel, settings.isolate_padding
         self.linear_chunk = scan.STATS_CHUNK_FRAMES = settings.linear_stats_chunk_frames
+        self.linear_kv_keep_ratio = settings.linear_kv_keep_ratio
         if self.kernel == 'decomposed':
             from src.models.softmax_attention.decomposed import varlen_kernel
             varlen_kernel()  # Fail explicitly if FA4 varlen is not installed.
 
     def signature(self):
-        return self.kernel, self.isolate_padding, self.linear_chunk
+        # Keep existing full-statistics geometry IDs stable across this upgrade.
+        signature = (self.kernel, self.isolate_padding, self.linear_chunk)
+        return signature if self.linear_kv_keep_ratio == 1.0 else (*signature, 'linear_kv_v1', self.linear_kv_keep_ratio)
 
     def report(self):
-        return {'kernel': self.kernel, 'linear_stats_chunk_frames': self.linear_chunk, 'isolate_padding': self.isolate_padding,
+        return {'kernel': self.kernel, 'linear_stats_chunk_frames': self.linear_chunk,
+                'linear_kv_keep_ratio': self.linear_kv_keep_ratio, 'isolate_padding': self.isolate_padding,
                 'padding_method': 'block_mask_key_exclusion' if self.isolate_padding else 'unmasked',
                 'score_mod': False}
 

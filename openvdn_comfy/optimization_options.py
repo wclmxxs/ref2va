@@ -1,5 +1,5 @@
 """Request-local optimization controls; quality experiments stay opt-in."""
-FIELDS = ('fast_communication', 'attention_kernel', 'isolate_padding', 'streaming_output', 'cleanup_policy', 'linear_stats_chunk_frames')
+FIELDS = ('fast_communication', 'attention_kernel', 'isolate_padding', 'streaming_output', 'cleanup_policy', 'linear_stats_chunk_frames', 'linear_kv_keep_ratio')
 
 
 def validate(settings):
@@ -8,6 +8,8 @@ def validate(settings):
             raise ValueError(f'{name} must be boolean')
     if type(settings.linear_stats_chunk_frames) is not int or settings.linear_stats_chunk_frames not in (8, 16, 32):
         raise ValueError('linear_stats_chunk_frames must be 8, 16 or 32')
+    from .linear_kv import validate_ratio
+    validate_ratio(settings.linear_kv_keep_ratio)
     if settings.attention_kernel not in ('native', 'decomposed'):
         raise ValueError('attention_kernel must be native or decomposed')
     if settings.attention_kernel == 'decomposed' and settings.softmax_backend == 'ref':

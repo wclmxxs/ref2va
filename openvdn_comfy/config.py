@@ -48,6 +48,7 @@ class Settings:
     resolution: int | None = None
     fast_communication: bool = True
     linear_stats_chunk_frames: int = 16
+    linear_kv_keep_ratio: float = 1.0
     attention_kernel: str = "native"
     isolate_padding: bool = False
     streaming_output: bool = True

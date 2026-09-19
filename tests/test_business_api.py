@@ -94,7 +94,7 @@ def test_complete_optimization_mapping_and_request_defaults(environment):
     original = json.dumps(state, sort_keys=True)
     optimization = {'cache_dit': {'enabled': True, 'warmup': 3, 'rdt': .25,
         'max_continuous_cached_steps': 1, 'fn_blocks': 8, 'bn_blocks': 8, 'max_cached_steps': 2, 'last_steps': 1},
-        'attention_kernel': 'native', 'isolate_padding': False, 'linear_stats_chunk_frames': 16,
+        'attention_kernel': 'native', 'isolate_padding': False, 'linear_stats_chunk_frames': 16, 'linear_kv_keep_ratio': .5,
         'softmax_ranks': 6, 'fast_communication': True, 'streaming_output': True,
         'cleanup_policy': 'adaptive', 'profile': False}
     request, settings, sources = contract.normalize_request(body(optimization=optimization, reference_short_edge=512), state)
@@ -119,6 +119,33 @@ def test_documented_example_covers_every_business_parameter(environment):
     request, settings, sources = contract.normalize_request(example, environment.state)
     assert settings.cache_dit and settings.cache_dit_threshold == .25
     assert request['num_inference_steps'] == 8 and sources[0]['kind'] == 'url'
+
+
+def test_linear_kv_ratio_is_request_local_and_rejected_before_queueing(environment):
+    async def exercise():
+        async with environment.client() as client:
+            for ratio in (True, 0, .75, '0.5', float('nan')):
+                response = await client.post(contract.PREFIX+'/video_generation',
+                                             json=body(optimization={'linear_kv_keep_ratio': ratio}))
+                assert response.status == 400, await response.text()
+            assert not environment.server.prompt_queue.pending
+            for optimization, expected in (({'linear_kv_keep_ratio': .5}, .5),
+                                           ({'linear_kv_keep_ratio': .25}, .25), ({}, 1.)):
+                response = await client.post(contract.PREFIX+'/video_generation', json=body(optimization=optimization))
+                assert response.status == 200, await response.text()
+                task_id = (await response.json())['task_id']
+                internal = contract.job_id(task_id)
+                assert jobs.read_job(internal)['settings']['linear_kv_keep_ratio'] == expected
+                jobs.update_job(internal, status='succeeded', metrics={
+                    'timings': {'linear_frame_statistics_seconds': .2},
+                    'upstream': {'optimizations': {'linear_kv': {'requested_keep_ratio': expected}}}})
+                response = await client.post(contract.PREFIX+'/query/video_generation',
+                                             json={'model': 'MiniMax-H3', 'task_id': task_id})
+                assert response.status == 200, await response.text()
+                task = (await response.json())['task']
+                assert task['optimizations']['linear_kv']['requested_keep_ratio'] == expected
+                assert task['timings']['linear_frame_statistics_seconds'] == .2
+    asyncio.run(exercise())
 
 
 def test_large_valid_inline_body_exceeds_aiohttp_default_one_mib(environment):

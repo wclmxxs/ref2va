@@ -441,6 +441,7 @@ cd /root/ref2va && git pull --ff-only && bash deploy.sh start
 | `fast_communication` | `true` | 每层从逐目标打包改成两个 Triton kernel，并融合回传后的 head 重排。NCCL payload、顺序、精度和异步 work/buffer 生存期不变；不量化通信。只作用于 branch-parallel 布局。 |
 | `attention_kernel` | `native` | `native` 保留当前 FA4/Flex 路径；`decomposed` 用上游 dense + varlen 分解相同窗口，保留相同桶。需要比较速度和浮点误差，不自动宣称更快。 |
 | `linear_stats_chunk_frames` | `16` | 可选 `8/16/32`，调整 linear 分支逐帧统计的 GEMM 批次，方程与精度不变。32 减少批次数、增加峰值显存；cuBLAS 算法可能随批次改变。 |
+| `linear_kv_keep_ratio` | `1.0` | 可选 `1.0/0.5/0.25`，控制 linear 分支每帧视频 K/V 统计保留的位置比例。`1.0` 走原路径；降低比例是有损近似，可能影响细节、身份和时序一致性，需同 seed 对照。 |
 | `isolate_padding` | `false` | 仅在 `softmax_backend=flex`、`attention_kernel=native` 时可用。用 BlockMask 排除中间 gap 的 key，保持完整块的快速路径，不使用 score_mod；full-cover 情况也通过隔离 mask，不激活额外 linear 分支。是否满足低开销目标须实测。 |
 | `streaming_output` | `true` | 并行 VAE 边解码边传回 clip；rank 0 按原生时间混合顺序提交有效帧，CPU H.264 与后续解码重叠。编码队列最多 4 个像素块，非零卡最多保留 2 个异步发送；异常会退出线程并删除 partial MP4。关闭时恢复整段解码后编码。 |
 | `cleanup_policy` | `adaptive` | 热态请求结束保留 CUDA 空闲内存池。新编译、启动校验、显存压力或每 32 次请求清理；`always` 恢复每次 gc/empty_cache。新的条件编码前所有卡仍释放空闲缓存，给 Qwen 跨卡临时分配腾出空间。 |
@@ -448,6 +449,27 @@ cd /root/ref2va && git pull --ff-only && bash deploy.sh start
 服务启动默认值也可通过 `REF2VA_FAST_COMMUNICATION`、`REF2VA_ATTENTION_KERNEL`、`REF2VA_LINEAR_STATS_CHUNK_FRAMES`、`REF2VA_ISOLATE_PADDING`、`REF2VA_STREAMING_OUTPUT`、`REF2VA_CLEANUP_POLICY` 设置。若要完全恢复此前调度，用 `REF2VA_FAST_COMMUNICATION=0 REF2VA_STREAMING_OUTPUT=0 REF2VA_CLEANUP_POLICY=always bash deploy.sh start`。现有 `REF2VA_ASYNC_OUTPUT` 控制非流式输出的 pinned-memory 预取。
 
 返回 `metrics.upstream.optimizations`，包含实际参数、通信小张量/真实 NCCL 一致性检查、attention 选择和清理原因。隔离开启时 `compilation.token_bucket.policy=prefix_gap_isolated_v3`，`padding_attention=excluded_keys`；默认仍为 `prefix_gap_unmasked_v2`。隔离与原生不补齐在有效 key 集合上等价，浮点核/矩阵尺寸不同，不能承诺生成视频逐像素一致。Cache-DiT 仍按原参数独立运行。
+
+`linear_kv_keep_ratio` 可在业务 API 的 `optimization` 内逐请求指定，不需要重启或重载模型。例如，在完整请求中使用：
+
+```json
+{
+  "optimization": {
+    "softmax_ranks": 6,
+    "linear_kv_keep_ratio": 0.5,
+    "profile": false,
+    "cache_dit": {"enabled": true, "rdt": 0.25}
+  }
+}
+```
+
+这里的 `softmax_ranks=6` 适用于八卡 worker；四卡须小于 4。旧 `/openvdn/jobs` 接口把 `linear_kv_keep_ratio` 放在顶层，CLI 使用 `--linear-kv-keep-ratio 0.5`，ComfyUI 节点也有对应选项。省略时默认为 `1.0`，不自动开启近似。完整业务请求见 [examples/business-request.json](examples/business-request.json)。
+
+采样发生在原有特征和卷积计算之后：将每帧展平的空间位置均匀划成 `ceil(S × ratio)` 段，各取一个中点，同一组索引同时作用于视频 K/V/beta；索引不使用随机数。统计矩阵 A、B 均乘 `S/保留数量` 以校正求和尺度，后续扫描仍使用原始 S。完整 Q、读出、文本状态、softmax、投影和通信数据量保持不变，因此 `0.5` 不代表整个 linear 分支或视频生成提速一倍。采样还会增加索引读取成本；速度和画质均需要 GPU 实测。
+
+返回的 `optimizations.linear_kv` 包含请求比例、是否实际执行近似、逐 rank 的原始/保留 token 数与统计调用次数。业务 API 查询结果位于 `task.optimizations.linear_kv`。开启 `optimization.profile=true` 后，`timings` 增加 `linear_kv_select_seconds`、`linear_frame_statistics_seconds`、`linear_kv_rescale_seconds`，均为各 rank 累计 CUDA event 耗时的最大值，已包含在去噪耗时中，不能再相加到总耗时；关闭 profile 时为 `null`。`1.0` 也可开启 profile 测量完整统计阶段作为对照。未执行 linear 的层/rank 不记采样，Cache-DiT 跳过的层也不会虚报调用。
+
+`1.0` 且关闭 profile 时完全旁路采样包装，逐 rank 报告为 `instrumented=false`、`statistics_calls=null`，表示未计数，而非没执行 linear 分支。不同比例单独标记编译几何，新比例首次请求可能编译，后续复用；默认启动仍只预热原路径。请求成功或失败都会恢复原始方法并释放采样索引，避免影响后续 `1.0` 请求。
 
 流式模式的 `video_vae_decode_seconds` 是包含传输、拼接、像素提交/队列反压的阶段 wall time，不是纯 VAE GPU 算子时间。新增 `video_vae_compute_max_rank_seconds` 来自逐 clip CUDA event，取八卡中最大的累计 decode 时间；`video_vae_decode.by_rank` 保留各卡明细。`output_pipeline_wall_seconds` 是整个重叠流水线耗时，`first_pixel_chunk_seconds` 表示第一批像素交给编码器的延迟。H.264、VAE、D2H 等组件现在有更多重叠，**不累加这些字段估算总耗时**；使用 `processing_wall_seconds` / `decode_and_encode_seconds` 比较端到端结果。
 

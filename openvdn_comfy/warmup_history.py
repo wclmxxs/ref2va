@@ -70,7 +70,7 @@ class WarmupHistory:
             settings["seed"] = 42
             settings["cache_dit"] = False
             settings["profile"] = False
-            identity = (candidate["prompt_file"], settings["softmax_ranks"],
+            identity = (candidate["prompt_file"], settings["softmax_ranks"], settings['linear_kv_keep_ratio'],
                         json.dumps(Settings(**settings).render_plan().metadata(), sort_keys=True))
             if identity in seen:
                 continue

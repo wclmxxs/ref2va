@@ -32,6 +32,8 @@ def main():
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--fast-communication", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--linear-stats-chunk-frames", type=int, choices=[8,16,32], default=16)
+    parser.add_argument("--linear-kv-keep-ratio", type=float, choices=[1.0, .5, .25], default=1.0,
+                        help="Approximate video K/V statistics only; 1.0 keeps the original computation")
     parser.add_argument("--attention-kernel", choices=["native", "decomposed"], default="native")
     parser.add_argument("--isolate-padding", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--streaming-output", action=argparse.BooleanOptionalAction, default=True)

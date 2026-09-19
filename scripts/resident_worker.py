@@ -20,6 +20,7 @@ from openvdn_comfy.fast_output import decode_and_save, measured
 from openvdn_comfy.exact_runtime import ExactRuntime, enabled
 from openvdn_comfy.attention_runtime import AttentionRuntime, summarize_attention
 from openvdn_comfy.communication import CommunicationRuntime
+from openvdn_comfy.linear_kv import LinearKVRuntime, summarize_linear_kv
 from openvdn_comfy.request_cleanup import RequestCleanup
 from openvdn_comfy.streaming_output import StreamingMP4
 from openvdn_comfy.optimization_options import FIELDS as OPTIMIZATION_FIELDS
@@ -146,6 +147,7 @@ def main():
         raise RuntimeError("Expected OpenVDN hybrid checkpoint")
     install_ulysses(model.transformer, runtime, softmax_ranks=settings.softmax_ranks)
     dit_runtime = DiTRuntime(model.transformer, runtime, ulysses.iter_hybrids(model.transformer))
+    linear_kv = LinearKVRuntime(dit_runtime.hybrids, runtime)
     # Native decomposed/reference paths remain available, without padded tokens.
     bucket_stride = compile_options["token_bucket"] if settings.softmax_backend == "flex" else 0
     buckets = TokenBuckets(bucket_stride)
@@ -245,7 +247,8 @@ def main():
         steps = []
         compile_before = compiler.snapshot()
         denoise_start = time.monotonic()
-        with dit_runtime.request(current, warmup=warmup), exact_runtime.request(verify=warmup):
+        with (dit_runtime.request(current, warmup=warmup), exact_runtime.request(verify=warmup),
+              linear_kv.request(current.linear_kv_keep_ratio)):
             latents, audio = exact_runtime.generate(
                 model.transformer, embeds, tags, plan.sampling_frames, 8, current.seed, device,
                 video_shift=12., audio_shift=3., runtime=runtime, step_seconds=steps, conditions=conditions)
@@ -255,13 +258,15 @@ def main():
             exact_report = exact_runtime.report()
             denoise_seconds = time.monotonic() - denoise_start
             dit_report = dit_runtime.report(denoise_seconds)
+            linear_kv_record = linear_kv.report()
         compile_records = [None] * runtime.world_size
         dist.all_gather_object(compile_records, {"rank": runtime.rank, **compiler.since(compile_before),
                                                "exact_runtime": exact_report, "dit_runtime": dit_report,
-                                               "attention": attention_runtime.report()})
+                                               "attention": attention_runtime.report(), "linear_kv": linear_kv_record})
         exact_records = [{"rank": item["rank"], **item.pop("exact_runtime")} for item in compile_records]
         dit_records = [item.pop("dit_runtime") for item in compile_records]
         attention_report = summarize_attention([{'rank': item['rank'], **item.pop('attention')} for item in compile_records])
+        linear_kv_report = summarize_linear_kv([item.pop('linear_kv') for item in compile_records])
         parallel_profile = summarize_profiles([item["profile"] for item in dit_records])
         cache_report = summarize_cache([item["cache_dit"] for item in dit_records])
         if runtime.is_main and warmup:
@@ -332,6 +337,10 @@ def main():
                    "hot_denoise_seconds": denoise_seconds if compilation["runtime_graph_reused"] else None,
                    "decode_and_encode_seconds": time.monotonic() - decode_start,
                    "parallel_profile_ms_per_nfe_by_rank": profiles}
+        for name in ('linear_kv_select', 'linear_frame_statistics', 'linear_kv_rescale'):
+            # Nested inside linear_compute / denoise; never sum across ranks.
+            timings[name + '_seconds'] = (max(r['profile']['total_ms'].get(name, 0.) for r in dit_records) / 1000
+                                          if parallel_profile['enabled'] else None)
         cleanup_start = time.monotonic()
         del latents, audio, embeds, tags, conditions, decoded_video
         cleanup_report = cleanup.run(torch, device, current.cleanup_policy,
@@ -357,7 +366,8 @@ def main():
                       "optimizations": {"requested": {name: getattr(current, name) for name in OPTIMIZATION_FIELDS},
                                         "communication": {"enabled": communication.active, "parity": communication.parity,
                                                           "pack_launches_per_layer": 2 if communication.active and runtime.branch_parallel else None},
-                                        "attention": attention_report, "cleanup": cleanup_report}, "video_vae_decode": video_decode_details,
+                                        "attention": attention_report, "linear_kv": linear_kv_report,
+                                        "cleanup": cleanup_report}, "video_vae_decode": video_decode_details,
                       "compilation": compilation,
                       "conditioning": conditioning,
                       "exact_runtime": {"enabled": exact_runtime.active, "by_rank": exact_records},

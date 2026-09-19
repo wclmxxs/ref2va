@@ -34,6 +34,7 @@
     "attention_kernel": "native",
     "isolate_padding": false,
     "linear_stats_chunk_frames": 16,
+    "linear_kv_keep_ratio": 1.0,
     "softmax_ranks": 6,
     "fast_communication": true,
     "streaming_output": true,
