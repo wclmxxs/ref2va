@@ -282,3 +282,31 @@ def test_client_timeout_signals_failure_recovery(tmp_path, monkeypatch):
     command = backend.read_json(tmp_path / 'command.json')
     cancel = backend.read_json(tmp_path / 'cancel.json')
     assert cancel == {'instance': 'worker', 'token': command['token'], 'reason': 'timeout'}
+
+
+def test_stop_during_preflight_reaps_shell_child(tmp_path, monkeypatch):
+    import time
+    import shlex
+    service = load_script('service')
+    root = tmp_path/'service';(root/'scripts').mkdir(parents=True)
+    pidfile = root/'doctor-pid'
+    (root/'scripts/doctor.py').write_text(
+        'import os,time\nfrom pathlib import Path\n'
+        f'Path({str(pidfile)!r}).write_text(str(os.getpid()))\ntime.sleep(30)\n')
+    (root/'deploy.sh').write_text('#!/bin/bash\n'+shlex.quote(sys.executable)+' '+shlex.quote(str(root/'scripts/doctor.py'))+'\n')
+    directory=root/'.runtime/backend';directory.mkdir(parents=True)
+    monkeypatch.setattr(service,'ROOT',root);monkeypatch.setattr(service,'BACKEND',directory)
+    monkeypatch.setattr(service,'LOG',root/'.runtime/service.log');monkeypatch.setattr(service,'RECORD',directory/'service.json')
+    child = None
+    try:
+        service.start([])
+        deadline=time.monotonic()+3
+        while not pidfile.exists() and time.monotonic()<deadline: time.sleep(.01)
+        child=psutil.Process(int(pidfile.read_text()))
+        service.stop()
+        assert not child.is_running() or child.status()==psutil.STATUS_ZOMBIE
+    finally:
+        service.stop()
+        if child and child.is_running():
+            try: child.kill()
+            except psutil.NoSuchProcess: pass

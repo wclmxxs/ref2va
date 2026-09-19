@@ -67,7 +67,7 @@ def main():
         log = RUNTIME / "nccl-probe.log"
         print(f"{hardware.world_size}-rank NCCL probe: NCCL_NVLS_ENABLE={worker_environment().get('NCCL_NVLS_ENABLE', 'NCCL default')}", flush=True)
         with gpu_lock(lambda: None):
-            run_process([sys.executable, "-m", "torch.distributed.run", "--standalone", f"--nproc_per_node={hardware.world_size}",
+            run_process([sys.executable, "-m", "torch.distributed.run", "--standalone", "--local-addr=127.0.0.1", f"--nproc_per_node={hardware.world_size}",
                          str(ROOT / "scripts/nccl_probe.py")], log, timeout=180)
         print(log.read_text())
     print("READY: ./deploy.sh start — upload an image and import workflows/openvdn_ref2va_like.json")

@@ -44,6 +44,12 @@ def checkout(name, source):
             if all(previous.get(k) == v for k, v in identity.items()) and previous.get("head") == git(path, "rev-parse", "HEAD"):
                 return
             raise RuntimeError(f"Managed patched Diffusers changed: preserve {path} then rerun install")
+    if name != 'diffusers':
+        try:
+            if git(path, 'rev-parse', 'HEAD') == pin:
+                return
+        except subprocess.CalledProcessError:
+            pass
     git(path, "fetch", "--depth", "1", "origin", pin)
     git(path, "checkout", "--detach", pin)
     if name == "diffusers":
@@ -59,7 +65,9 @@ def main():
     link = DEPS / "ComfyUI/custom_nodes/openvdn_h200"
     if link.is_symlink():
         if link.resolve() != ROOT:
-            raise RuntimeError(f"Custom node link points elsewhere: {link}")
+            # A managed node link from a relocated VM image may be absolute.
+            link.unlink()
+            link.symlink_to(ROOT, target_is_directory=True)
     elif link.exists():
         raise RuntimeError(f"Custom node path already exists: {link}")
     else:

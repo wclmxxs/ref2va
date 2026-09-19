@@ -1,6 +1,6 @@
-# OpenVDN 8 步 · ComfyUI · H200 / B200
+# OpenVDN 8 步 · ComfyUI · H200 / B200 / B300
 
-默认一条视频使用全部 8 张 H200；可选择 H200/B200，以及一套八卡或两套四卡服务。ComfyUI 负责输入、队列和视频预览；常驻 GPU 进程调用固定版本的 [OpenVDN](https://github.com/OpenVDN/vdn-minimax-h3)，默认 FP8、6 个 softmax rank + 2 个 linear rank、8 NFE。
+默认自动识别 H200/B200/B300，一条视频使用全部 8 张 GPU；可切换为两套四卡服务。ComfyUI 负责输入、队列和视频预览；常驻 GPU 进程调用固定版本的 [OpenVDN](https://github.com/OpenVDN/vdn-minimax-h3)，默认 FP8、8 NFE；H200 八卡默认 6 个 softmax rank + 2 个 linear rank。
 
 图片参考模式是官方 **Ref2VA-like**：FL2VA 权重接收参考图，不是 MiniMax 的独立 Ref2VA transformer。支持默认关闭的 DBCache 跨步缓存；暂不接入 LightX2V 或整块 DiT 编译；`inference_kernels` 控制官方融合/局部编译内核组合。
 
@@ -9,16 +9,25 @@
 已部署的服务器更新：
 
 ```bash
-cd /root/ref2va && git pull --ff-only && bash deploy.sh restart
+cd /root/ref2va && git pull --ff-only && bash deploy.sh --gpus 4
 ```
 
-首次部署，在克隆的仓库目录执行 `bash deploy.sh`，自动安装固定版本源码、下载模型并启动。需要 Linux x86_64、8 张完整 H200 或 B200、支持 CUDA 12.9 的驱动、NVLink/NCCL，约 250 GB 磁盘空间。首次部署命令在前台运行；依赖和模型就绪后，使用 `bash deploy.sh up` 后台启动，或 `bash deploy.sh restart` 更新重启。
+首次部署、已有机器更新、从镜像创建的新机器，都使用同一入口：
+
+```bash
+bash deploy.sh --gpus 4   # 自动识别型号，两套四卡服务，8188 / 8189
+bash deploy.sh            # 自动识别型号，一套八卡服务，8188
+```
+
+启动命令先离线检查固定版本源码、Diffusers 补丁、Python 环境、依赖版本/导入路径、模型版本及分片；缺什么才安装/下载，完整镜像不重新下载依赖和权重。代码和配置未变且服务仍在运行时复用现有进程；代码、参数或机器启动身份变化时自动重载。**命令会等到每套模型完成预热且对应 API 真正就绪才成功返回**，之后服务继续在后台运行。进程启动或模型就绪但端口尚不可用，不算成功。
+
+需要 Linux x86_64、系统 `python3`、8 张同型号完整 H200/B200/B300、支持当前 CUDA 12.9 PyTorch 的驱动、NVLink/NCCL 和约 250 GB 磁盘空间。依赖/权重检查不等于校验全部权重文件的 SHA-256；CUDA/NCCL 和模型预热检查在目标机器实际执行。
 
 当前默认测试 **2048 间隔的无屏蔽前缀分桶**：补齐 token 参与 attention，可能改变生成结果；尚无这版的 H200 耗时/效果实测。已有环境变量会继续生效；如需覆盖旧的 0/1024 设置，用 `REF2VA_TOKEN_BUCKET=2048 bash deploy.sh restart`；`REF2VA_TOKEN_BUCKET=0 bash deploy.sh start` 可回到不补齐的原生布局。
 
 启动依次执行：
 
-1. 停止本目录的旧服务。
+1. 自动检查依赖和模型；需要更新时停止本目录旧服务，已满足相同配置的健康实例直接复用。
 2. **自动停止本实例所选 GPU 上已有的计算应用**，释放显存。识别到 systemd 应用服务或 Docker 容器时停止其服务/容器；其他情况停止推理进程树，先 TERM，再在超时后 KILL。不会卸载应用或永久禁用服务。清理动作写入 `.runtime/gpu-cleanup.json`。若外部调度器持续拉起应用，启动报错，不会无限杀进程。
 3. 检查模型、所选 GPU 型号/卡数与 NCCL。
 4. 每卡加载一份 DiT、默认一份视频 VAE；音频 VAE 位于本实例 rank 0。Qwen3-VL 通过 Accelerate 分配到本实例的 GPU，单卡权重预算八卡时 12 GiB、四卡时 24 GiB，禁止 CPU/磁盘权重卸载。两套四卡 worker 各自加载完整模型。
@@ -29,19 +38,20 @@ cd /root/ref2va && git pull --ff-only && bash deploy.sh restart
 
 模型全程常驻。后续生成复用 DiT、Qwen3-VL 和 VAE，不重新读权重，不执行额外去噪预热。同一 prompt、参考图内容、参考尺寸和模型版本命中条件缓存时，也会跳过编码。新序列长度/尺寸仍可能触发内核编译；启动预热不能覆盖所有输入形状。保留磁盘编译缓存，并在有限数量的新形状后重置 Dynamo 编译图记录，避免官方单次推理实现达到重编译上限。
 
-Ctrl-C 会回收 UI 和当前部署的 GPU 进程组。取消正在推理的任务会终止整组 NCCL worker，并自动重新加载预热，期间生成接口返回 503。GPU OOM、CUDA/NCCL 错误、rank 退出、启动超时及推理卡死会自动回收整组 worker，重新加载模型并完成启动预热。UI 和查询接口在恢复期间保留，生成接口返回 503，就绪后自动恢复服务。
+首次就绪等待期间 Ctrl-C 会取消启动并回收此次实例；命令成功返回后服务留在后台，使用 `bash deploy.sh stop` 停止。取消正在推理的任务会终止整组 NCCL worker，并自动重新加载预热，期间生成接口返回 503。GPU OOM、CUDA/NCCL 错误、rank 退出、启动超时及推理卡死会自动回收整组 worker，重新加载模型并完成启动预热。UI 和查询接口在恢复期间保留，生成接口返回 503，就绪后自动恢复服务。
 
 ## 后台运行与 worker 自动恢复
 
 ```bash
-bash deploy.sh up       # 后台启动；已运行时不会重复启动
-bash deploy.sh restart  # 停止旧服务，再以当前代码和环境变量后台启动
-bash deploy.sh status   # 查看控制进程、ready、阶段、重启次数及最近错误
-bash deploy.sh logs     # 持续查看 .runtime/service.log；Ctrl-C 只退出日志查看
-bash deploy.sh stop     # 停止控制进程、全部实例的 UI 和 GPU worker
+bash deploy.sh --gpus 4 # 检查/安装/必要时重载，等两套 API 就绪后返回
+bash deploy.sh status   # 各实例 running、worker_ready、ready、阶段及恢复状态
+bash deploy.sh logs     # 持续查看服务日志；Ctrl-C 只退出日志查看
+bash deploy.sh stop     # 停止全部实例的控制进程、UI 和 GPU worker
 ```
 
-`up/restart` 返回表示后台进程已启动，**不表示模型已就绪**；用 `status` 或 `GET /openvdn/health` 确认 `ready=true`。关闭终端、断开 SSH 不影响运行。`start` 仍为前台启动，并使用相同的 worker 自动恢复机制。后台模式不安装系统服务，服务器重启后需要重新执行 `up`；控制进程本身被 SIGKILL 也需要重新启动。
+旧的 `deploy/start/up/restart` 仍可使用，均进入统一流程，不再需要区分安装和重启。启动失败直接输出 service/worker 日志并返回非零，回收本次启动的实例；不会仅留下“后台启动成功”提示。默认首次就绪等待上限为 `REF2VA_STARTUP_TIMEOUT + 300` 秒（默认 3900 秒），可用 `--wait-timeout` 或 `REF2VA_LAUNCH_TIMEOUT` 调整。模型就绪但某个端口被其他服务占用/未响应也不能返回成功。
+
+成功返回后，关闭终端或断开 SSH 不影响服务。当前不安装开机 systemd 单元；镜像机器开机后运行同一命令即可，控制进程被 SIGKILL 后也可用同一命令恢复。
 
 恢复会保留磁盘编译缓存，重新加载模型及执行原有基础预热。连续失败按 5、10、20、40、60 秒退避重试，之后每次最多等待 60 秒，稳定运行 300 秒后重置退避。重启期间仅清理本服务的旧进程组，不重复执行启动时的其他 GPU 应用清理；显存仍被其他应用占用时，记录原因并退避等待。
 
@@ -65,10 +75,10 @@ REF2VA_REQUEST_TIMEOUT=900 REF2VA_STARTUP_TIMEOUT=3600 bash deploy.sh restart
 ## 选择 GPU 型号、卡数与端口
 
 ```bash
-bash deploy.sh restart                                  # 默认：一套 8×H200，8188
-bash deploy.sh restart --gpu-type b200 --gpus 8          # 一套 8×B200，8188
-bash deploy.sh restart --gpu-type h200 --gpus 4          # 两套 4×H200，8188 / 8189
-bash deploy.sh restart --gpu-type b200 --gpus 4 --port 9000  # 两套 4×B200，9000 / 9001
+bash deploy.sh                                        # 自动识别型号，一套八卡
+bash deploy.sh --gpus 4                               # 自动识别型号，两套四卡
+bash deploy.sh --gpu-type b300 --gpus 4                # 显式要求 B300
+bash deploy.sh --gpu-type b200 --gpus 4 --port 9000    # 两套四卡 B200，9000 / 9001
 ```
 
 `--gpus` 是**每个 worker 的卡数**，部署机器仍需提供 8 张 GPU。四卡模式启动两套独立服务：worker-0 使用 GPU 0–3，worker-1 使用 GPU 4–7。指定 `CUDA_VISIBLE_DEVICES=...` 时须列出八个不同设备，按前四/后四拆分。两套服务各有一个 API 端口、一条队列、一套常驻模型；提交、查询、下载同一任务须使用同一端口，不自动负载均衡。两边都有任务时可同时生成两条视频。
@@ -79,14 +89,26 @@ bash deploy.sh restart --gpu-type b200 --gpus 4 --port 9000  # 两套 4×B200，
 | H200 / 4 | flex | 3 + 1 |
 | B200 / 8 | decomposed | 5 + 3 |
 | B200 / 4 | decomposed | 2 + 2 |
+| B300 / 8 | decomposed | 5 + 3 |
+| B300 / 4 | decomposed | 2 + 2 |
 
-这是起始配置，不代表已测得各机型最优布局。请求级 `softmax_ranks` 范围为 0 到单 worker 卡数减 1；0 使用标准 Ulysses。B200 的 decomposed 路径不使用 Flex 的 token 分桶。显式 `REF2VA_SOFTMAX_BACKEND` / `REF2VA_SOFTMAX_RANKS` 仍覆盖默认；从八卡切为四卡时不要保留越界的 rank 数，启动器会在停止旧服务前检查配置。H200 默认关闭 NVLS 以兼容既有主机；B200 使用 NCCL 默认，仍可显式设置 `NCCL_NVLS_ENABLE`。
+这是起始配置，不代表已测得各机型最优布局。请求级 `softmax_ranks` 范围为 0 到单 worker 卡数减 1；0 使用标准 Ulysses。B200/B300 的 decomposed 路径不使用 Flex 的 token 分桶。显式 `REF2VA_SOFTMAX_BACKEND` / `REF2VA_SOFTMAX_RANKS` 仍覆盖默认；从八卡切为四卡时不要保留越界的 rank 数，启动器会在停止旧服务前检查配置。H200 默认关闭 NVLS 以兼容既有主机；B200/B300 使用 NCCL 默认，仍可显式设置 `NCCL_NVLS_ENABLE`。
 
-四卡实例状态、GPU 锁、条件缓存、编译缓存、用户数据库、临时目录和日志分别位于 `.runtime/instances/worker-0/`、`.runtime/instances/worker-1/`。模型文件与唯一文件名的输出目录共用。`status/logs/stop` 自动读取 `.runtime/fleet.json`，无需再传卡数；切换拓扑用 `restart`。一组 OOM/卡死只重启该组，另一组继续工作。API 健康结果的 `hardware` 返回实际型号、设备列表和单 worker 卡数。
+四卡实例状态、GPU 锁、条件缓存、编译缓存、用户数据库、临时目录和日志分别位于 `.runtime/instances/worker-0/`、`.runtime/instances/worker-1/`。模型文件与唯一文件名的输出目录共用。`status/logs/stop` 自动读取 `.runtime/fleet.json`，无需再传卡数；切换拓扑仍用同一命令并传入新的 `--gpus`。一组 OOM/卡死只重启该组，另一组继续工作。API 健康结果的 `hardware` 返回实际型号、设备列表和单 worker 卡数。
 
-`up` 和 `start` 也接受上述参数；首次安装可执行 `bash deploy.sh deploy --gpu-type b200 --gpus 4`。界面中选择带 `_h200_4`、`_b200_4` 等后缀的 starter workflow，参数会匹配对应实例，已有用户保存的工作流不会被覆盖。
+界面中选择带 `_h200_4`、`_b200_4`、`_b300_4` 等后缀的 starter workflow，参数会匹配对应实例，已有用户保存的工作流不会被覆盖。B300 严格校验 `CC 10.3` 和完整显存配置，不把它伪装为 B200；误传 `--gpu-type b200` 会在加载前提示改用 B300/auto。[NVIDIA 型号与计算能力表](https://developer.nvidia.com/cuda/gpus)
 
-四卡和 B200 路径已覆盖本地配置、上游布局及故障隔离回归，实际显存峰值、CUDA 内核兼容性与吞吐量仍需目标服务器验证。
+四卡和 B200/B300 路径已覆盖本地配置、上游布局及故障隔离回归，实际显存峰值、CUDA 内核兼容性与吞吐量仍需目标服务器验证；通过本地测试不等于 B300 已跑通模型。
+
+### 镜像迁移
+
+- GPU 型号和所选卡的 UUID 在每次启动重新查询，不用镜像里保存的 UUID；默认用本机 0–7，显式 `CUDA_VISIBLE_DEVICES` 必须属于新机器。
+- PID 记录绑定机器/boot ID 和进程创建时间，旧机器的 ready、PID、命令不会当成新机器的服务，也不自动重跑镜像中的未完成请求。模型、历史输出和可复用缓存保留。
+- 默认监听 `0.0.0.0`；生成/查询的视频 URL 按当前 HTTP 请求 origin 生成，不在代码或启动配置中写死公私网 IP。旧 fleet 文件里的 `PUBLIC_BASE_URL` 不会重放。镜像中不要通过 shell/systemd 额外导出旧 IP、旧 GPU UUID 或旧网卡名；这些是用户显式覆盖，程序不会猜测并替换。
+- 同机 torchrun 使用 loopback rendezvous 和自动分配端口；两个 worker 不共用固定 master 端口，也不依赖旧主机名。硬件型号/卡数的编译缓存目录分开，B300 不强用 B200 的缓存目录。
+- 完整机器镜像可保留 Python 环境和模型；代码目录移动后会检查 venv、editable 包路径和 ComfyUI 节点链接，需要时修复。自定义 `REF2VA_MODELS` 挂载路径仍须在新机器可用。
+
+业务使用稳定反向代理域名时，可显式设置 `PUBLIC_BASE_URL`（单实例）或 `REF2VA_PUBLIC_BASE_URL_0/1`（双实例）；裸 IP 部署建议不设置，让 API 自动按当前请求生成链接。
 
 ## 连续请求的输出流水线
 
@@ -178,7 +200,7 @@ bash deploy.sh render \
 | --- | --- | --- |
 | `REF2VA_CLEAR_GPU_APPS` | 1 | 启动时清理所选 GPU 的计算应用；0 仅检查 |
 | `CUDA_VISIBLE_DEVICES` | 0,1,2,3,4,5,6,7 | 恰好 8 张卡，可用 GPU UUID |
-| `NCCL_NVLS_ENABLE` | 0（本部署） | 绕过当前 H200 主机的 NVLS multicast 内存绑定 CUDA 401；通信自检和常驻 worker 使用相同值。仅关闭 NVLink SHARP offload，不设置 P2P/NVLink transport 禁用开关；主机修复后可显式设 1/2 重测。 |
+| `NCCL_NVLS_ENABLE` | H200=0；B200/B300=NCCL 默认 | 绕过当前 H200 主机的 NVLS multicast 内存绑定 CUDA 401；通信自检和常驻 worker 使用相同值。仅关闭 NVLink SHARP offload，不设置 P2P/NVLink transport 禁用开关；主机修复后可显式设 1/2 重测。 |
 | `REF2VA_MODELS` | ./models | 下载、启动使用同一权重目录 |
 | `REF2VA_PORT` / `REF2VA_LISTEN` | 8188 / 0.0.0.0 | ComfyUI 地址 |
 | `REF2VA_FP8` | 1 | 官方 FP8 线性层；0 为 BF16 |

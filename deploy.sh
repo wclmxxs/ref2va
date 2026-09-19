@@ -2,8 +2,9 @@
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
-action="${1:-deploy}"
-if [[ $# -gt 0 ]]; then shift; fi
+action=deploy
+if [[ $# -gt 0 && "$1" != --* ]]; then action="$1"; shift; fi
+if [[ "${1:-}" == --help ]]; then action=help; shift; fi
 install_environment() {
     [[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]] || { echo 'Deployment requires Linux x86_64'; exit 1; }
     for binary in git curl tar sha256sum gcc; do
@@ -17,8 +18,11 @@ install_environment() {
     fi
     uv="$ROOT/.runtime/bin/uv"
     "$uv" python install 3.12
-    [[ -x .venv-ui/bin/python ]] || "$uv" venv --python 3.12 .venv-ui
-    [[ -x .venv-vdn/bin/python ]] || "$uv" venv --python 3.12 .venv-vdn
+    for kind in ui vdn; do
+      if ! ".venv-$kind/bin/python" -c 'import sys; from pathlib import Path; assert sys.version_info[:2] == (3,12) and Path(sys.prefix).resolve() == Path(sys.argv[1]).resolve()' "$ROOT/.venv-$kind" 2>/dev/null; then
+        "$uv" venv --clear --python 3.12 ".venv-$kind"
+      fi
+    done
     .venv-ui/bin/python scripts/install_sources.py
     "$uv" pip install --python .venv-ui/bin/python --index-url https://download.pytorch.org/whl/cpu \
       torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0
@@ -59,30 +63,21 @@ start_ui() {
 }
 
 case "$action" in
-  deploy)
-    echo '[1/4] Installing pinned sources and Python environments'
-    install_environment
-    echo '[2/4] Downloading pinned model weights'
-    download_models
-    if [[ $# -gt 0 || "${REF2VA_GPUS:-8}" == 4 ]]; then
-      exec .venv-ui/bin/python "$ROOT/scripts/fleet.py" foreground "$@"
-    fi
-    echo '[3/4] Checking GPU environment'
-    check_runtime
-    echo "[4/4] Releasing GPUs, preloading models, warming up, then starting ComfyUI on ${REF2VA_PORT:-8188}"
-    start_ui "$@"
+  deploy|up|restart)
+    command -v python3 >/dev/null || { echo 'Install system python3 for the deployment launcher'; exit 1; }
+    exec python3 "$ROOT/scripts/bootstrap.py" "$@"
     ;;
   install) install_environment ;;
   download) download_models "$@" ;;
   check) check_runtime "$@" ;;
   start)
     if [[ "${REF2VA_MANAGED_INSTANCE:-0}" != 1 ]]; then
-      exec .venv-ui/bin/python "$ROOT/scripts/fleet.py" foreground "$@"
+      exec python3 "$ROOT/scripts/bootstrap.py" "$@"
     fi
     check_runtime
     start_ui "$@"
     ;;
-  up|restart|stop|status|logs)
+  stop|status|logs)
     [[ -x .venv-ui/bin/python ]] || { echo 'Run ./deploy.sh install first'; exit 1; }
     exec .venv-ui/bin/python "$ROOT/scripts/fleet.py" "$action" "$@"
     ;;
@@ -90,10 +85,11 @@ case "$action" in
     exec .venv-ui/bin/python scripts/render.py "$@"
     ;;
   help|-h|--help)
-    echo 'Usage: bash deploy.sh [deploy | install | download | check [--nccl] | start | up | restart | stop | status | logs | render --help]'
-    echo 'No arguments: install, download, check eight GPUs, and start ComfyUI.'
-    echo 'Options: --gpu-type h200|b200 --gpus 4|8 --port 8188 (4 = two workers, ports 8188/8189)'
-    echo 'up: background start with worker auto-recovery; restart: reload; stop/status/logs: service controls.'
+    echo 'Usage: bash deploy.sh [--gpu-type auto|h200|b200|b300] [--gpus 4|8] [--port 8188] [--wait-timeout seconds]'
+    echo 'Checks/reuses dependencies and models, reloads changed code/config, waits for every API, then returns with services running.'
+    echo 'Default: auto-detect GPU model, one 8-GPU worker. --gpus 4: two workers, ports 8188/8189.'
+    echo 'Controls: status | logs | stop. Legacy deploy/start/up/restart are aliases for the unified startup.'
+    echo 'Maintenance only: install | download | check [--nccl] | render --help'
     ;;
   *) echo "Unknown action: $action" >&2; exit 2 ;;
 esac

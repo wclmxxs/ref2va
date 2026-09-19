@@ -30,7 +30,8 @@ def script(name):
 
 
 @pytest.mark.parametrize('gpu,size,backend_name,soft', [('h200',8,'flex',6),('h200',4,'flex',3),
-                                                       ('b200',8,'decomposed',5),('b200',4,'decomposed',2)])
+                                                       ('b200',8,'decomposed',5),('b200',4,'decomposed',2),
+                                                       ('b300',8,'decomposed',5),('b300',4,'decomposed',2)])
 def test_all_hardware_profiles_and_rank_limits(monkeypatch, gpu, size, backend_name, soft):
     monkeypatch.setenv('REF2VA_GPU_TYPE',gpu)
     monkeypatch.setenv('REF2VA_GPUS',str(size))
@@ -43,7 +44,9 @@ def test_all_hardware_profiles_and_rank_limits(monkeypatch, gpu, size, backend_n
     assert backend.startup_settings().softmax_ranks==soft
     assert Settings(softmax_ranks=size-1).validate()
     with pytest.raises(ValueError): Settings(softmax_ranks=size).validate()
-    h.validate_device(gpu.upper(), (140 if gpu=='h200' else 180)*1024**3, (9,0) if gpu=='h200' else (10,0))
+    from openvdn_comfy.hardware import GPU_SPECS
+    capability, minimum = GPU_SPECS[gpu]
+    h.validate_device(gpu.upper(), (minimum+5)*1024**3, capability)
     with pytest.raises(RuntimeError): h.validate_device('RTX 5090', 32*1024**3, (12,0))
 
 
@@ -54,7 +57,7 @@ def test_fleet_splits_selected_devices_ports_and_namespaces():
     assert a['REF2VA_PORT']=='9000' and b['REF2VA_PORT']=='9001'
     assert a['REF2VA_INSTANCE']=='worker-0' and b['REF2VA_INSTANCE']=='worker-1'
     assert fleet.plans('h200',8,8188)[0]['REF2VA_INSTANCE']==''
-    for args in [('b300',4,8188),('h200',2,8188),('h200',4,65535)]:
+    for args in [('b100',4,8188),('h200',2,8188),('h200',4,65535)]:
         with pytest.raises(ValueError): fleet.plans(*args)
     with pytest.raises(ValueError): fleet.plans('h200',4,8188,'0,1,2,3')
 
@@ -178,13 +181,13 @@ def test_fleet_validates_both_before_stop_and_preserves_manifest_controls(monkey
     calls=[]
     def invoke(action,plan,args=(),capture=False):
         calls.append((action,dict(plan),args))
-        return types.SimpleNamespace(stdout='{"running":false}')
+        return types.SimpleNamespace(stdout='{"running":true,"ready":true}')
     monkeypatch.setattr(fleet,'invoke',invoke)
     monkeypatch.setattr(sys,'argv',['fleet','restart','--gpu-type','b200','--gpus','4','--port','9000'])
     fleet.main()
-    assert [x[0] for x in calls]==['validate','validate','stop','stop','stop','up','up']
-    assert [x[1]['CUDA_VISIBLE_DEVICES'] for x in calls[-2:]]==['0,1,2,3','4,5,6,7']
-    assert [x[1]['REF2VA_PORT'] for x in calls[-2:]]==['9000','9001']
+    assert [x[0] for x in calls]==['validate','validate','stop','stop','stop','up','up','status','status']
+    assert [x[1]['CUDA_VISIBLE_DEVICES'] for x in calls[5:7]]==['0,1,2,3','4,5,6,7']
+    assert [x[1]['REF2VA_PORT'] for x in calls[5:7]]==['9000','9001']
     assert len(json.loads(fleet.MANIFEST.read_text())['instances'])==2
     calls.clear()
     monkeypatch.setenv('CUDA_VISIBLE_DEVICES','3')
@@ -194,8 +197,8 @@ def test_fleet_validates_both_before_stop_and_preserves_manifest_controls(monkey
     calls.clear()
     monkeypatch.delenv('CUDA_VISIBLE_DEVICES')
     monkeypatch.setattr(sys,'argv',['fleet','up'])
-    with pytest.raises(RuntimeError,match='selection changed'): fleet.main()
-    assert not any(x[0] in ('up','stop') for x in calls)
+    fleet.main()
+    assert [x[0] for x in calls] == ['validate','stop','stop','stop','up','status']
 
 
 def test_fleet_rejects_invalid_second_profile_before_stopping(monkeypatch,tmp_path):
@@ -223,7 +226,7 @@ def test_cancel_cpu_wait_never_writes_cancel_for_next_gpu(tmp_path,monkeypatch):
     assert not (tmp_path/'cancel.json').exists()
 
 
-@pytest.mark.parametrize('gpu,size', [('h200',4),('b200',4),('b200',8)])
+@pytest.mark.parametrize('gpu,size', [('h200',4),('b200',4),('b200',8),('b300',4),('b300',8)])
 def test_workflow_starters_match_hardware_without_overwriting_saved_edits(tmp_path,monkeypatch,gpu,size):
     monkeypatch.setenv('REF2VA_GPU_TYPE',gpu)
     monkeypatch.setenv('REF2VA_GPUS',str(size))

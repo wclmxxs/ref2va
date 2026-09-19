@@ -10,6 +10,7 @@ import psutil
 
 from .config import RUNTIME, Settings, atomic_json
 from .hardware import Hardware
+from .host_identity import belongs_to_host
 
 BACKEND = RUNTIME / "backend"
 PROFILE_FIELDS = ("fp8", "inference_kernels", "softmax_backend")
@@ -54,6 +55,8 @@ def read_json(path, default=None):
 
 
 def same_process(record):
+    if not belongs_to_host(record):
+        return False
     try:
         process = psutil.Process(record["pid"])
         return process.is_running() and process.status() != psutil.STATUS_ZOMBIE and abs(process.create_time() - record["created"]) < .01

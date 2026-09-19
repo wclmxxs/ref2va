@@ -16,6 +16,7 @@ from PIL import Image
 
 from .config import RUNTIME, Settings, atomic_json
 from .hardware import Hardware
+from .host_identity import host_identity
 from .runner import generate
 from .references import download_references, parse_urls
 from .jobs import update_job, read_job
@@ -162,7 +163,7 @@ class OpenVDNH200Request(OpenVDNH200Generate):
                 return result, video
             if defer_result:
                 update_job(job_id, status="running", phase="encoding_output",
-                           output_owner={"pid": os.getpid(), "created": psutil.Process().create_time()})
+                           output_owner={"pid": os.getpid(), "created": psutil.Process().create_time(), "host": host_identity()})
                 def complete():
                     try:
                         finish(result.finish())

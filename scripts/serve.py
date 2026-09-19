@@ -21,11 +21,13 @@ from openvdn_comfy.gpu_cleanup import clear_gpu_applications, stop_tree
 from openvdn_comfy.gpu_check import ensure_free_gpus
 from openvdn_comfy.runner import stop_group, worker_environment
 from openvdn_comfy.hardware import Hardware, install_workflows
+from openvdn_comfy.host_identity import host_identity
 from openvdn_comfy.supervision import Policy, WorkerWatchdog, fail_pending
 
 
 def process_record(process, instance):
-    return {"pid": process.pid, "created": psutil.Process(process.pid).create_time(), "instance": instance}
+    return {"pid": process.pid, "created": psutil.Process(process.pid).create_time(), "instance": instance,
+            "host": host_identity()}
 
 
 def retire_previous_server():
@@ -60,7 +62,7 @@ def launch_worker():
                                         "parallel_vae": parallel_vae_enabled(), "compile_cache": cache_settings()})
     atomic_json(BACKEND / "inference.json", settings.inference_config(BACKEND / "warmup.pt", BACKEND / "warmup.mp4"))
     atomic_json(BACKEND / "state.json", {"instance": instance, "status": "loading", "phase": "starting_ranks"})
-    command = [str(WORKER_PYTHON), "-m", "torch.distributed.run", "--standalone", "--nnodes=1",
+    command = [str(WORKER_PYTHON), "-m", "torch.distributed.run", "--standalone", "--local-addr=127.0.0.1", "--nnodes=1",
                f"--nproc_per_node={Hardware.from_env().world_size}", str(ROOT / "scripts/resident_worker.py")]
     with (BACKEND / "worker.log").open("a") as log:
         log.write(f"\n=== Starting resident worker {instance} ===\n")

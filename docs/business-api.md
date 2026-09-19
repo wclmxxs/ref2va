@@ -26,7 +26,7 @@ curl -sS http://43.218.119.131:8188/ic/capcut/edit_gateway/v2/video_generation \
   --data-binary @examples/business-request.json
 ```
 
-全参数示例中的 `optimization.softmax_ranks=6` 对应默认八卡 H200；四卡 H200 改为 3、四卡 B200 改为 2，或省略/null 以继承部署默认。相同请求发送到 `/sync_infer` 即为同步模式。示例显式启用 RDT 0.25；只将 `reference_short_edge` 改为 `512` 就是 512 参考图组，输出短边仍为 768。
+全参数示例中的 `optimization.softmax_ranks=6` 对应默认八卡 H200；四卡 H200 改为 3、四卡 B200/B300 改为 2，或省略/null 以继承部署默认。相同请求发送到 `/sync_infer` 即为同步模式。示例显式启用 RDT 0.25；只将 `reference_short_edge` 改为 `512` 就是 512 参考图组，输出短边仍为 768。
 
 | 顶层字段 | 含义与约束 |
 | --- | --- |
@@ -71,7 +71,7 @@ curl -sS http://43.218.119.131:8188/ic/capcut/edit_gateway/v2/video_generation \
 | `attention_kernel` | native | `native` / `decomposed`；不支持 Sol |
 | `isolate_padding` | false | 是否隔离补齐 token；只能用于当前 Flex 部署＋native kernel |
 | `linear_stats_chunk_frames` | 16 | 8 / 16 / 32 |
-| `softmax_ranks` | H200 八卡 6、四卡 3；B200 八卡 5、四卡 2 | 0 到单 worker 卡数减 1；0 为标准 Ulysses；省略/null 继承部署默认 |
+| `softmax_ranks` | H200 八卡 6、四卡 3；B200/B300 八卡 5、四卡 2 | 0 到单 worker 卡数减 1；0 为标准 Ulysses；省略/null 继承部署默认 |
 | `fast_communication` | true | 已验证的通信优化 |
 | `streaming_output` | true | 视频流式输出优化 |
 | `cleanup_policy` | adaptive | `adaptive` / `always` |
@@ -101,3 +101,5 @@ curl -sS http://43.218.119.131:8188/ic/capcut/edit_gateway/v2/query/video_genera
 反向代理部署时设置 `PUBLIC_BASE_URL=https://你的服务地址`；未设置时根据当前请求的 origin 生成视频 URL。不自动信任 Forwarded 头。双 API 模式若使用反向代理，分别设置 `REF2VA_PUBLIC_BASE_URL_0` 和 `REF2VA_PUBLIC_BASE_URL_1`；否则不要设置全局 `PUBLIC_BASE_URL`，以各请求 origin 生成对应端口的链接。
 
 错误格式为 `{"error":{"type":"invalid_request_error","message":"...","http_code":400}}`。同步超时另含顶层 `task_id`，可以继续查询。任务请求和结果保存在 `.runtime/api/jobs`；四卡实例分别保存在 `.runtime/instances/worker-{0,1}/api/jobs`，可用原内部 UUID 通过旧管理接口排障。
+
+统一启动命令：`bash deploy.sh --gpus 4`，自动识别本机 H200/B200/B300、复用已安装依赖和权重，等待两个 API 就绪后才返回终端。新机器默认无需指定 IP；仍须在对应端口查询该端口提交的任务。

@@ -3,6 +3,11 @@ from dataclasses import dataclass
 import json
 import os
 import re
+import csv
+import io
+import subprocess
+
+GPU_SPECS = {'h200': ((9, 0), 130), 'b200': ((10, 0), 165), 'b300': ((10, 3), 250)}
 
 
 @dataclass(frozen=True)
@@ -14,8 +19,8 @@ class Hardware:
     def from_env(cls):
         gpu = os.environ.get('REF2VA_GPU_TYPE', 'h200').lower()
         size = int(os.environ.get('REF2VA_GPUS', '8'))
-        if gpu not in ('h200', 'b200') or size not in (4, 8):
-            raise ValueError('Choose --gpu-type h200|b200 and --gpus 4|8 (GPUs per worker)')
+        if gpu not in GPU_SPECS or size not in (4, 8):
+            raise ValueError('Choose --gpu-type h200|b200|b300 and --gpus 4|8 (GPUs per worker)')
         return cls(gpu, size)
 
     @property
@@ -34,14 +39,37 @@ class Hardware:
         return devices
 
     def validate_device(self, name, memory, capability):
-        expected = (9, 0) if self.gpu_type == 'h200' else (10, 0)
-        minimum = 130 if self.gpu_type == 'h200' else 165
+        expected, minimum = GPU_SPECS[self.gpu_type]
         if self.gpu_type.upper() not in name.upper() or tuple(capability) != expected or memory < minimum * 1024**3:
             raise RuntimeError(f'Expected full {self.gpu_type.upper()} GPU with CC {expected} and >= {minimum} GiB; '
                                f'got {name}, CC {capability}, {memory/1024**3:.1f} GiB')
 
     def metadata(self):
         return {'gpu_type': self.gpu_type, 'world_size': self.world_size, 'devices': self.visible_devices()}
+
+
+def detect_hardware(requested='auto', devices=None):
+    """Resolve this machine's devices afresh; never reuse UUIDs from an image."""
+    result = subprocess.check_output(['nvidia-smi', '--query-gpu=index,uuid,name',
+                                      '--format=csv,noheader,nounits'], text=True, timeout=20)
+    rows = list(csv.reader(io.StringIO(result), skipinitialspace=True))
+    lookup = {key: row for row in rows if len(row) == 3 for key in row[:2]}
+    ids = [x.strip() for x in (devices or ','.join(map(str, range(8)))).split(',')]
+    try:
+        selected = [lookup[value] for value in ids]
+    except KeyError as error:
+        raise ValueError(f'GPU {error.args[0]} is absent on this machine; update CUDA_VISIBLE_DEVICES') from error
+    if len(selected) != 8 or len({row[1] for row in selected}) != 8:
+        raise ValueError('Provide eight distinct physical GPUs; --gpus 4 divides them into two groups')
+    kinds = {next((kind for kind in GPU_SPECS if re.search(r'\b' + kind + r'\b', row[2], re.I)), None)
+             for row in selected}
+    if len(kinds) != 1 or None in kinds:
+        raise ValueError('Expected eight GPUs of the same H200, B200 or B300 model')
+    actual = kinds.pop()
+    if requested not in ('auto', actual):
+        raise ValueError(f'Requested {requested.upper()}, detected {actual.upper()}; '
+                         f'use --gpu-type {actual} or omit --gpu-type for automatic detection')
+    return actual, ','.join(row[1] for row in selected)
 
 
 def runtime_directory(root):

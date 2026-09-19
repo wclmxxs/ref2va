@@ -28,6 +28,7 @@ def deployment(tmp_path):
     for env in ("ui", "vdn"):
         executable(root / f".venv-{env}/bin/python", mock +
                    'if [ "$1" = "$DEPLOY_TEST_FAIL" ]; then exit 7; fi\n')
+    executable(root / "bin/python3", mock + 'if [ "$1" = "$DEPLOY_TEST_FAIL" ]; then exit 7; fi\n')
     for tool in ("git", "curl", "tar", "sha256sum", "gcc"):
         executable(root / "bin" / tool, "#!/bin/sh\nexit 0\n")
     executable(root / "bin/uname", '#!/bin/sh\nif [ "$1" = -s ]; then echo Linux; else echo x86_64; fi\n')
@@ -36,41 +37,43 @@ def deployment(tmp_path):
     return root, env
 
 
-def test_no_arguments_runs_every_stage_and_preserves_user_workflow(deployment):
+@pytest.mark.parametrize("prefix", [[], ["deploy"], ["start"], ["up"], ["restart"]])
+def test_unified_launch_forwards_options_without_requiring_existing_venvs(deployment, prefix):
     root, env = deployment
+    shutil.rmtree(root / '.venv-ui')
+    shutil.rmtree(root / '.venv-vdn')
+    subprocess.run(['bash', str(root / 'deploy.sh'), *prefix, '--gpu-type', 'b300', '--gpus', '4'],
+                   cwd=root.parent, env=env, check=True, capture_output=True)
+    calls = (root / 'calls.log').read_text().splitlines()
+    assert len(calls) == 1
+    assert calls[0].endswith(str(root / 'scripts/bootstrap.py') + ' --gpu-type b300 --gpus 4')
+
+
+def test_managed_instance_checks_before_loading_and_preserves_user_workflow(deployment):
+    root, env = deployment
+    env.update(REF2VA_MANAGED_INSTANCE='1', REF2VA_INSTANCE='worker-1')
     for iteration in range(2):
-        subprocess.run(["bash", str(root / "deploy.sh")], cwd=root.parent, env=env, check=True,
+        subprocess.run(['bash', str(root / 'deploy.sh'), 'start'], cwd=root.parent, env=env, check=True,
                        capture_output=True, text=True)
-        workflow = root / ".runtime/comfy-user/default/workflows/openvdn_ref2va_like.json"
+        workflow = root / '.runtime/instances/worker-1/comfy-user/default/workflows/openvdn_ref2va_like.json'
         assert workflow.read_text() == ('{"starter": true}' if iteration == 0 else '{"edited": true}')
         workflow.write_text('{"edited": true}')
-    calls = (root / "calls.log").read_text().splitlines()
-    stages = [line.split(":", 1)[1] for line in calls if "/bin/python:" in line]
-    expected = ["scripts/install_sources.py", "scripts/download.py", "scripts/doctor.py"]
-    assert stages[:3] == expected
-    assert stages[3] == str(root / "scripts/serve.py")
-    assert (root / ".runtime/comfy-user").is_dir()
-    assert stages[4:7] == expected
+    calls = (root / 'calls.log').read_text().splitlines()
+    assert [line.split(':', 1)[1] for line in calls] == ['scripts/doctor.py', str(root / 'scripts/serve.py')] * 2
 
 
-@pytest.mark.parametrize("stage", ["scripts/install_sources.py", "scripts/download.py", "scripts/doctor.py"])
-def test_deployment_stops_on_failed_stage(deployment, stage):
+def test_failed_managed_precheck_does_not_spawn_worker(deployment):
     root, env = deployment
-    env["DEPLOY_TEST_FAIL"] = stage
-    result = subprocess.run(["bash", str(root / "deploy.sh")], env=env, capture_output=True)
+    env.update(REF2VA_MANAGED_INSTANCE='1', DEPLOY_TEST_FAIL='scripts/doctor.py')
+    result = subprocess.run(['bash', str(root / 'deploy.sh'), 'start'], env=env, capture_output=True)
     assert result.returncode == 7
-    calls = (root / "calls.log").read_text()
-    assert ".deps/ComfyUI/main.py" not in calls
-    if stage == "scripts/install_sources.py":
-        assert "scripts/download.py" not in calls
-    if stage != "scripts/doctor.py":
-        assert "scripts/doctor.py" not in calls
+    assert 'serve.py' not in (root / 'calls.log').read_text()
 
 
-@pytest.mark.parametrize("action", ["up", "restart", "stop", "status", "logs"])
-def test_background_controls_forward_to_service_without_loading_models(deployment, action):
+@pytest.mark.parametrize("action", ["stop", "status", "logs"])
+def test_background_controls_forward_without_loading_models(deployment, action):
     root, env = deployment
-    subprocess.run(["bash", str(root / "deploy.sh"), action], env=env, check=True, capture_output=True)
-    calls = (root / "calls.log").read_text().splitlines()
+    subprocess.run(['bash', str(root / 'deploy.sh'), action], env=env, check=True, capture_output=True)
+    calls = (root / 'calls.log').read_text().splitlines()
     assert len(calls) == 1
-    assert calls[0].endswith(str(root / "scripts/fleet.py") + " " + action)
+    assert calls[0].endswith(str(root / 'scripts/fleet.py') + ' ' + action)
