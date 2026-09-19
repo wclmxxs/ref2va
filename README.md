@@ -373,6 +373,45 @@ cd /root/ref2va && git pull --ff-only && bash deploy.sh start
 - `branches` / `max_ms_per_nfe` 用于找慢卡和分支不均衡。计时测到的是计算流上的时间跨度，包含可见等待和提交间隙，并不是独立 NCCL kernel 的纯耗时。
 - `branch_dispatch` 包含 `branch_pack` 和 `branch_relevant_wait`，`output_dispatch` 包含 `output_a2a` 和 `output_unpack`，`blocks` 包含 attention/FFN；这些层级有重叠，不能相加，也不能累加八卡计时作为请求耗时。分析会有额外开销，正式测速使用 `profile: false`。
 
+Schema 12 增加按请求的细粒度分析，业务接口通过 `optimization.profile=true` 开启，并在 `task.profiling` 返回完整结果，旧接口的返回位置不变：
+
+- softmax 分解为 dense/window attention、Q/K/V gather、K/V contiguous、scatter 和计划准备。仅实际执行 decomposed 路径时有这些分项，flex/ref 不伪造数据。
+- linear 分解为 Q 激活、K/V 空间卷积、时间卷积与激活、A/B 统计、文本状态（含统计与求解）、Cholesky、三角求解、逆矩阵乘积、正反向扫描、状态 gather、query readout、norm/gate。优化路径另外记录 `linear_fused_delta`、`linear_chunk_compose_forward/reverse`、`linear_chunk_scan`。循环按整段计时，不在每帧后同步。
+- 各阶段 GPU event 数据在 `by_rank[].total_ms/calls`，对应未同步的 CPU 提交墙钟在 `by_rank[].fine.host_scopes`。后者包含提交、Python 调度及同步等待，不能当成纯 CPU 算术。
+- 进一步传 `optimization.profile_kernels=true`（要求同时 `profile=true`），只在 rank 0 和第一个 linear rank 采集 PyTorch/Kineto CPU+CUDA 活动。`by_rank[].fine.kernel_trace` 返回实际设备活动区间并集、kernel 调用数和耗时排名、NCCL kernel 累计活动时间、CPU 算子排名。没有 CUPTI/CUDA 活动时明确标记不可用，不把 CPU 推算成 GPU 耗时。多流重叠的 kernel 累计时间也不是端到端延迟。
+- 详细计时会扰动调度，kernel tracing 尤其明显。先同参数跑 1 次预热及 3 次 `profile=false` 测速，再单独分析；不能用分析请求计算加速比例。Profiler 收尾时间独立记录在 `kernel_trace.finalize_seconds`。报告整理和跨 rank 指标收集记录为 `timings.metadata_collection_seconds`，包含 profiler 收尾，两者算入 worker 墙钟但不算入 DiT 去噪。
+- 普通请求不进入分析包装；分析包装保留当前选中的原生或加速路径，在成功/失败后恢复。分析本身不改变数学运算、不做降精度或新增近似，默认不采集。
+
+### SGLang 算子与通信适配
+
+参考 [SGLang VDN 实现](https://github.com/sgl-project/sglang/blob/5e9342d16f03621f8f434baca2bc4bbdfa4800c7/python/sglang/multimodal_gen/runtime/models/dits/minimax_h3_vdn.py) 和同版本的 [FP32 delta CUDA kernel](https://github.com/sgl-project/sglang/blob/5e9342d16f03621f8f434baca2bc4bbdfa4800c7/python/sglang/kernels/jit/csrc/diffusion/vdn_delta_factors.cuh)，移植到现有 OpenVDN Ref2VA 常驻 worker。保留参考图、音频和窗口定义，无需安装 SGLang/TVM；来源与 Apache-2.0 许可证在 `openvdn_comfy/_vendor/sglang_vdn/`。
+
+全部参数通过业务请求 `optimization`、旧 REST 顶层、ComfyUI 和 CLI 传入：
+
+| 参数 | 默认 | 行为 |
+|---|---|---|
+| `fused_delta` | `true` | 把视频/文本的 128×128 SPD 求逆、transition 和 injection 合成一个 FP32 CUDA kernel，替换多次 Cholesky/求解/GEMM。启动在实际 GPU 对 FP64 参考做检查；失败报错，不跳过校验。 |
+| `boundary_scan` | `true` | 先合成块内全部帧的仿射变换，再扫描 chunk 边界；保留所有帧的信息。首尾锚帧、尾部不足一个 chunk 均处理；不符合边界条件的窗口回退原扫描。 |
+| `fast_softmax` | `true` | decomposed 路径改为 index_select 和连续 Q 切片，保留 FA4/cuDNN 后端及原 mask；有 stride 时仍复制连续，不把错误布局交给 FA4。flex/ref 路径不受此开关影响。 |
+| `dual_stream` | `false` | 实验性普通 Ulysses：共享一次原始 QKV 交换，softmax/linear 两条 CUDA 流重叠，独立回传再汇合。要求 `softmax_ranks=0`、`inference_kernels=true`，支持 4/8 卡。每种新几何的首个 block 与原 Ulysses 进行全 rank 数值核对。 |
+
+`fused_delta` 和 `boundary_scan` 保持方程与全部输入，改变 FP32 运算顺序，不能称为逐位等价；没有新增 K/V 下采样。双流路径的 gate GEMM 形状也会改变。Cache-DiT 和 `linear_kv_keep_ratio` 仍单独控制，做精度对照时设为关闭和 `1.0`。
+
+启动默认值可设 `REF2VA_FUSED_DELTA=0|1`、`REF2VA_BOUNDARY_SCAN=0|1`、`REF2VA_FAST_SOFTMAX=0|1`、`REF2VA_DUAL_STREAM=0|1`；启用最后一项须同时 `REF2VA_SOFTMAX_RANKS=0`。仅预热原配置的一种 shape，其他组合首请求按需编译。融合 kernel 需要 `nvcc`，自动按源码、CUDA toolkit 版本及实际 GPU 架构缓存到实例目录的 `cuda-kernels/`；镜像更换 H200/B200/B300 后重新选对应缓存，不依赖 IP。
+
+返回 `task.optimizations.linear_acceleration.by_rank` 包含实际路径调用次数、求解/扫描 GPU 校验；`task.optimizations.dual_stream.by_rank` 包含双流启用与校验状态。不开 profile 也返回这些记录。双流的 `softmax_return_launch` / `linear_return_launch` 是提交跨度，`output_stream_join` 是主流等待；只有 kernel trace 的 NCCL 活动统计才是设备通信活动时间。第一种新双流几何的数值核对会增加一次原路径 forward，不能混入热态测速。
+
+同 case 对照脚本（请求文件为 `examples/business-request.json` 格式，替换真实参考图 URL，固定 seed）：
+
+```bash
+python3 scripts/benchmark_sglang_acceleration.py --server http://HOST:8188 \
+  --request-file case.json --output-dir work/sglang-ablation --repeat 3 --kernels
+```
+
+默认比较原路径、单独融合求解、单独边界扫描、单独窗口整理、三项合并、普通 Ulysses 串行、普通 Ulysses 双流。每组预热一次，然后交错进行三次无 profile 测速，最后单独采集细粒度分析；`--kernels` 再采集三组代表性 CPU/CUDA trace。可用 `--variants native combined ulysses_dual` 缩减。输出保存逐次请求、响应、视频 URL、`profiling.json` 和 `summary.json`；保留原请求的 Cache-DiT 配置，比较无缓存时在请求中关闭它。热态仍有编译的组不计算速度，服务实例改变立即停止，恢复跑批不会重复提交已接收任务。
+
+当前移植继续使用已有 FP8 精度路径，**未切换 MXFP8**；不能把 SGLang 的 6.9 秒（8×B200、345 帧 T2VA、MXFP8 热态）直接当作这套 Ref2VA 的承诺。实际 GPU 时延与画质需在部署后用同 case 测量；本地 CPU 数值测试不替代 CUDA/视频验证。
+
 ### Cache-DiT / DBCache 参数
 
 这是按 [Cache-DiT DBCache 算法](https://github.com/vipshop/cache-dit/tree/main/src/cache_dit/caching/cache_blocks) 独立实现的 OpenVDN 八卡适配层 `openvdn_dbcache_adapter_v1`，不是直接安装其 Python 包或 ComfyUI 原生 H3 插件，不启用 TaylorSeer。先完整计算前 Fn 层，比较前缀残差与上次完整计算时的前缀残差；足够相似时复用中间层残差，再完整计算最后 Bn 层。保留原模型的混合 attention、参考图条件、音频、8 次采样调用和后处理。缓存命中会改变去噪轨迹，效果需逐案例对照。

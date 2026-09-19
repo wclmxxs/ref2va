@@ -234,4 +234,10 @@ def optimization_inputs():
         "isolate_padding": ("BOOLEAN", {"default": False}),
         "streaming_output": ("BOOLEAN", {"default": True}),
         "cleanup_policy": (["adaptive", "always"],),
+        # Append new widgets: existing saved workflows store values by position.
+        "profile_kernels": ("BOOLEAN", {"default": False, "tooltip": "Requires profile=true. Diagnostic CUDA/CPU tracing on one rank per branch; adds overhead."}),
+        "fused_delta": ("BOOLEAN", {"default": True, "tooltip": "FP32 fused delta factorization; checked on GPU before use; requires nvcc."}),
+        "boundary_scan": ("BOOLEAN", {"default": True, "tooltip": "Compose frame transitions within chunks; preserves information with FP32 reassociation."}),
+        "fast_softmax": ("BOOLEAN", {"default": True, "tooltip": "Optimize copies in the decomposed window attention path."}),
+        "dual_stream": ("BOOLEAN", {"default": False, "tooltip": "Experimental shared-QKV two-stream Ulysses; requires softmax_ranks=0."}),
     }

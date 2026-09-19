@@ -137,7 +137,7 @@ def task_payload(record, base_url):
             'task_type': 'generation', 'modality': 'video', 'phase': record.get('phase'),
             'render_plan': record['render_plan'], 'timings': timings,
             'compilation': upstream.get('compilation'), 'cache_dit': upstream.get('cache_dit'),
-            'optimizations': upstream.get('optimizations')}
+            'optimizations': upstream.get('optimizations'), 'profiling': upstream.get('parallel_profile')}
     if status == 'succeeded':
         task['content'] = {'url': f'{base_url}{PREFIX}/video_generation/{task["id"]}/content'}
     elif status in ('failed', 'cancelled'):

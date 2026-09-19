@@ -51,6 +51,11 @@ def main():
         print(f"GPU {i}: {gpu.name}, {gpu.total_memory / 1024**3:.1f} GiB")
     for package in ("torch", "transformers", "flash-attn-4", "triton", "diffusers"):
         print(f"{package}: {importlib.metadata.version(package)}")
+    from openvdn_comfy.backend import startup_settings
+    if startup_settings().fused_delta:
+        from openvdn_comfy.delta_kernel import compiler_info
+        nvcc, _, arch = compiler_info(*torch.cuda.get_device_capability(0))
+        print(f"Fused delta compiler: {nvcc}; sm_{arch}")
     for name in ("openvdn", "ComfyUI"):
         head = subprocess.check_output(["git", "-C", str(DEPS / name), "rev-parse", "HEAD"], text=True).strip()
         if head != source_lock()["git"][name]["revision"]:

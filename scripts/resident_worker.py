@@ -21,6 +21,9 @@ from openvdn_comfy.exact_runtime import ExactRuntime, enabled
 from openvdn_comfy.attention_runtime import AttentionRuntime, summarize_attention
 from openvdn_comfy.communication import CommunicationRuntime
 from openvdn_comfy.linear_kv import LinearKVRuntime, summarize_linear_kv
+from openvdn_comfy.fine_profile import FineProfiler
+from openvdn_comfy.linear_acceleration import LinearAcceleration
+from openvdn_comfy.dual_stream import DualStream
 from openvdn_comfy.request_cleanup import RequestCleanup
 from openvdn_comfy.streaming_output import StreamingMP4
 from openvdn_comfy.optimization_options import FIELDS as OPTIMIZATION_FIELDS
@@ -131,7 +134,9 @@ def main():
                         "active_softmax_ranks": runtime.softmax_ranks,
                         "world_size": runtime.world_size, "hardware": Hardware.from_env().metadata(),
                         "video_vae_world_size": runtime.world_size if parallel_vae else 1,
-                        "metrics_schema_version": 10, "compile_cache": compile_options,
+                        "metrics_schema_version": 12, "compile_cache": compile_options,
+                        "sglang_acceleration_version": 1,
+                        "profiling_capabilities": {"fine_scopes_version": 1, "optional_kernel_trace": True},
                         "pipeline_output": enabled('REF2VA_PIPELINE_OUTPUT'), "output_buffer_capacity": 2,
                         "nccl": {"nvls_enable": os.environ.get("NCCL_NVLS_ENABLE", "NCCL default")},
                         "token_bucket_policy": BUCKET_POLICY if compile_options["token_bucket"] and settings.softmax_backend == "flex" else "native",
@@ -148,6 +153,12 @@ def main():
     install_ulysses(model.transformer, runtime, softmax_ranks=settings.softmax_ranks)
     dit_runtime = DiTRuntime(model.transformer, runtime, ulysses.iter_hybrids(model.transformer))
     linear_kv = LinearKVRuntime(dit_runtime.hybrids, runtime)
+    from src.models.softmax_attention import decomposed
+    from src.models.linear_attention import features, scan, delta_rule
+    acceleration = LinearAcceleration(dit_runtime.hybrids, linear_kv, runtime, scan)
+    fine_profile = FineProfiler(runtime, linear_kv, decomposed, features, scan, delta_rule, acceleration)
+    state("loading", "checking_linear_kernels")
+    acceleration.select(settings, device)
     # Native decomposed/reference paths remain available, without padded tokens.
     bucket_stride = compile_options["token_bucket"] if settings.softmax_backend == "flex" else 0
     buckets = TokenBuckets(bucket_stride)
@@ -160,6 +171,7 @@ def main():
     exact_runtime = ExactRuntime(model.transformer, ulysses, render, active=enabled("REF2VA_EXACT_RUNTIME"),
                                  block_runtime=dit_runtime, token_buckets=buckets if bucket_stride else None,
                                  attention_runtime=attention_runtime)
+    dual_stream = DualStream(runtime, dit_runtime, dit_runtime.forwards['_ulysses_attention_forward'])
     runtime.barrier()
     if parallel_vae:
         state("loading", "loading_parallel_video_vaes")
@@ -234,11 +246,12 @@ def main():
                                  render.video_latent_num_frames(plan.sampling_frames, 17, 5), bucket_stride)
         buckets.prepare(bucket, device)
         attention_runtime.select(current)
+        acceleration.select(current, device)
         if current.fast_communication and communication.parity is None:
             communication.verify(head_dim=dit_runtime.hybrids[0].head_dim)
         communication.select(current.fast_communication)
         runtime._ref2va_attention_signature = attention_runtime.signature()
-        dit_runtime.select_layout(current.softmax_ranks)
+        dit_runtime.select_layout(current.softmax_ranks, current.dual_stream)
         new_shape = geometries.prepare(runtime, plan, embeds, tags, conditions, bucket=bucket)
         phase = "warming_up" if warmup else "verifying_warm_cache" if startup else "denoising"
         state(run_status, phase, token=request.get("token"))
@@ -248,7 +261,9 @@ def main():
         compile_before = compiler.snapshot()
         denoise_start = time.monotonic()
         with (dit_runtime.request(current, warmup=warmup), exact_runtime.request(verify=warmup),
-              linear_kv.request(current.linear_kv_keep_ratio)):
+              linear_kv.request(current.linear_kv_keep_ratio),
+              acceleration.request(), dual_stream.request(current.dual_stream),
+              fine_profile.request(kernels=current.profile_kernels and not warmup)):
             latents, audio = exact_runtime.generate(
                 model.transformer, embeds, tags, plan.sampling_frames, 8, current.seed, device,
                 video_shift=12., audio_shift=3., runtime=runtime, step_seconds=steps, conditions=conditions)
@@ -257,8 +272,12 @@ def main():
             torch.cuda.synchronize(device)
             exact_report = exact_runtime.report()
             denoise_seconds = time.monotonic() - denoise_start
+            metadata_started = time.monotonic()
             dit_report = dit_runtime.report(denoise_seconds)
             linear_kv_record = linear_kv.report()
+        dit_report["profile"]["fine"] = fine_profile.report()
+        dit_report["acceleration"] = acceleration.report()
+        dit_report["dual_stream"] = dual_stream.report(current.dual_stream)
         compile_records = [None] * runtime.world_size
         dist.all_gather_object(compile_records, {"rank": runtime.rank, **compiler.since(compile_before),
                                                "exact_runtime": exact_report, "dit_runtime": dit_report,
@@ -281,6 +300,7 @@ def main():
         geometries.commit()
         compilation.update(geometries.last)
         profiles = [item["profile"]["ms_per_nfe"] for item in dit_records]
+        metadata_seconds = time.monotonic() - metadata_started
         decode_start = time.monotonic()
         decoded_video = None
         pending_output = None
@@ -329,6 +349,8 @@ def main():
                 stream_writer.abort(error)
             raise
         timings = {"denoise_seconds": denoise_seconds, "seconds_per_step": denoise_seconds / 8,
+                   "metadata_collection_seconds": metadata_seconds,
+                   "profiling_finalize_seconds": fine_profile.trace.get('finalize_seconds', 0.),
                    "step_seconds": steps, "model_setup_seconds": 0,
                    "step_timing_method": exact_report["step_timing_method"],
                    "dynamo_compile_seconds": compilation["dynamo_compile_seconds"],
@@ -367,6 +389,8 @@ def main():
                                         "communication": {"enabled": communication.active, "parity": communication.parity,
                                                           "pack_launches_per_layer": 2 if communication.active and runtime.branch_parallel else None},
                                         "attention": attention_report, "linear_kv": linear_kv_report,
+                                        "linear_acceleration": {"by_rank": [r['acceleration'] for r in dit_records]},
+                                        "dual_stream": {"by_rank": [r['dual_stream'] for r in dit_records]},
                                         "cleanup": cleanup_report}, "video_vae_decode": video_decode_details,
                       "compilation": compilation,
                       "conditioning": conditioning,
@@ -418,7 +442,7 @@ def main():
     verify_requests = [warm_request, *replays] if compile_options["warmup_verify"] else []
     for index, replay in enumerate(verify_requests):
         state("loading", "verifying_warm_cache", warmup_index=index + 1, warmup_count=1 + len(replays))
-        checked = {**replay, "settings": {**replay["settings"], "cache_dit": False, "profile": False}}
+        checked = {**replay, "settings": {**replay["settings"], "cache_dit": False, "profile": False, "profile_kernels": False}}
         result = run(checked, warmup=False, denoise_only=True, startup=True)
         if runtime.is_main:
             compilation = result["upstream"]["compilation"]

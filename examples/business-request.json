@@ -39,6 +39,11 @@
     "fast_communication": true,
     "streaming_output": true,
     "cleanup_policy": "adaptive",
-    "profile": false
+    "profile": false,
+    "profile_kernels": false,
+    "fused_delta": true,
+    "boundary_scan": true,
+    "fast_softmax": true,
+    "dual_stream": false
   }
 }

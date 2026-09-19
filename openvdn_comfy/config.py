@@ -43,10 +43,15 @@ class Settings:
     softmax_ranks: int = field(default_factory=lambda: Hardware.from_env().softmax_ranks)
     warmup_steps: int = 2
     profile: bool = False
+    profile_kernels: bool = False
     duration: float | None = None
     ratio: str | None = None
     resolution: int | None = None
     fast_communication: bool = True
+    fused_delta: bool = True
+    boundary_scan: bool = True
+    fast_softmax: bool = True
+    dual_stream: bool = False
     linear_stats_chunk_frames: int = 16
     linear_kv_keep_ratio: float = 1.0
     attention_kernel: str = "native"
@@ -73,9 +78,11 @@ class Settings:
             raise ValueError("num_frames must be 17n+5, e.g. 124 or 345")
         if self.reference_short_edge % 32:
             raise ValueError("reference_short_edge must be a multiple of 32")
-        for name in ("fp8", "inference_kernels", "profile"):
+        for name in ("fp8", "inference_kernels", "profile", "profile_kernels"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be boolean")
+        if self.profile_kernels and not self.profile:
+            raise ValueError("profile_kernels requires profile=true")
         if self.softmax_backend not in ("flex", "decomposed", "ref"):
             raise ValueError("Unsupported softmax_backend")
         from .optimization_options import validate

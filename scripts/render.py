@@ -30,7 +30,13 @@ def main():
     parser.add_argument("--softmax-ranks", type=int, default=Hardware.from_env().softmax_ranks)
     parser.add_argument("--warmup-steps", type=int, default=2)
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--profile-kernels", action="store_true", help="Requires --profile; diagnostic CPU/CUDA kernel tracing")
     parser.add_argument("--fast-communication", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--fused-delta", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--boundary-scan", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--fast-softmax", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--dual-stream", action=argparse.BooleanOptionalAction, default=False,
+                        help="Shared raw QKV with overlapped branches; requires --softmax-ranks 0")
     parser.add_argument("--linear-stats-chunk-frames", type=int, choices=[8,16,32], default=16)
     parser.add_argument("--linear-kv-keep-ratio", type=float, choices=[1.0, .5, .25], default=1.0,
                         help="Approximate video K/V statistics only; 1.0 keeps the original computation")

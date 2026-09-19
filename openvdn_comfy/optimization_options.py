@@ -1,11 +1,13 @@
 """Request-local optimization controls; quality experiments stay opt-in."""
-FIELDS = ('fast_communication', 'attention_kernel', 'isolate_padding', 'streaming_output', 'cleanup_policy', 'linear_stats_chunk_frames', 'linear_kv_keep_ratio')
+FIELDS = ('fast_communication', 'attention_kernel', 'isolate_padding', 'streaming_output', 'cleanup_policy', 'linear_stats_chunk_frames', 'linear_kv_keep_ratio', 'profile_kernels', 'fused_delta', 'boundary_scan', 'fast_softmax', 'dual_stream')
 
 
 def validate(settings):
-    for name in ('fast_communication', 'isolate_padding', 'streaming_output'):
+    for name in ('fast_communication', 'isolate_padding', 'streaming_output', 'fused_delta', 'boundary_scan', 'fast_softmax', 'dual_stream'):
         if type(getattr(settings, name)) is not bool:
             raise ValueError(f'{name} must be boolean')
+    if settings.dual_stream and (settings.softmax_ranks != 0 or not settings.inference_kernels):
+        raise ValueError('dual_stream requires softmax_ranks=0 and inference_kernels=true')
     if type(settings.linear_stats_chunk_frames) is not int or settings.linear_stats_chunk_frames not in (8, 16, 32):
         raise ValueError('linear_stats_chunk_frames must be 8, 16 or 32')
     from .linear_kv import validate_ratio

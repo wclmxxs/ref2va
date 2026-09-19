@@ -60,10 +60,12 @@ def fingerprint(desired, ui_args):
     digest = hashlib.sha256()
     files = [ROOT / 'deploy.sh', ROOT / 'sources.lock.json', *ROOT.glob('constraints-*.txt')]
     files += list((ROOT / 'scripts').glob('*.py')) + list((ROOT / 'openvdn_comfy').rglob('*.py'))
+    # Native kernel changes must restart an otherwise-ready cloned deployment.
+    files += list((ROOT / 'openvdn_comfy').rglob('*.cu')) + list((ROOT / 'openvdn_comfy').rglob('*.cuh'))
     for path in sorted(files):
         digest.update(str(path.relative_to(ROOT)).encode()); digest.update(path.read_bytes())
     config = {key: value for key, value in os.environ.items()
-              if key.startswith(('REF2VA_', 'NCCL_', 'TORCH', 'TRITON_')) or key in ('PUBLIC_BASE_URL', 'OMP_NUM_THREADS')}
+              if key.startswith(('REF2VA_', 'NCCL_', 'TORCH', 'TRITON_')) or key in ('PUBLIC_BASE_URL', 'OMP_NUM_THREADS', 'CUDA_HOME')}
     # Internal process marker does not change runtime behavior.
     config.pop('REF2VA_MANAGED_INSTANCE', None)
     digest.update(json.dumps([desired, ui_args, config], sort_keys=True).encode())

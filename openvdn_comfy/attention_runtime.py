@@ -61,6 +61,12 @@ def window_attention(attn, q, k, v, layout, bounds, scale):
         if torch.cuda.get_device_capability(v.device)[0] >= 10:
             q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
         return window_softmax_flex(q, k, v, mask, scale, inference=attn.inference_mode)
+    if state.fast_softmax and (state.kernel == 'decomposed' or attn._window_kernel(attn.inference_mode, q.is_cuda) == 'decomposed'):
+        from .window_attention import window_softmax_fast
+        state.fast_softmax_calls += 1
+        runtime = attn._ulysses_runtime
+        return window_softmax_fast(q, k, v, layout, bounds, scale, attn.anchor_frames,
+            profiler=getattr(runtime, '_ref2va_fine', None) if runtime.profile_enabled else None)
     if state.kernel == 'decomposed':
         from src.models.softmax_attention.decomposed import window_softmax_decomposed
         return window_softmax_decomposed(q, k, v, layout, bounds, scale, anchor_frames=attn.anchor_frames)
@@ -71,6 +77,9 @@ class AttentionRuntime:
     def __init__(self, hybrids, buckets, native):
         self.buckets, self.native = buckets, native
         self.kernel, self.isolate_padding = 'native', False
+        self.fast_softmax = False
+        self.fast_softmax_calls = 0
+        self.acceleration_signature = (False, False, False, False)
         for attn in hybrids:
             attn._ref2va_attention = self
 
@@ -79,6 +88,9 @@ class AttentionRuntime:
         self.kernel, self.isolate_padding = settings.attention_kernel, settings.isolate_padding
         self.linear_chunk = scan.STATS_CHUNK_FRAMES = settings.linear_stats_chunk_frames
         self.linear_kv_keep_ratio = settings.linear_kv_keep_ratio
+        self.fast_softmax = settings.fast_softmax
+        self.fast_softmax_calls = 0
+        self.acceleration_signature = (settings.fused_delta, settings.boundary_scan, settings.dual_stream, settings.fast_softmax)
         if self.kernel == 'decomposed':
             from src.models.softmax_attention.decomposed import varlen_kernel
             varlen_kernel()  # Fail explicitly if FA4 varlen is not installed.
@@ -86,10 +98,13 @@ class AttentionRuntime:
     def signature(self):
         # Keep existing full-statistics geometry IDs stable across this upgrade.
         signature = (self.kernel, self.isolate_padding, self.linear_chunk)
-        return signature if self.linear_kv_keep_ratio == 1.0 else (*signature, 'linear_kv_v1', self.linear_kv_keep_ratio)
+        signature = signature if self.linear_kv_keep_ratio == 1.0 else (*signature, 'linear_kv_v1', self.linear_kv_keep_ratio)
+        return (*signature, 'sglang_accel_v1', *self.acceleration_signature) if any(self.acceleration_signature) else signature
 
     def report(self):
         return {'kernel': self.kernel, 'linear_stats_chunk_frames': self.linear_chunk,
+                'fast_softmax': self.fast_softmax,
+                'fast_softmax_calls': self.fast_softmax_calls,
                 'linear_kv_keep_ratio': self.linear_kv_keep_ratio, 'isolate_padding': self.isolate_padding,
                 'padding_method': 'block_mask_key_exclusion' if self.isolate_padding else 'unmasked',
                 'score_mod': False}

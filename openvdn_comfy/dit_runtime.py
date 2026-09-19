@@ -19,6 +19,8 @@ def transformer_replacements():
         ("    runtime.configure(sequence_length, first_attn.num_heads)",
          "    runtime.configure(sequence_length, first_attn.num_heads)\n    _ref2va_input_event = runtime.profile_start()"),
         (BLOCK_LOOP, BLOCK_REPLACEMENT),
+        ("    local_rotary = tuple(t[start:end] for t in rotary_emb)",
+         "    runtime._ref2va_full_rotary = rotary_emb\n    local_rotary = tuple(t[start:end] for t in rotary_emb)"),
         ("    packed = runtime.gather_sequence(packed[0]).unsqueeze(0)",
          "    packed = runtime.gather_sequence(packed[0]).unsqueeze(0)\n"
          '    runtime.profile_end("final_gather", _ref2va_gather_event)\n'
@@ -56,22 +58,27 @@ class DiTRuntime:
         self.forwards = forwards
         self.select_layout(self.runtime.softmax_ranks)
 
-    def select_layout(self, softmax_ranks):
+    def select_layout(self, softmax_ranks, dual_stream=False):
         runtime = self.runtime
         if type(softmax_ranks) is not int or not 0 <= softmax_ranks < runtime.world_size:
             raise ValueError("softmax_ranks must be in [0, world_size - 1]")
+        if dual_stream and softmax_ranks:
+            raise ValueError('dual_stream requires standard Ulysses (softmax_ranks=0)')
         # Called only between serialized requests, after every prior collective
         # completed. Existing dispatch communicators contain all eight ranks.
         runtime.sequence_length = 0
         runtime.softmax_ranks = softmax_ranks
+        runtime._ref2va_dual_stream = dual_stream
         name = "_branch_parallel_attention_forward" if softmax_ranks else "_ulysses_attention_forward"
+        if dual_stream:
+            name = '_dual_stream_attention_forward'
         for attn in self.hybrids:
             method = types.MethodType(self.forwards[name], attn)
             attn.forward = timed_method(method, runtime, "attention")
 
     @contextmanager
     def request(self, settings, *, warmup=False):
-        self.select_layout(settings.softmax_ranks)
+        self.select_layout(settings.softmax_ranks, settings.dual_stream)
         self.runtime.profile_enabled = settings.profile and not warmup
         self.runtime.reset_profile()
         config = CacheConfig.from_settings(settings)
@@ -110,6 +117,7 @@ class DiTRuntime:
         counts = {name: len(events) for name, events in runtime.profile_events.items()}
         role = runtime.branch_kind if runtime.branch_parallel else "both"
         report = {"rank": runtime.rank, "role": role, "heads": runtime.heads_per_rank,
+                  "dual_stream": getattr(runtime, '_ref2va_dual_stream', False),
                   "denoise_seconds": denoise_seconds, "profile_enabled": runtime.profile_enabled,
                   "total_ms": totals, "calls": counts,
                   "ms_per_nfe": {name: ms / max(1, self.cache.step) for name, ms in totals.items()}}
@@ -119,12 +127,13 @@ class DiTRuntime:
 def summarize_profiles(records):
     """Keep overlapping scopes separate; never sum GPU ranks into latency."""
     enabled = all(record["profile_enabled"] for record in records)
-    result = {"enabled": enabled, "by_rank": records, "method": "cuda_events_on_compute_stream",
+    result = {"enabled": enabled, "by_rank": records, "method": "cuda_events_on_current_stream",
               "scope": "denoise only; includes enqueue gaps/waits; nested scopes overlap",
               "pure_nccl_kernel_time": False,
               "notes": ["branch_dispatch includes branch_pack and branch_relevant_wait",
                         "output_dispatch includes output_a2a and output_unpack",
                         "blocks includes attention and ffn; never sum these scopes or ranks",
+                        "dual_stream scopes can overlap on separate streams; output_stream_join is an exposed wait",
                         "profiling overhead is included; use profile=false for speed comparisons"]}
     if not enabled:
         return result
@@ -134,11 +143,13 @@ def summarize_profiles(records):
     for role in ("softmax", "linear", "both"):
         ranks = [r for r in records if r["role"] == role]
         if ranks:
+            dual = any(r.get('dual_stream') for r in ranks)
             groups[role] = {"ranks": [r["rank"] for r in ranks],
                 "max_compute_ms_per_nfe": (max(r["ms_per_nfe"].get(role + "_compute", 0.) for r in ranks)
                                            if role != "both" else None),
-                "max_return_dispatch_ms_per_nfe": max(r["ms_per_nfe"].get(
-                    "output_dispatch" if role != "both" else "heads_to_sequence", 0.) for r in ranks)}
+                "max_return_dispatch_ms_per_nfe": None if dual else max(r["ms_per_nfe"].get(
+                    "output_dispatch" if role != "both" else "heads_to_sequence", 0.) for r in ranks),
+                "max_stream_join_ms_per_nfe": max(r['ms_per_nfe'].get('output_stream_join',0.) for r in ranks) if dual else None}
     result["branches"] = groups
     # Compute-stream spans measure exposed waits, not the asynchronous NCCL
     # kernels' entire duration. Do not label an overlap-heavy sum a comm percent.
