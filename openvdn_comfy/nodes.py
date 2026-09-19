@@ -77,7 +77,7 @@ class OpenVDNH200Generate:
     CATEGORY = "OpenVDN H200"
     DESCRIPTION = ("Official 8-NFE Ulysses, 1344×768 at 24 fps; uses this API instance's GPU group. Ref2VA-like uses FL2VA weights. "
                    "inference_kernels controls the official fused/compiled kernel bundle; it is not a whole-DiT compile switch. "
-                   "Optional approximate DBCache; disabled by default. Models are resident; kernel/precision settings must match /openvdn/health. "
+                   "Approximate DBCache defaults to RDT 0.25; disable for full computation. Models are resident; kernel/precision settings must match /openvdn/health. "
                    "warmup_steps is a legacy field; startup performs 8 NFE once, requests perform no extra warmup.")
 
     @classmethod
@@ -205,8 +205,8 @@ class OpenVDNH200BusinessRequest(OpenVDNH200Request):
 
 def cache_inputs():
     return {
-        "cache_dit": ("BOOLEAN", {"default": False, "tooltip": "Approximate DBCache for this request only."}),
-        "cache_dit_threshold": ("FLOAT", {"default": .08, "min": 0., "max": 1., "step": .01}),
+        "cache_dit": ("BOOLEAN", {"default": Settings().cache_dit, "tooltip": "Approximate DBCache for this request only."}),
+        "cache_dit_threshold": ("FLOAT", {"default": Settings().cache_dit_threshold, "min": 0., "max": 1., "step": .01}),
         "cache_dit_fn_blocks": ("INT", {"default": 8, "min": 1, "max": 49}),
         "cache_dit_bn_blocks": ("INT", {"default": 8, "min": 0, "max": 49}),
         "cache_dit_warmup_steps": ("INT", {"default": 3, "min": 1, "max": 8}),
@@ -239,7 +239,7 @@ def optimization_inputs():
         "fused_delta": ("BOOLEAN", {"default": True, "tooltip": "FP32 fused delta factorization; checked on GPU before use; requires nvcc."}),
         "boundary_scan": ("BOOLEAN", {"default": True, "tooltip": "Compose frame transitions within chunks; preserves information with FP32 reassociation."}),
         "fast_softmax": ("BOOLEAN", {"default": True, "tooltip": "Optimize copies in the decomposed window attention path."}),
-        "dual_stream": ("BOOLEAN", {"default": False, "tooltip": "Experimental shared-QKV two-stream Ulysses; requires softmax_ranks=0."}),
+        "dual_stream": ("BOOLEAN", {"default": Settings().dual_stream, "tooltip": "Shared-QKV two-stream Ulysses; disable when selecting softmax_ranks>0."}),
         "vae_tile_batch_size": ([4, 1, 2, 8], {"tooltip": "Batch independent same-shape VAE tiles. 1 with vae_compile=false restores scalar decode."}),
         "vae_compile": ("BOOLEAN", {"default": True, "tooltip": "Compile repeated VAE decoder blocks on first use, with native numerical checks. Uses disk cache; no exhaustive startup warmup."}),
     }

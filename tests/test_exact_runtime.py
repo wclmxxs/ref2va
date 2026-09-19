@@ -301,7 +301,7 @@ def test_pinned_forward_with_dit_controller_cache_off_matches_native(exact_enabl
         # Profile toggles and branch switches must not change the pinned block
         # loop math; compare all video/audio outputs for every NFE.
         for layout,profile in ((6,False),(4,True),(0,True),(6,False)):
-            settings = Settings(softmax_ranks=layout,profile=profile)
+            settings = Settings(softmax_ranks=layout,profile=profile,cache_dit=False,dual_stream=False)
             with controller.request(settings),exact.request():
                 for _ in range(8):
                     actual = model(**kwargs)
@@ -318,7 +318,7 @@ def test_pinned_forward_with_dit_controller_cache_off_matches_native(exact_enabl
                     assert not rt.profile_events
             assert not rt.profile_enabled and not rt.profile_events
             assert controller.cache.previous is None
-        with controller.request(Settings(cache_dit=True,profile=True),warmup=True),exact.request():
+        with controller.request(Settings(cache_dit=True,profile=True,dual_stream=False),warmup=True),exact.request():
             assert not controller.cache.config.enabled and not rt.profile_enabled
             for _ in range(8):
                 model(**kwargs)

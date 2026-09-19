@@ -25,6 +25,7 @@ def parallel_vae_enabled():
 
 
 def startup_settings():
+    defaults = Settings()
     def boolean(name, default):
         value = os.environ.get(name, str(int(default)))
         if value not in ("0", "1"):
@@ -40,13 +41,18 @@ def startup_settings():
         fused_delta=boolean("REF2VA_FUSED_DELTA", True),
         boundary_scan=boolean("REF2VA_BOUNDARY_SCAN", True),
         fast_softmax=boolean("REF2VA_FAST_SOFTMAX", True),
-        dual_stream=boolean("REF2VA_DUAL_STREAM", False),
+        dual_stream=boolean("REF2VA_DUAL_STREAM", True) if "REF2VA_DUAL_STREAM" in os.environ else None,
         linear_stats_chunk_frames=int(os.environ.get("REF2VA_LINEAR_STATS_CHUNK_FRAMES", "16")),
         attention_kernel=os.environ.get("REF2VA_ATTENTION_KERNEL", "native"),
         isolate_padding=boolean("REF2VA_ISOLATE_PADDING", False),
         streaming_output=boolean("REF2VA_STREAMING_OUTPUT", True),
         vae_tile_batch_size=int(os.environ.get("REF2VA_VAE_TILE_BATCH_SIZE", "4")),
         vae_compile=boolean("REF2VA_VAE_COMPILE", True),
+        cache_dit=boolean("REF2VA_CACHE_DIT", defaults.cache_dit),
+        cache_dit_threshold=float(os.environ.get("REF2VA_CACHE_DIT_THRESHOLD", str(defaults.cache_dit_threshold))),
+        **{name: int(os.environ.get("REF2VA_" + name.upper(), str(getattr(defaults, name))))
+           for name in ("cache_dit_fn_blocks", "cache_dit_bn_blocks", "cache_dit_warmup_steps",
+                        "cache_dit_max_consecutive", "cache_dit_max_cached_steps", "cache_dit_last_steps")},
         cleanup_policy=os.environ.get("REF2VA_CLEANUP_POLICY", "adaptive"),
         softmax_backend=os.environ.get("REF2VA_SOFTMAX_BACKEND", Hardware.from_env().softmax_backend),
         softmax_ranks=int(os.environ.get("REF2VA_SOFTMAX_RANKS", str(Hardware.from_env().softmax_ranks))),

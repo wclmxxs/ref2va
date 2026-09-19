@@ -29,7 +29,7 @@ class Hardware:
 
     @property
     def softmax_ranks(self):
-        return (6 if self.gpu_type == 'h200' else 5) if self.world_size == 8 else (3 if self.gpu_type == 'h200' else 2)
+        return 0
 
     def visible_devices(self):
         devices = os.environ.get('CUDA_VISIBLE_DEVICES', ','.join(map(str, range(self.world_size)))).split(',')
@@ -81,11 +81,12 @@ def runtime_directory(root):
 
 def install_workflows(root, user_directory, settings):
     """Separate starter names per hardware profile; preserve saved user edits."""
+    from .nodes import cache_inputs, optimization_inputs
     hardware = Hardware.from_env()
     destination = user_directory / 'default/workflows'
     destination.mkdir(parents=True, exist_ok=True)
     for name in ('openvdn_ref2va_like', 'openvdn_url_request'):
-        target = destination / f'{name}_{hardware.gpu_type}_{hardware.world_size}.json'
+        target = destination / f'{name}_{hardware.gpu_type}_{hardware.world_size}_fast_v1.json'
         if target.exists():
             continue
         workflow = json.loads((root / 'workflows' / f'{name}.json').read_text())
@@ -93,4 +94,6 @@ def install_workflows(root, user_directory, settings):
             offset = {'OpenVDNH200Generate': 8, 'OpenVDNH200Request': 10}.get(node['type'])
             if offset is not None:
                 node['widgets_values'][offset:offset + 2] = [settings.softmax_backend, settings.softmax_ranks]
+                node['widgets_values'][offset + 4:] = [getattr(settings, field)
+                                                       for field in (*cache_inputs(), *optimization_inputs())]
         target.write_text(json.dumps(workflow, ensure_ascii=False, indent=2) + '\n')

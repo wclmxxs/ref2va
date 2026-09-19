@@ -51,7 +51,7 @@ class Settings:
     fused_delta: bool = True
     boundary_scan: bool = True
     fast_softmax: bool = True
-    dual_stream: bool = False
+    dual_stream: bool | None = None
     linear_stats_chunk_frames: int = 16
     linear_kv_keep_ratio: float = 1.0
     attention_kernel: str = "native"
@@ -60,14 +60,20 @@ class Settings:
     vae_tile_batch_size: int = 4
     vae_compile: bool = True
     cleanup_policy: str = "adaptive"
-    cache_dit: bool = False
-    cache_dit_threshold: float = 0.08
+    cache_dit: bool = True
+    cache_dit_threshold: float = 0.25
     cache_dit_fn_blocks: int = 8
     cache_dit_bn_blocks: int = 8
     cache_dit_warmup_steps: int = 3
     cache_dit_max_consecutive: int = 1
     cache_dit_max_cached_steps: int = 2
     cache_dit_last_steps: int = 1
+
+    def __post_init__(self):
+        # An explicit branch layout or unfused model must remain usable without
+        # specifying the new dual-stream option. Explicit conflicts still fail.
+        if self.dual_stream is None:
+            object.__setattr__(self, 'dual_stream', self.softmax_ranks == 0 and self.inference_kernels is True)
 
     def validate(self):
         for name, low, high in (("num_frames", 107, 345), ("seed", 0, 2**63 - 1),
@@ -113,3 +119,12 @@ class Settings:
             "precision": {"dtype": "bfloat16", "fp8": {"enabled": self.fp8, "skip_end_blocks": 0}},
             "parallel": {"softmax_ranks": self.softmax_ranks, "profile": self.profile},
         }
+
+
+def merge_request_options(defaults, overrides):
+    """Apply request controls without inheriting an incompatible dual-stream default."""
+    options = {**defaults, **overrides}
+    if 'dual_stream' not in overrides and (options.get('softmax_ranks', 0) != 0 or
+                                           options.get('inference_kernels') is False):
+        options['dual_stream'] = False
+    return options

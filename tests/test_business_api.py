@@ -15,7 +15,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from PIL import Image
 import pytest
 
-from openvdn_comfy import api, business_api, business_contract as contract, business_media as media, jobs, nodes
+from openvdn_comfy import api, backend, business_api, business_contract as contract, business_media as media, jobs, nodes
 from openvdn_comfy.config import Settings
 
 
@@ -47,7 +47,7 @@ def environment(monkeypatch, tmp_path):
     settings = Settings()
     state = {'ready': True, 'instance': 'worker-1',
              'profile': {k: getattr(settings, k) for k in (*api.PROFILE_FIELDS, 'softmax_ranks', 'profile')},
-             'request_options': {'optimizations': {'fast_communication': True},
+             'request_options': {'optimizations': {k: getattr(settings, k) for k in contract.OPTIMIZATIONS},
                                  'cache_dit': {k: getattr(settings, k) for k in api.CACHE_FIELDS}}}
     monkeypatch.setattr(api, 'health', lambda: state)
     monkeypatch.setitem(sys.modules, 'folder_paths', types.SimpleNamespace(get_output_directory=lambda: str(tmp_path/'output')))
@@ -106,7 +106,7 @@ def test_complete_optimization_mapping_and_request_defaults(environment):
     for key in contract.OPTIMIZATIONS:
         assert getattr(settings, key) == optimization[key]
     assert json.dumps(state, sort_keys=True) == original
-    assert not contract.normalize_request(body(), state)[1].cache_dit
+    assert contract.normalize_request(body(), state)[1].cache_dit
     state['request_options']['cache_dit'].update(cache_dit=True, cache_dit_threshold=.15)
     _, inherited, _ = contract.normalize_request(body(optimization={'cache_dit': {'rdt': None}}), state)
     assert inherited.cache_dit and inherited.cache_dit_threshold == .15
@@ -121,6 +121,60 @@ def test_documented_example_covers_every_business_parameter(environment):
     request, settings, sources = contract.normalize_request(example, environment.state)
     assert settings.cache_dit and settings.cache_dit_threshold == .25
     assert request['num_inference_steps'] == 8 and sources[0]['kind'] == 'url'
+
+
+@pytest.mark.parametrize('gpu,size', [('h200',8),('h200',4),('b200',8),('b200',4),('b300',8),('b300',4)])
+def test_omitted_optimization_matches_full_example_and_startup(environment, monkeypatch, gpu, size):
+    monkeypatch.setenv('REF2VA_GPU_TYPE', gpu)
+    monkeypatch.setenv('REF2VA_GPUS', str(size))
+    startup = backend.startup_settings()
+    state = {'profile': {k: getattr(startup, k) for k in (*api.PROFILE_FIELDS, 'softmax_ranks')},
+             'request_options': {'optimizations': {k: getattr(startup,k) for k in contract.OPTIMIZATIONS},
+                                 'cache_dit': {k: getattr(startup,k) for k in api.CACHE_FIELDS}}}
+    example = json.loads((Path(__file__).resolve().parents[1]/'examples/business-request.json').read_text())
+    _, full, _ = contract.normalize_request(example, state)
+    for opt in (None, {}, {'dual_stream': None, 'cache_dit': {'enabled': None, 'rdt': None}}):
+        _, minimal, _ = contract.normalize_request(body(optimization=opt), state)
+        for field in (*contract.OPTIMIZATIONS, *api.CACHE_FIELDS):
+            assert getattr(minimal,field) == getattr(full,field) == getattr(startup,field)
+
+
+def test_gateway_override_and_next_default_request_are_independent(environment):
+    async def exercise():
+        async with environment.client() as client:
+            for opt, expected in [
+                ({'softmax_ranks': 3, 'cache_dit': {'enabled': False}, 'vae_tile_batch_size': 1, 'vae_compile': False},
+                 (3, False, False, 1, False)),
+                ({}, (0, True, True, 4, True)),
+                ({'dual_stream': False}, (0, False, True, 4, True)),
+            ]:
+                response = await client.post(contract.PREFIX+'/video_generation', json=body(optimization=opt))
+                assert response.status == 200, await response.text()
+                record = jobs.read_job(contract.job_id((await response.json())['task_id']))
+                assert tuple(record['settings'][k] for k in ('softmax_ranks','dual_stream','cache_dit',
+                                                             'vae_tile_batch_size','vae_compile')) == expected
+            response = await client.post(contract.PREFIX+'/video_generation',
+                                         json=body(optimization={'softmax_ranks': 3, 'dual_stream': True}))
+            assert response.status == 400
+            assert len(environment.server.prompt_queue.pending) == 3
+    asyncio.run(exercise())
+
+
+def test_legacy_api_inherits_cache_defaults_and_resolves_branch_override(environment, monkeypatch):
+    async def refs(urls): return ['/prepared-reference.png']
+    monkeypatch.setattr(api, 'download_references', refs)
+    environment.state['request_options']['cache_dit'].update(cache_dit=False, cache_dit_threshold=.12)
+    async def exercise():
+        async with environment.client() as client:
+            for changes, dual, cache in [({'softmax_ranks': 3},False,False), ({},True,False),
+                                         ({'cache_dit':True},True,True)]:
+                response = await client.post('/openvdn/jobs', json={'prompt':'test',
+                    'reference_image_url':'https://example.com/ref.png', **changes})
+                assert response.status == 202, await response.text()
+                actual = jobs.read_job((await response.json())['job_id'])['settings']
+                assert actual['dual_stream'] is dual and actual['cache_dit'] is cache
+                assert actual['cache_dit_threshold'] == .12
+    asyncio.run(exercise())
 
 
 def test_linear_kv_ratio_is_request_local_and_rejected_before_queueing(environment):

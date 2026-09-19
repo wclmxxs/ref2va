@@ -35,17 +35,19 @@ def main():
     parser.add_argument("--fused-delta", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--boundary-scan", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--fast-softmax", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--dual-stream", action=argparse.BooleanOptionalAction, default=False,
-                        help="Shared raw QKV with overlapped branches; requires --softmax-ranks 0")
+    parser.add_argument("--dual-stream", action=argparse.BooleanOptionalAction, default=None,
+                        help="Shared raw QKV with overlapped branches; defaults on for --softmax-ranks 0 with inference kernels")
     parser.add_argument("--linear-stats-chunk-frames", type=int, choices=[8,16,32], default=16)
     parser.add_argument("--linear-kv-keep-ratio", type=float, choices=[1.0, .5, .25], default=1.0,
                         help="Approximate video K/V statistics only; 1.0 keeps the original computation")
     parser.add_argument("--attention-kernel", choices=["native", "decomposed"], default="native")
     parser.add_argument("--isolate-padding", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--streaming-output", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--vae-tile-batch-size", type=int, choices=[1, 2, 4, 8], default=4)
+    parser.add_argument("--vae-compile", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--cleanup-policy", choices=["adaptive", "always"], default="adaptive")
-    parser.add_argument("--cache-dit", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--cache-dit-threshold", type=float, default=.08)
+    parser.add_argument("--cache-dit", action=argparse.BooleanOptionalAction, default=Settings().cache_dit)
+    parser.add_argument("--cache-dit-threshold", type=float, default=Settings().cache_dit_threshold)
     parser.add_argument("--cache-dit-fn-blocks", type=int, default=8)
     parser.add_argument("--cache-dit-bn-blocks", type=int, default=8)
     parser.add_argument("--cache-dit-warmup-steps", type=int, default=3)

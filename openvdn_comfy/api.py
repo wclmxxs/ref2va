@@ -9,7 +9,7 @@ import aiohttp
 
 from aiohttp import web
 
-from .config import Settings
+from .config import Settings, merge_request_options
 from .optimization_options import FIELDS as OPTIMIZATION_FIELDS
 from .cache_dit import FIELDS as CACHE_FIELDS
 from .jobs import create_job, read_job, update_job
@@ -89,7 +89,9 @@ def register_routes(server=None):
                     raise web.HTTPRequestEntityTooLarge(max_size=131072, actual_size=len(content))
             body = json.loads(content)
             if isinstance(body, dict):
-                body = {**backend["profile"], **backend.get("request_options", {}).get("optimizations", {}), **body}
+                defaults = backend.get("request_options", {})
+                body = merge_request_options({**backend["profile"], **defaults.get("optimizations", {}),
+                                              **defaults.get("cache_dit", {})}, body)
             normalized, settings = normalize_request(body)
             validate_profile(settings, backend)
         except (ValueError, TypeError) as error:

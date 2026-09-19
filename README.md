@@ -1,8 +1,8 @@
 # OpenVDN 8 步 · ComfyUI · H200 / B200 / B300
 
-默认自动识别 H200/B200/B300，一条视频使用全部 8 张 GPU；可切换为两套四卡服务。ComfyUI 负责输入、队列和视频预览；常驻 GPU 进程调用固定版本的 [OpenVDN](https://github.com/OpenVDN/vdn-minimax-h3)，默认 FP8、8 NFE；H200 八卡默认 6 个 softmax rank + 2 个 linear rank。
+默认自动识别 H200/B200/B300，一条视频使用全部 8 张 GPU；可切换为两套四卡服务。ComfyUI 负责输入、队列和视频预览；常驻 GPU 进程调用固定版本的 [OpenVDN](https://github.com/OpenVDN/vdn-minimax-h3)，默认 FP8、8 NFE；默认 `softmax_ranks=0`，使用双流 Ulysses，各卡计算两种 attention 分支。
 
-图片参考模式是官方 **Ref2VA-like**：FL2VA 权重接收参考图，不是 MiniMax 的独立 Ref2VA transformer。支持默认关闭的 DBCache 跨步缓存；暂不接入 LightX2V 或整块 DiT 编译；`inference_kernels` 控制官方融合/局部编译内核组合。
+图片参考模式是官方 **Ref2VA-like**：FL2VA 权重接收参考图，不是 MiniMax 的独立 Ref2VA transformer。默认开启 RDT 0.25 的 DBCache 近似跨步缓存，支持逐请求关闭；暂不接入 LightX2V 或整块 DiT 编译；`inference_kernels` 控制官方融合/局部编译内核组合。
 
 ## 一条命令启动
 
@@ -23,7 +23,7 @@ bash deploy.sh            # 自动识别型号，一套八卡服务，8188
 
 需要 Linux x86_64、系统 `python3`、8 张同型号完整 H200/B200/B300、支持当前 CUDA 12.9 PyTorch 的驱动、NVLink/NCCL 和约 250 GB 磁盘空间。依赖/权重检查不等于校验全部权重文件的 SHA-256；CUDA/NCCL 和模型预热检查在目标机器实际执行。
 
-当前默认测试 **2048 间隔的无屏蔽前缀分桶**：补齐 token 参与 attention，可能改变生成结果；尚无这版的 H200 耗时/效果实测。已有环境变量会继续生效；如需覆盖旧的 0/1024 设置，用 `REF2VA_TOKEN_BUCKET=2048 bash deploy.sh restart`；`REF2VA_TOKEN_BUCKET=0 bash deploy.sh start` 可回到不补齐的原生布局。
+H200 Flex 后端默认使用 **2048 间隔的无屏蔽前缀分桶**（B200/B300 decomposed 后端不补齐）：补齐 token 参与 attention，可能改变生成结果；新双流组合的 H200 耗时仍需复测。已有环境变量会继续生效；如需覆盖旧的 0/1024 设置，用 `REF2VA_TOKEN_BUCKET=2048 bash deploy.sh restart`；`REF2VA_TOKEN_BUCKET=0 bash deploy.sh start` 可回到不补齐的原生布局。
 
 启动依次执行：
 
@@ -83,22 +83,22 @@ bash deploy.sh --gpu-type b200 --gpus 4 --port 9000    # 两套四卡 B200，900
 
 `--gpus` 是**每个 worker 的卡数**，部署机器仍需提供 8 张 GPU。四卡模式启动两套独立服务：worker-0 使用 GPU 0–3，worker-1 使用 GPU 4–7。指定 `CUDA_VISIBLE_DEVICES=...` 时须列出八个不同设备，按前四/后四拆分。两套服务各有一个 API 端口、一条队列、一套常驻模型；提交、查询、下载同一任务须使用同一端口，不自动负载均衡。两边都有任务时可同时生成两条视频。
 
-| GPU / 每 worker 卡数 | 默认 softmax backend | softmax + linear ranks |
+| GPU / 每 worker 卡数 | 默认 softmax backend | 默认布局 |
 | --- | --- | --- |
-| H200 / 8 | flex | 6 + 2 |
-| H200 / 4 | flex | 3 + 1 |
-| B200 / 8 | decomposed | 5 + 3 |
-| B200 / 4 | decomposed | 2 + 2 |
-| B300 / 8 | decomposed | 5 + 3 |
-| B300 / 4 | decomposed | 2 + 2 |
+| H200 / 8 | flex | ranks=0，双流 Ulysses |
+| H200 / 4 | flex | ranks=0，双流 Ulysses |
+| B200 / 8 | decomposed | ranks=0，双流 Ulysses |
+| B200 / 4 | decomposed | ranks=0，双流 Ulysses |
+| B300 / 8 | decomposed | ranks=0，双流 Ulysses |
+| B300 / 4 | decomposed | ranks=0，双流 Ulysses |
 
-这是起始配置，不代表已测得各机型最优布局。请求级 `softmax_ranks` 范围为 0 到单 worker 卡数减 1；0 使用标准 Ulysses。B200/B300 的 decomposed 路径不使用 Flex 的 token 分桶。显式 `REF2VA_SOFTMAX_BACKEND` / `REF2VA_SOFTMAX_RANKS` 仍覆盖默认；从八卡切为四卡时不要保留越界的 rank 数，启动器会在停止旧服务前检查配置。H200 默认关闭 NVLS 以兼容既有主机；B200/B300 使用 NCCL 默认，仍可显式设置 `NCCL_NVLS_ENABLE`。
+默认使用本次 B300 对比中最快的组合：双流 Ulysses、RDT 0.25、VAE 4 块合批＋编译；完整参数见 [业务接口](docs/business-api.md)。4×B300 的 10 秒、输出/参考图短边 768 案例热态中位数为 DiT 10.30 秒、视频 VAE 1.88 秒、worker 12.51 秒。该耗时只代表已测案例，不代表各机型均已测得最优布局。请求级 `softmax_ranks` 范围为 0 到单 worker 卡数减 1；0 使用标准 Ulysses。B200/B300 的 decomposed 路径不使用 Flex 的 token 分桶。显式 `REF2VA_SOFTMAX_BACKEND` / `REF2VA_SOFTMAX_RANKS` 仍覆盖默认；从八卡切为四卡时不要保留越界的 rank 数，启动器会在停止旧服务前检查配置。H200 默认关闭 NVLS 以兼容既有主机；B200/B300 使用 NCCL 默认，仍可显式设置 `NCCL_NVLS_ENABLE`。
 
 四卡实例状态、GPU 锁、条件缓存、编译缓存、用户数据库、临时目录和日志分别位于 `.runtime/instances/worker-0/`、`.runtime/instances/worker-1/`。模型文件与唯一文件名的输出目录共用。`status/logs/stop` 自动读取 `.runtime/fleet.json`，无需再传卡数；切换拓扑仍用同一命令并传入新的 `--gpus`。一组 OOM/卡死只重启该组，另一组继续工作。API 健康结果的 `hardware` 返回实际型号、设备列表和单 worker 卡数。
 
-界面中选择带 `_h200_4`、`_b200_4`、`_b300_4` 等后缀的 starter workflow，参数会匹配对应实例，已有用户保存的工作流不会被覆盖。B300 严格校验 `CC 10.3` 和完整显存配置，不把它伪装为 B200；误传 `--gpu-type b200` 会在加载前提示改用 B300/auto。[NVIDIA 型号与计算能力表](https://developer.nvidia.com/cuda/gpus)
+界面中选择带 `_h200_4_fast_v1`、`_b200_4_fast_v1`、`_b300_4_fast_v1` 等后缀的 starter workflow，参数会匹配对应实例，已有用户保存的工作流不会被覆盖。B300 严格校验 `CC 10.3` 和完整显存配置，不把它伪装为 B200；误传 `--gpu-type b200` 会在加载前提示改用 B300/auto。[NVIDIA 型号与计算能力表](https://developer.nvidia.com/cuda/gpus)
 
-四卡和 B200/B300 路径已覆盖本地配置、上游布局及故障隔离回归，实际显存峰值、CUDA 内核兼容性与吞吐量仍需目标服务器验证；通过本地测试不等于 B300 已跑通模型。
+四卡/八卡 B300 已完成目标服务器测试；H200/B200 保留对应后端与硬件校验，更新后的组合仍需在对应硬件复测。
 
 ### 镜像迁移
 
@@ -205,8 +205,13 @@ bash deploy.sh render \
 | `REF2VA_PORT` / `REF2VA_LISTEN` | 8188 / 0.0.0.0 | ComfyUI 地址 |
 | `REF2VA_FP8` | 1 | 官方 FP8 线性层；0 为 BF16 |
 | `REF2VA_INFERENCE_KERNELS` | 1 | 官方融合/局部编译内核；0 也不代表全部禁用编译 |
-| `REF2VA_SOFTMAX_BACKEND` | flex | flex / decomposed / ref |
-| `REF2VA_SOFTMAX_RANKS` | 6 | 6+2；0 为普通八卡 Ulysses |
+| `REF2VA_SOFTMAX_BACKEND` | H200=flex；B200/B300=decomposed | flex / decomposed / ref |
+| `REF2VA_SOFTMAX_RANKS` | 0 | Ulysses，各卡处理两分支；默认启用双流 |
+| `REF2VA_DUAL_STREAM` | ranks=0 且 inference kernels 开启时为 1 | 显式 0/1 覆盖；非零 ranks 不支持双流 |
+| `REF2VA_CACHE_DIT` / `REF2VA_CACHE_DIT_THRESHOLD` | 1 / 0.25 | 默认启用近似残差缓存，可逐请求覆盖 |
+| `REF2VA_CACHE_DIT_FN_BLOCKS` / `REF2VA_CACHE_DIT_BN_BLOCKS` | 8 / 8 | 前后完整执行块数 |
+| `REF2VA_CACHE_DIT_WARMUP_STEPS` / `REF2VA_CACHE_DIT_LAST_STEPS` | 3 / 1 | 开头/结尾完整执行步数 |
+| `REF2VA_CACHE_DIT_MAX_CONSECUTIVE` / `REF2VA_CACHE_DIT_MAX_CACHED_STEPS` | 1 / 2 | 连续/总缓存步数上限 |
 | `REF2VA_PROFILE` | 0 | 各 rank 分段计时 |
 | `REF2VA_VAE_PARALLEL` | 1 | 八卡视频 VAE 片段并行及预分配 tile 拼接；启动时逐片段对照未优化原版，校验通过才开放服务；0 恢复原版单卡 |
 | `REF2VA_COMPILE_SHAPES` | 32 | 编译图轮换前保留的成功几何配置数，8–64；达到容量后才重置 Dynamo，保留磁盘缓存和 mask LRU |
@@ -335,7 +340,7 @@ python3 scripts/benchmark_vae.py --server http://HOST:8188 \
 
 ## 单次请求内的 DiT 去重与同步优化（schema 4）
 
-默认 `REF2VA_EXACT_RUNTIME=1`。默认关闭 DBCache 时完整运行 8 次 DiT，保留所有注意力和线性分支、FP8 设置、权重及采样器，不启用跨步残差缓存：
+默认 `REF2VA_EXACT_RUNTIME=1`。显式关闭 DBCache 时完整运行 8 次 DiT，保留所有注意力和线性分支、FP8 设置、权重及采样器，不启用跨步残差缓存：
 
 - 同一次请求的 `RoPE(position_ids)`、`token_refiner(context_embedder(prompt_embeds))` 只计算一次，其余 7 次复用。输入存储、形状、stride、版本、dtype、设备与 autocast 变化会失效；请求结束或异常立即释放。不同请求不共享这些结果。
 - 每层线性输出投影的 GPU 布尔索引/`any()`/`sum().item()` 改为 CPU 已知区间切片，保留原 GEMM 的输入形状、连续布局和精度。
@@ -379,7 +384,7 @@ cd /root/ref2va && git pull --ff-only && bash deploy.sh start
 
 ### 多卡布局与分析
 
-`softmax_ranks` 现在可逐请求指定：6 为 6+2，5 为 5+3，4 为 4+4，0 为普通八卡 Ulysses。只在串行队列的请求边界切换分工，保留权重与 communicator。不同布局单独记录编译几何；首次切换可能编译，随后复用。服务默认仍为 6+2，比较脚本不会替用户永久更改默认值。改变并行分工不引入缓存近似，但浮点运算顺序可能不同，不能承诺逐像素一致。
+`softmax_ranks` 现在可逐请求指定：6 为 6+2，5 为 5+3，4 为 4+4，0 为普通八卡 Ulysses。只在串行队列的请求边界切换分工，保留权重与 communicator。不同布局单独记录编译几何；首次切换可能编译，随后复用。服务默认改为 ranks=0 的双流路径；API 仅传非零 ranks 会自动关闭该请求的双流，显式冲突则拒绝。比较脚本不永久更改服务默认。改变并行分工不引入缓存近似，但浮点运算顺序可能不同，不能承诺逐像素一致。
 
 `profile: true` 按请求开启 CUDA event 分析，默认关闭。返回 `metrics.upstream.parallel_profile`：
 
@@ -408,7 +413,7 @@ Schema 12 增加按请求的细粒度分析，业务接口通过 `optimization.p
 | `fused_delta` | `true` | 把视频/文本的 128×128 SPD 求逆、transition 和 injection 合成一个 FP32 CUDA kernel，替换多次 Cholesky/求解/GEMM。启动在实际 GPU 对 FP64 参考做检查；失败报错，不跳过校验。 |
 | `boundary_scan` | `true` | 先合成块内全部帧的仿射变换，再扫描 chunk 边界；保留所有帧的信息。首尾锚帧、尾部不足一个 chunk 均处理；不符合边界条件的窗口回退原扫描。 |
 | `fast_softmax` | `true` | decomposed 路径改为 index_select 和连续 Q 切片，保留 FA4/cuDNN 后端及原 mask；有 stride 时仍复制连续，不把错误布局交给 FA4。flex/ref 路径不受此开关影响。 |
-| `dual_stream` | `false` | 实验性普通 Ulysses：共享一次原始 QKV 交换，softmax/linear 两条 CUDA 流重叠，独立回传再汇合。要求 `softmax_ranks=0`、`inference_kernels=true`，支持 4/8 卡。每种新几何的首个 block 与原 Ulysses 进行全 rank 数值核对。 |
+| `dual_stream` | `true`（ranks=0） | 双流 Ulysses：共享一次原始 QKV 交换，softmax/linear 两条 CUDA 流重叠，独立回传再汇合。要求 `softmax_ranks=0`、`inference_kernels=true`，支持 4/8 卡。每种新几何的首个 block 与原 Ulysses 进行全 rank 数值核对。 |
 
 `fused_delta` 和 `boundary_scan` 保持方程与全部输入，改变 FP32 运算顺序，不能称为逐位等价；没有新增 K/V 下采样。双流路径的 gate GEMM 形状也会改变。Cache-DiT 和 `linear_kv_keep_ratio` 仍单独控制，做精度对照时设为关闭和 `1.0`。
 
@@ -437,8 +442,8 @@ python3 scripts/benchmark_sglang_acceleration.py --server http://HOST:8188 \
 
 | 参数 | 默认 | 含义 |
 | --- | --- | --- |
-| `cache_dit` | false | 开关；关闭时无残差缓存拷贝或额外决策 collective |
-| `cache_dit_threshold` | 0.08 | 复用变化阈值，0–1；越小越保守，0 完全不复用；1 仍需通过变化量检查 |
+| `cache_dit` | true | 开关；关闭时无残差缓存拷贝或额外决策 collective |
+| `cache_dit_threshold` | 0.25 | 复用变化阈值，0–1；越小越保守，0 完全不复用；1 仍需通过变化量检查 |
 | `cache_dit_fn_blocks` | 8 | 每步完整计算前 Fn 层，1–49 |
 | `cache_dit_bn_blocks` | 8 | 每步完整计算后 Bn 层，0–49；Fn+Bn 必须小于 50 |
 | `cache_dit_warmup_steps` | 3 | 前几次 DiT 调用完整计算，1–8；不是额外增加采样步数 |
@@ -452,10 +457,11 @@ python3 scripts/benchmark_sglang_acceleration.py --server http://HOST:8188 \
 
 ```json
 {
-  "softmax_ranks": 6,
+  "softmax_ranks": 0,
+  "dual_stream": true,
   "profile": false,
   "cache_dit": true,
-  "cache_dit_threshold": 0.08,
+  "cache_dit_threshold": 0.25,
   "cache_dit_fn_blocks": 8,
   "cache_dit_bn_blocks": 8,
   "cache_dit_warmup_steps": 3,
@@ -511,7 +517,8 @@ cd /root/ref2va && git pull --ff-only && bash deploy.sh start
 ```json
 {
   "optimization": {
-    "softmax_ranks": 6,
+    "softmax_ranks": 0,
+    "dual_stream": true,
     "linear_kv_keep_ratio": 0.5,
     "profile": false,
     "cache_dit": {"enabled": true, "rdt": 0.25}
@@ -519,7 +526,7 @@ cd /root/ref2va && git pull --ff-only && bash deploy.sh start
 }
 ```
 
-这里的 `softmax_ranks=6` 适用于八卡 worker；四卡须小于 4。旧 `/openvdn/jobs` 接口把 `linear_kv_keep_ratio` 放在顶层，CLI 使用 `--linear-kv-keep-ratio 0.5`，ComfyUI 节点也有对应选项。省略时默认为 `1.0`，不自动开启近似。完整业务请求见 [examples/business-request.json](examples/business-request.json)。
+这里的 `softmax_ranks=0`、`dual_stream=true` 同时适用于四卡和八卡 worker。旧 `/openvdn/jobs` 接口把 `linear_kv_keep_ratio` 放在顶层，CLI 使用 `--linear-kv-keep-ratio 0.5`，ComfyUI 节点也有对应选项。省略时默认为 `1.0`，不自动开启近似。完整业务请求见 [examples/business-request.json](examples/business-request.json)。
 
 采样发生在原有特征和卷积计算之后：将每帧展平的空间位置均匀划成 `ceil(S × ratio)` 段，各取一个中点，同一组索引同时作用于视频 K/V/beta；索引不使用随机数。统计矩阵 A、B 均乘 `S/保留数量` 以校正求和尺度，后续扫描仍使用原始 S。完整 Q、读出、文本状态、softmax、投影和通信数据量保持不变，因此 `0.5` 不代表整个 linear 分支或视频生成提速一倍。采样还会增加索引读取成本；速度和画质均需要 GPU 实测。
 

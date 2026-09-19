@@ -8,7 +8,7 @@ import uuid
 
 from .business_media import select_source
 from .cache_dit import FIELDS as CACHE_FIELDS
-from .config import Settings
+from .config import Settings, merge_request_options
 from .optimization_options import FIELDS as OPTIMIZATION_FIELDS
 
 PREFIX = '/ic/capcut/edit_gateway/v2'
@@ -92,7 +92,7 @@ def normalize_request(body, state):
     if opt is not None:
         require_object(opt, 'optimization')
         reject_unknown(opt, (*OPTIMIZATIONS, 'cache_dit'), 'optimization')
-        options.update({k: v for k, v in opt.items() if k in OPTIMIZATIONS and v is not None})
+        options = merge_request_options(options, {k: v for k, v in opt.items() if k in OPTIMIZATIONS and v is not None})
         cache = opt.get('cache_dit')
         if cache is not None:
             require_object(cache, 'optimization.cache_dit')

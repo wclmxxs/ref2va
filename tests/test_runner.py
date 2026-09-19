@@ -93,7 +93,7 @@ def test_official_config_and_no_shell_interpolation(tmp_path):
     config = Settings().inference_config(tmp_path / "ref [1], x.pt", tmp_path / "out a.mp4")
     assert config["render"]["num_steps"] == 8
     assert config["render"]["num_frames"] == 345
-    assert config["parallel"]["softmax_ranks"] == 6
+    assert config["parallel"]["softmax_ranks"] == 0
     assert config["render"]["prompt_file"].endswith("ref [1], x.pt")
     with pytest.raises(ValueError, match="OmegaConf"):
         Settings().inference_config(tmp_path / "${x}.pt", tmp_path / "out.mp4")

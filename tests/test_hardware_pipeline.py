@@ -29,9 +29,9 @@ def script(name):
     return module
 
 
-@pytest.mark.parametrize('gpu,size,backend_name,soft', [('h200',8,'flex',6),('h200',4,'flex',3),
-                                                       ('b200',8,'decomposed',5),('b200',4,'decomposed',2),
-                                                       ('b300',8,'decomposed',5),('b300',4,'decomposed',2)])
+@pytest.mark.parametrize('gpu,size,backend_name,soft', [('h200',8,'flex',0),('h200',4,'flex',0),
+                                                       ('b200',8,'decomposed',0),('b200',4,'decomposed',0),
+                                                       ('b300',8,'decomposed',0),('b300',4,'decomposed',0)])
 def test_all_hardware_profiles_and_rank_limits(monkeypatch, gpu, size, backend_name, soft):
     monkeypatch.setenv('REF2VA_GPU_TYPE',gpu)
     monkeypatch.setenv('REF2VA_GPUS',str(size))
@@ -60,6 +60,42 @@ def test_fleet_splits_selected_devices_ports_and_namespaces():
     for args in [('b100',4,8188),('h200',2,8188),('h200',4,65535)]:
         with pytest.raises(ValueError): fleet.plans(*args)
     with pytest.raises(ValueError): fleet.plans('h200',4,8188,'0,1,2,3')
+
+
+def test_startup_custom_defaults_and_dual_stream_dependencies(monkeypatch):
+    monkeypatch.setenv('REF2VA_SOFTMAX_RANKS', '3')
+    monkeypatch.delenv('REF2VA_DUAL_STREAM', raising=False)
+    monkeypatch.setenv('REF2VA_CACHE_DIT', '0')
+    monkeypatch.setenv('REF2VA_CACHE_DIT_THRESHOLD', '.15')
+    monkeypatch.setenv('REF2VA_CACHE_DIT_MAX_CACHED_STEPS', '1')
+    settings = backend.startup_settings()
+    assert not settings.dual_stream and not settings.cache_dit
+    assert settings.cache_dit_threshold == .15 and settings.cache_dit_max_cached_steps == 1
+    monkeypatch.setenv('REF2VA_DUAL_STREAM', '1')
+    with pytest.raises(ValueError, match='dual_stream requires'):
+        backend.startup_settings()
+    monkeypatch.delenv('REF2VA_DUAL_STREAM')
+    monkeypatch.setenv('REF2VA_SOFTMAX_RANKS', '0')
+    monkeypatch.setenv('REF2VA_INFERENCE_KERNELS', '0')
+    assert not backend.startup_settings().dual_stream
+
+
+def test_render_cli_fast_defaults_and_explicit_baseline(monkeypatch):
+    render = script('render')
+    requests = []
+    def capture(**kwargs):
+        requests.append(kwargs['settings'].validate())
+        return {}
+    monkeypatch.setattr(render, 'generate', capture)
+    monkeypatch.setattr(sys, 'argv', ['render', '--prompt', 'test'])
+    render.main()
+    assert requests[-1].cache_dit and requests[-1].cache_dit_threshold == .25
+    assert requests[-1].dual_stream and requests[-1].vae_tile_batch_size == 4 and requests[-1].vae_compile
+    monkeypatch.setattr(sys, 'argv', ['render', '--prompt', 'test', '--softmax-ranks', '3', '--no-cache-dit',
+                                     '--vae-tile-batch-size', '1', '--no-vae-compile'])
+    render.main()
+    assert not requests[-1].dual_stream and not requests[-1].cache_dit
+    assert requests[-1].vae_tile_batch_size == 1 and not requests[-1].vae_compile
 
 
 def test_instance_runtime_and_cache_isolation(monkeypatch,tmp_path):
@@ -233,10 +269,12 @@ def test_workflow_starters_match_hardware_without_overwriting_saved_edits(tmp_pa
     settings=Settings()
     install_workflows(ROOT,tmp_path,settings)
     for name,offset in [('openvdn_url_request',10),('openvdn_ref2va_like',8)]:
-        path=tmp_path/'default/workflows'/f'{name}_{gpu}_{size}.json'
+        path=tmp_path/'default/workflows'/f'{name}_{gpu}_{size}_fast_v1.json'
         data=json.loads(path.read_text())
         node=next(n for n in data['nodes'] if n['type'] in ('OpenVDNH200Generate','OpenVDNH200Request'))
         assert node['widgets_values'][offset:offset+2]==[settings.softmax_backend,settings.softmax_ranks]
+        from openvdn_comfy.nodes import cache_inputs, optimization_inputs
+        assert node['widgets_values'][offset+4:]==[getattr(settings,k) for k in (*cache_inputs(),*optimization_inputs())]
         path.write_text('{"user edited":true}')
         install_workflows(ROOT,tmp_path,settings)
         assert json.loads(path.read_text())=={'user edited':True}

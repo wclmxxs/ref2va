@@ -21,12 +21,16 @@
 完整请求见 [examples/business-request.json](../examples/business-request.json)。先将示例里的 `image_url.url` 换成真实公网图片 URL，再提交：
 
 ```bash
-curl -sS http://43.218.119.131:8188/ic/capcut/edit_gateway/v2/video_generation \
+curl -sS http://108.136.40.172:8188/ic/capcut/edit_gateway/v2/video_generation \
   -H 'Content-Type: application/json' \
   --data-binary @examples/business-request.json
 ```
 
-全参数示例中的 `optimization.softmax_ranks=6` 对应默认八卡 H200；四卡 H200 改为 3、四卡 B200/B300 改为 2，或省略/null 以继承部署默认。相同请求发送到 `/sync_infer` 即为同步模式。示例显式启用 RDT 0.25；只将 `reference_short_edge` 改为 `512` 就是 512 参考图组，输出短边仍为 768。
+当前默认采用实测最快组合：`softmax_ranks=0`、`dual_stream=true`、Cache-DiT RDT 0.25、VAE 4 块合批＋编译，开启 fused delta / boundary scan / fast softmax / fast communication / streaming output。保留完整 linear K/V，不开启 profiling。省略整个 `optimization` 即使用这些默认值；显式字段仍可逐请求覆盖。四卡、八卡均使用相同请求格式，型号与卡数通过启动命令指定。
+
+示例使用参考图短边 768、输出短边 768、10 秒 9:16。只将 `reference_short_edge` 改为 `512` 就是 512 参考图组；相同请求发送到 `/sync_infer` 即为同步模式。上面的 IP 是本次测试机，其他机器替换为其当前 IP/DNS，不需要修改代码。
+
+2026-09-19 的 4×B300 同案例三次热态中位数：DiT 10.30 秒、视频 VAE 1.88 秒、worker 12.51 秒、API 13.13 秒。新形状的首次编译、输入下载/条件编码未命中或排队会增加时间，不能将该数值视为所有请求及 H200/B200 的承诺。Cache-DiT 是近似加速；需要完整去噪计算时传 `cache_dit.enabled=false`，其他优化可保持开启。
 
 | 顶层字段 | 含义与约束 |
 | --- | --- |
@@ -60,9 +64,9 @@ curl -sS http://43.218.119.131:8188/ic/capcut/edit_gateway/v2/video_generation \
 
 | 字段（位于 `optimization`） | 默认 | 含义 |
 | --- | --- | --- |
-| `cache_dit.enabled` | false | 请求内的近似跨步缓存 |
+| `cache_dit.enabled` | true | 请求内的近似跨步缓存 |
 | `cache_dit.warmup` | 3 | 开头完整执行的步数，1–8；不是服务启动预热 |
-| `cache_dit.rdt` | 0.08 | 复用阈值，0–1；0 禁止复用；示例使用 0.25 |
+| `cache_dit.rdt` | 0.25 | 复用阈值，0–1；0 禁止复用 |
 | `cache_dit.max_continuous_cached_steps` | 1 | 最多连续复用步数，1–7 |
 | `cache_dit.fn_blocks` | 8 | 前段完整计算块数，1–49 |
 | `cache_dit.bn_blocks` | 8 | 后段完整计算块数，0–49；前后之和必须小于 50 |
@@ -71,18 +75,28 @@ curl -sS http://43.218.119.131:8188/ic/capcut/edit_gateway/v2/video_generation \
 | `attention_kernel` | native | `native` / `decomposed`；不支持 Sol |
 | `isolate_padding` | false | 是否隔离补齐 token；只能用于当前 Flex 部署＋native kernel |
 | `linear_stats_chunk_frames` | 16 | 8 / 16 / 32 |
-| `softmax_ranks` | H200 八卡 6、四卡 3；B200/B300 八卡 5、四卡 2 | 0 到单 worker 卡数减 1；0 为标准 Ulysses；省略/null 继承部署默认 |
+| `softmax_ranks` | 0 | 0 到单 worker 卡数减 1；0 为 Ulysses，各卡都处理两分支，默认使用双流 |
+| `dual_stream` | true | 两条 CUDA 流重叠计算 softmax / linear，要求 ranks=0 且部署启用 inference kernels |
+| `fused_delta` | true | 融合 FP32 delta 求解内核，首次使用进行 GPU 数值校验 |
+| `boundary_scan` | true | 合成块内仿射变换后扫描边界，保留全部帧 |
+| `fast_softmax` | true | 优化 decomposed window attention 的复制/索引 |
+| `linear_kv_keep_ratio` | 1.0 | 1.0 / 0.5 / 0.25；1.0 保留完整视频 K/V，较小值为额外近似 |
 | `fast_communication` | true | 已验证的通信优化 |
 | `streaming_output` | true | 视频流式输出优化 |
 | `cleanup_policy` | adaptive | `adaptive` / `always` |
 | `profile` | false | 细粒度 profiling；关闭时仍有常规阶段耗时 |
+| `profile_kernels` | false | 需要 profile=true；诊断 CPU/CUDA trace，增加耗时，CUDA 事件依赖有效 CUPTI |
+| `vae_tile_batch_size` | 4 | 1 / 2 / 4 / 8；对同形状独立空间 tile 合批；1 + compile=false 恢复逐块 eager |
+| `vae_compile` | true | 编译重复 VAE decoder blocks；首次按需编译，不在启动穷举所有形状 |
 
-基础字段及四个 Cache-DiT 公共字段沿用 8b200 命名，其余是 ref2va 扩展。FP8、`inference_kernels`、`softmax_backend`、编译开关和桶间隔为部署级配置，不接受新业务请求覆盖；使用健康接口查看，修改需重启。未知参数（包括已移除的 Sol 参数）明确返回 400，不静默忽略。
+仅覆盖 `softmax_ranks` 为非零且未显式开启双流时，API 自动关闭本次请求的 `dual_stream`；显式传入非零 ranks 和 dual_stream=true 会返回 400。关闭缓存可传 `{"optimization":{"cache_dit":{"enabled":false}}}`；恢复逐块 VAE 可传 `{"optimization":{"vae_tile_batch_size":1,"vae_compile":false}}`。这些修改只作用于本次请求。
+
+基础字段及四个 Cache-DiT 公共字段沿用 8b200 命名，其余是 ref2va 扩展。FP8、`inference_kernels`、`softmax_backend`、DiT 编译形状容量和 token 桶间隔为部署级配置，不接受新业务请求覆盖；使用健康接口查看，修改需重启。VAE 编译支持上表的请求级开关。未知参数（包括已移除的 Sol 参数）明确返回 400，不静默忽略。
 
 ## 查询与耗时
 
 ```bash
-curl -sS http://43.218.119.131:8188/ic/capcut/edit_gateway/v2/query/video_generation \
+curl -sS http://108.136.40.172:8188/ic/capcut/edit_gateway/v2/query/video_generation \
   -H 'Content-Type: application/json' \
   -d '{"model":"MiniMax-H3","task_id":"video_<提交返回的32位hex>"}'
 ```
@@ -96,7 +110,8 @@ curl -sS http://43.218.119.131:8188/ic/capcut/edit_gateway/v2/query/video_genera
 - `task.timings` 保留完整原始耗时：DiT、条件编码/装载、视频/音频 VAE、GPU→CPU、像素准备、H.264、封装、输出整体、清理、排队和总处理等。看约 11 秒的 DiT 指标应使用 `denoise_seconds`。
 - `input_prepare_seconds` 为提交阶段的请求读取、校验、图片解析/下载及准备耗时；`api_queue_seconds` 从图片准备完入队算起；`processing_wall_seconds` 包含输入准备和节点执行，排除队列等待。`reference_download_seconds` 为兼容字段，对 Base64 请求也包含输入准备。
 - schema 10 新增 `gpu_worker_seconds`（条件编码到 GPU 回传/清理的阶段墙钟）、`cpu_output_tail_seconds`（其后的 CPU 尾段）、`output_backpressure_seconds`（等待输出槽）、`cross_request_output`（跨请求重叠是否启用）。这些时间可能与其他任务重叠；GPU 阶段墙钟也包含 CPU 调度，不是纯 kernel 时间。
-- `task.compilation` 保留编译耗时、图复用、分桶布局；`task.cache_dit` 保留实际复用步；`task.optimizations` 返回实际执行的优化和校验结果。编译及输出细分项可能相互包含/重叠，不要机械相加。
+- `task.video_vae_decode` 返回 VAE 合批大小、实际 decoder 调用数、各 rank 编译命中及数值校验结果。`timings.video_vae_compile_seconds`、`video_vae_tile_decoder_seconds`、`video_vae_tile_stitch_seconds`、`video_vae_verification_seconds` 是视频 VAE 阶段内的子项，不能再加到该阶段总时间上。
+- `task.compilation` 保留 DiT 编译耗时、图复用、分桶布局；`task.cache_dit` 保留实际复用步；`task.optimizations` 返回实际执行的优化和校验结果。编译及输出细分项可能相互包含/重叠，不要机械相加。
 
 反向代理部署时设置 `PUBLIC_BASE_URL=https://你的服务地址`；未设置时根据当前请求的 origin 生成视频 URL。不自动信任 Forwarded 头。双 API 模式若使用反向代理，分别设置 `REF2VA_PUBLIC_BASE_URL_0` 和 `REF2VA_PUBLIC_BASE_URL_1`；否则不要设置全局 `PUBLIC_BASE_URL`，以各请求 origin 生成对应端口的链接。
 
